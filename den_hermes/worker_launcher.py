@@ -344,6 +344,14 @@ def run_den_coder_reviewer_workflow(
         role="reviewer",
         artifact=reviewer_result.artifact,
     )
+    den_client.post_review_findings(
+        task_id=task_id,
+        review_request=review_request,
+        reviewer_run_id=reviewer_run_id,
+        verdict=reviewer_result.artifact["verdict"],
+        findings=reviewer_result.artifact["findings"],
+        summary=reviewer_result.artifact.get("summary", ""),
+    )
     return DenCoderReviewerWorkflowResult(
         status="completed",
         coder=coder_result,

@@ -403,7 +403,21 @@ Implemented the first Den-facing orchestration wrapper around the spawned-Hermes
 
 This is still intentionally fake-Den: no live Den MCP worker-run rows or review rounds are created. The value is the transition contract. The next step can replace `RecordingDenClient` with a real Den MCP adapter once the lifecycle shape is stable.
 
-Remaining unimplemented pieces now include a real Den MCP client adapter, live Den review-round creation, richer reviewer finding schemas, retry loops, abort/rerun/cleanup controls, and a real Hermes/LLM smoke test.
+Remaining unimplemented pieces now include a real Den MCP client adapter, live Den review-round creation, retry loops, abort/rerun/cleanup controls, and a real Hermes/LLM smoke test.
+
+### Spike A.5 result — reviewer findings adapter transition
+
+Implemented the first reviewer-findings handoff through the fakeable Den adapter:
+
+- The fake reviewer can now emit non-empty `findings` and a configurable `verdict`.
+- `run_den_coder_reviewer_workflow(...)` calls `den_client.post_review_findings(...)` after reviewer artifact validation and lifecycle completion recording.
+- The adapter call includes task id, review request handle, reviewer run id, verdict, findings, and reviewer summary.
+- Tests prove a `changes_requested` reviewer artifact with a blocking finding is passed to the Den adapter after reviewer completion.
+- Validation command: `python -m pytest -q` → `12 passed`.
+
+This still does not create live Den review findings. It locks in the mapping point where the future real adapter will translate reviewer artifacts into `mcp_den_create_review_finding`, `mcp_den_post_review_findings`, and `mcp_den_set_review_verdict` calls.
+
+Remaining unimplemented pieces now include a real Den MCP client adapter, live Den review-round/finding creation, retry loops, abort/rerun/cleanup controls, and a real Hermes/LLM smoke test.
 
 ### delegate_task provider/model override spike
 

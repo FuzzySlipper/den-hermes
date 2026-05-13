@@ -65,13 +65,14 @@ if mode == "identity_mismatch":
 
 artifact_path.parent.mkdir(parents=True, exist_ok=True)
 if role == "reviewer":
+    findings = json.loads(os.environ.get("FAKE_REVIEW_FINDINGS", "[]"))
     artifact = {
         "task_id": artifact_task_id,
         "run_id": artifact_run_id,
         "role": artifact_role,
         "status": "completed",
-        "verdict": "looks_good",
-        "findings": [],
+        "verdict": os.environ.get("FAKE_REVIEW_VERDICT", "looks_good"),
+        "findings": findings,
         "summary": "fake reviewer approved",
     }
 else:
@@ -146,6 +147,11 @@ class RecordingDenClient:
     def request_review(self, *, task_id, branch, head_commit, tests_run, coder_run_id):
         self.events.append(("review_requested", task_id, branch, head_commit, tests_run, coder_run_id))
         return {"review_round_id": 321}
+
+    def post_review_findings(self, *, task_id, review_request, reviewer_run_id, verdict, findings, summary):
+        self.events.append(
+            ("review_findings_posted", task_id, review_request, reviewer_run_id, verdict, findings, summary)
+        )
 
 
 def test_spawned_hermes_worker_success_captures_command_and_artifact(tmp_path):
@@ -424,3 +430,53 @@ def test_den_workflow_does_not_request_review_or_launch_reviewer_when_coder_git_
     ]
     assert "branch" in den.events[-1][-1].lower()
     assert [call["env"]["DEN_WORKER_ROLE"] for call in read_fake_calls(tmp_path)] == ["coder"]
+
+
+def test_den_workflow_posts_reviewer_findings_after_reviewer_completion(tmp_path):
+    head = init_git_repo(tmp_path)
+    subprocess.run(["git", "checkout", "-b", "task/1368-fake"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    env = fake_env(tmp_path)
+    env["FAKE_HEAD"] = head
+    env["FAKE_REVIEW_VERDICT"] = "changes_requested"
+    env["FAKE_REVIEW_FINDINGS"] = json.dumps(
+        [
+            {
+                "category": "blocking_bug",
+                "summary": "reviewer found a fake blocker",
+                "notes": "details from reviewer artifact",
+            }
+        ]
+    )
+    den = RecordingDenClient()
+
+    result = run_den_coder_reviewer_workflow(
+        den_client=den,
+        task_id=1368,
+        prompt="Use the Den task context to implement and review task 1368.",
+        run_root=tmp_path / ".den" / "runs",
+        cwd=tmp_path,
+        verify_git=True,
+        coder={"run_id": "coder-run"},
+        reviewer={"run_id": "reviewer-run"},
+        env_overrides=env,
+    )
+
+    assert result.status == "completed"
+    posted = [event for event in den.events if event[0] == "review_findings_posted"]
+    assert posted == [
+        (
+            "review_findings_posted",
+            1368,
+            {"review_round_id": 321},
+            "reviewer-run",
+            "changes_requested",
+            [
+                {
+                    "category": "blocking_bug",
+                    "summary": "reviewer found a fake blocker",
+                    "notes": "details from reviewer artifact",
+                }
+            ],
+            "fake reviewer approved",
+        )
+    ]
