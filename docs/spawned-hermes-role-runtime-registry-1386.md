@@ -598,3 +598,25 @@ With the registry enabled:
 - Resolver failures happen before Den registration and before any subprocess launch.
 
 Existing low-level tests still support explicit inline profile/provider/model values for fake/manual flows without a registry path. Durable Den orchestrator paths should pass the registry path (or use `DEN_HERMES_RUNTIME_REGISTRY` once launcher wiring is promoted to always-on central resolution).
+
+## 17. Operator command surface (#1389)
+
+The initial operator surface is available as a Python module:
+
+```bash
+python -m den_hermes.runtime_ops --registry config/spawned-hermes-runtimes.sample.yaml matrix
+python -m den_hermes.runtime_ops --registry config/spawned-hermes-runtimes.sample.yaml validate
+python -m den_hermes.runtime_ops --registry config/spawned-hermes-runtimes.sample.yaml preflight --roles coder,reviewer
+```
+
+`matrix` prints the active profile/provider/model/toolset/timeout/runtime-id table. `validate` resolves all required roles and fails closed on malformed config. `preflight` runs the exact resolved Hermes profile/provider/model shape with a harmless `PROFILE_OK` prompt and redacts secret-looking stderr/stdout values before printing diagnostics.
+
+Current-host preflight evidence for the sample central picks:
+
+```text
+python -m den_hermes.runtime_ops --registry config/spawned-hermes-runtimes.sample.yaml preflight --roles coder,reviewer
+OK coder profile=den-hermes-runner provider=openai-codex model=gpt-5.5 exit=0
+OK reviewer profile=den-hermes-runner provider=openai-codex model=gpt-5.5 exit=0
+```
+
+To change the active reviewer pick, edit the active registry file (normally `/home/agents/profiles/den-hermes-runner/runtime/spawned-hermes-runtimes.yaml`), run `validate`, then run `preflight --roles reviewer`. Do not edit Den project/task metadata to change runtime picks.
