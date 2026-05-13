@@ -158,6 +158,7 @@ def run_coder_reviewer_sequence(
     cwd: str | Path | None = None,
     env_overrides: Mapping[str, str] | None = None,
     timeout_seconds: int = 300,
+    verify_git: bool = False,
 ) -> CoderReviewerSequenceResult:
     """Run a fakeable coder -> reviewer sequence with artifact handoff."""
 
@@ -183,6 +184,14 @@ def run_coder_reviewer_sequence(
             coder=coder_result,
             error=coder_result.error or "Coder worker did not complete",
         )
+    if verify_git:
+        git_error = _verify_git_branch_head(coder_result.artifact, cwd=cwd)
+        if git_error:
+            return CoderReviewerSequenceResult(
+                status="failed",
+                coder=coder_result,
+                error=git_error,
+            )
 
     reviewer_run_id = str(reviewer["run_id"])
     reviewer_prompt = (
@@ -294,3 +303,38 @@ def _validate_artifact_shape(*, artifact: Mapping[str, Any], role: str) -> str |
 def _optional_str(mapping: Mapping[str, Any], key: str) -> str | None:
     value = mapping.get(key)
     return str(value) if value is not None else None
+
+
+def _verify_git_branch_head(artifact: Mapping[str, Any], cwd: str | Path | None) -> str | None:
+    branch = str(artifact["branch"])
+    head_commit = str(artifact["head_commit"])
+    repo_cwd = str(cwd) if cwd is not None else None
+
+    branch_ref = subprocess.run(
+        ["git", "rev-parse", "--verify", f"refs/heads/{branch}"],
+        cwd=repo_cwd,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if branch_ref.returncode != 0:
+        return f"Git verification failed: branch {branch!r} does not exist"
+
+    head_ref = subprocess.run(
+        ["git", "rev-parse", "--verify", f"{head_commit}^{{commit}}"],
+        cwd=repo_cwd,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if head_ref.returncode != 0:
+        return f"Git verification failed: head_commit {head_commit!r} does not resolve"
+
+    branch_sha = branch_ref.stdout.strip()
+    head_sha = head_ref.stdout.strip()
+    if branch_sha != head_sha:
+        return (
+            "Git verification failed: branch "
+            f"{branch!r} points to {branch_sha}, not reported head_commit {head_sha}"
+        )
+    return None

@@ -1,5 +1,6 @@
 import json
 import os
+import subprocess
 from pathlib import Path
 
 from den_hermes.worker_launcher import run_coder_reviewer_sequence, run_hermes_worker
@@ -70,13 +71,15 @@ if role == "reviewer":
         "summary": "fake reviewer approved",
     }
 else:
+    fake_branch = os.environ.get("FAKE_BRANCH", "task/1368-fake")
+    fake_head = os.environ.get("FAKE_HEAD", "0123456789abcdef0123456789abcdef01234567")
     artifact = {
         "task_id": artifact_task_id,
         "run_id": artifact_run_id,
         "role": artifact_role,
         "status": "completed",
-        "branch": "task/1368-fake",
-        "head_commit": "0123456789abcdef0123456789abcdef01234567",
+        "branch": fake_branch,
+        "head_commit": fake_head,
         "tests_run": [
             {"command": "pytest tests/ -q", "result": "passed"}
         ],
@@ -102,6 +105,17 @@ def fake_env(tmp_path: Path, mode: str = "success") -> dict[str, str]:
     if mode != "success":
         env["FAKE_HERMES_MODE"] = mode
     return env
+
+
+def init_git_repo(tmp_path: Path) -> str:
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.name", "Test User"], cwd=tmp_path, check=True)
+    (tmp_path / "README.md").write_text("# test\n")
+    subprocess.run(["git", "add", "README.md"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-m", "initial"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    return head.stdout.strip()
 
 
 def read_fake_calls(tmp_path: Path) -> list[dict]:
@@ -284,3 +298,45 @@ def test_fake_coder_then_reviewer_sequence_uses_distinct_runtime_args(tmp_path):
     assert "terminal,file" in reviewer_args
     assert "task/1368-fake" in reviewer_args[reviewer_args.index("-q") + 1]
     assert FAKE_HEAD in reviewer_args[reviewer_args.index("-q") + 1]
+
+
+def test_sequence_git_verification_blocks_reviewer_when_branch_is_missing(tmp_path):
+    init_git_repo(tmp_path)
+
+    result = run_coder_reviewer_sequence(
+        task_id=1368,
+        prompt="Use the Den task context to implement and review task 1368.",
+        run_root=tmp_path / ".den" / "runs",
+        cwd=tmp_path,
+        verify_git=True,
+        coder={"run_id": "coder-run"},
+        reviewer={"run_id": "reviewer-run"},
+        env_overrides=fake_env(tmp_path),
+    )
+
+    assert result.status == "failed"
+    assert result.reviewer is None
+    assert "branch" in result.error.lower()
+    assert [call["env"]["DEN_WORKER_ROLE"] for call in read_fake_calls(tmp_path)] == ["coder"]
+
+
+def test_sequence_git_verification_allows_reviewer_when_branch_head_resolve(tmp_path):
+    head = init_git_repo(tmp_path)
+    subprocess.run(["git", "checkout", "-b", "task/1368-fake"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    env = fake_env(tmp_path)
+    env["FAKE_HEAD"] = head
+
+    result = run_coder_reviewer_sequence(
+        task_id=1368,
+        prompt="Use the Den task context to implement and review task 1368.",
+        run_root=tmp_path / ".den" / "runs",
+        cwd=tmp_path,
+        verify_git=True,
+        coder={"run_id": "coder-run"},
+        reviewer={"run_id": "reviewer-run"},
+        env_overrides=env,
+    )
+
+    assert result.status == "completed"
+    assert result.coder.artifact["head_commit"] == head
+    assert [call["env"]["DEN_WORKER_ROLE"] for call in read_fake_calls(tmp_path)] == ["coder", "reviewer"]
