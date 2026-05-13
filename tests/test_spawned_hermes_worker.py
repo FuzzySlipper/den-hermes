@@ -42,7 +42,7 @@ entry = {
 with log_path.open("a") as log_file:
     log_file.write(json.dumps(entry) + "\\n")
 
-mode = os.environ.get("FAKE_HERMES_MODE", "success")
+mode = os.environ.get(f"FAKE_HERMES_{role.upper()}_MODE", os.environ.get("FAKE_HERMES_MODE", "success"))
 
 if mode == "missing_artifact":
     print("fake hermes completed without writing artifact")
@@ -132,10 +132,16 @@ def read_fake_calls(tmp_path: Path) -> list[dict]:
 
 
 class RecordingDenClient:
-    def __init__(self, launch_log: Path | None = None, fail_registration_roles: set[str] | None = None):
+    def __init__(
+        self,
+        launch_log: Path | None = None,
+        fail_registration_roles: set[str] | None = None,
+        fail_completion_roles: set[str] | None = None,
+    ):
         self.events = []
         self.launch_log = launch_log
         self.fail_registration_roles = fail_registration_roles or set()
+        self.fail_completion_roles = fail_completion_roles or set()
 
     def register_worker_run(self, **kwargs):
         if kwargs["role"] in self.fail_registration_roles:
@@ -149,6 +155,8 @@ class RecordingDenClient:
         self.events.append(("started", task_id, run_id, role))
 
     def mark_worker_completed(self, *, task_id, run_id, role, artifact):
+        if role in self.fail_completion_roles:
+            raise RuntimeError(f"completion rejected for {role}")
         self.events.append(("completed", task_id, run_id, role, artifact))
 
     def mark_worker_failed(self, *, task_id, run_id, role, error):
@@ -429,6 +437,35 @@ def test_den_workflow_registration_failure_prevents_worker_launch(tmp_path):
     assert not (tmp_path / "fake-hermes-call.jsonl").exists()
 
 
+def test_den_workflow_coder_completion_rejection_stops_before_review(tmp_path):
+    head = init_git_repo(tmp_path)
+    subprocess.run(["git", "checkout", "-b", "task/1368-fake"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    env = fake_env(tmp_path)
+    env["FAKE_HEAD"] = head
+    den = RecordingDenClient(fail_completion_roles={"coder"})
+
+    result = run_den_coder_reviewer_workflow(
+        den_client=den,
+        task_id=1368,
+        prompt="Use the Den task context to implement and review task 1368.",
+        run_root=tmp_path / ".den" / "runs",
+        cwd=tmp_path,
+        verify_git=True,
+        coder={"run_id": "coder-run"},
+        reviewer={"run_id": "reviewer-run"},
+        env_overrides=env,
+    )
+
+    assert result.status == "failed"
+    assert result.review_request is None
+    assert "coder completion rejected" in result.error.lower()
+    assert [event[0:4] for event in den.events] == [
+        ("registered", 1368, "coder-run", "coder"),
+        ("started", 1368, "coder-run", "coder"),
+    ]
+    assert [call["env"]["DEN_WORKER_ROLE"] for call in read_fake_calls(tmp_path)] == ["coder"]
+
+
 def test_den_workflow_reviewer_registration_failure_prevents_reviewer_launch(tmp_path):
     head = init_git_repo(tmp_path)
     subprocess.run(["git", "checkout", "-b", "task/1368-fake"], cwd=tmp_path, check=True, capture_output=True, text=True)
@@ -522,6 +559,57 @@ def test_den_workflow_does_not_request_review_or_launch_reviewer_when_coder_git_
     ]
     assert "branch" in den.events[-1][-1].lower()
     assert [call["env"]["DEN_WORKER_ROLE"] for call in read_fake_calls(tmp_path)] == ["coder"]
+
+
+def test_den_workflow_reviewer_artifact_failure_posts_failure_packet(tmp_path):
+    head = init_git_repo(tmp_path)
+    subprocess.run(["git", "checkout", "-b", "task/1368-fake"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    env = fake_env(tmp_path)
+    env["FAKE_HEAD"] = head
+    env["FAKE_HERMES_REVIEWER_MODE"] = "missing_artifact"
+    den = RecordingDenClient()
+
+    result = run_den_coder_reviewer_workflow(
+        den_client=den,
+        task_id=1368,
+        prompt="Use the Den task context to implement and review task 1368.",
+        run_root=tmp_path / ".den" / "runs",
+        cwd=tmp_path,
+        verify_git=True,
+        coder={"run_id": "coder-run"},
+        reviewer={"run_id": "reviewer-run"},
+        env_overrides=env,
+    )
+
+    assert result.status == "failed"
+    assert "missing completion artifact" in result.error.lower()
+    assert den.events[-1][0:4] == ("failed", 1368, "reviewer-run", "reviewer")
+    assert [call["env"]["DEN_WORKER_ROLE"] for call in read_fake_calls(tmp_path)] == ["coder", "reviewer"]
+
+
+def test_den_workflow_reviewer_completion_rejection_skips_findings_packet(tmp_path):
+    head = init_git_repo(tmp_path)
+    subprocess.run(["git", "checkout", "-b", "task/1368-fake"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    env = fake_env(tmp_path)
+    env["FAKE_HEAD"] = head
+    den = RecordingDenClient(fail_completion_roles={"reviewer"})
+
+    result = run_den_coder_reviewer_workflow(
+        den_client=den,
+        task_id=1368,
+        prompt="Use the Den task context to implement and review task 1368.",
+        run_root=tmp_path / ".den" / "runs",
+        cwd=tmp_path,
+        verify_git=True,
+        coder={"run_id": "coder-run"},
+        reviewer={"run_id": "reviewer-run"},
+        env_overrides=env,
+    )
+
+    assert result.status == "failed"
+    assert "reviewer completion rejected" in result.error.lower()
+    assert not [event for event in den.events if event[0] == "review_findings_posted"]
+    assert den.events[-1][0:4] == ("started", 1368, "reviewer-run", "reviewer")
 
 
 def test_den_workflow_posts_reviewer_findings_after_reviewer_completion(tmp_path):

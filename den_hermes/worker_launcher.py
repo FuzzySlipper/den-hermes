@@ -302,12 +302,16 @@ def run_den_coder_reviewer_workflow(
         timeout_seconds=timeout_seconds,
     )
     if coder_result.status == "completed" and coder_result.artifact is not None:
-        den_client.mark_worker_completed(
-            task_id=task_id,
-            run_id=coder_run_id,
-            role="coder",
-            artifact=coder_result.artifact,
-        )
+        try:
+            den_client.mark_worker_completed(
+                task_id=task_id,
+                run_id=coder_run_id,
+                role="coder",
+                artifact=coder_result.artifact,
+            )
+        except Exception as exc:  # noqa: BLE001 - Den rejected authoritative completion; fail closed
+            error = f"Coder completion rejected by Den: {exc}"
+            return DenCoderReviewerWorkflowResult(status="failed", coder=coder_result, error=error)
     else:
         error = coder_result.error or "Coder worker did not complete"
         den_client.mark_worker_failed(task_id=task_id, run_id=coder_run_id, role="coder", error=error)
@@ -389,12 +393,22 @@ def run_den_coder_reviewer_workflow(
             error=error,
         )
 
-    den_client.mark_worker_completed(
-        task_id=task_id,
-        run_id=reviewer_run_id,
-        role="reviewer",
-        artifact=reviewer_result.artifact,
-    )
+    try:
+        den_client.mark_worker_completed(
+            task_id=task_id,
+            run_id=reviewer_run_id,
+            role="reviewer",
+            artifact=reviewer_result.artifact,
+        )
+    except Exception as exc:  # noqa: BLE001 - Den rejected authoritative completion; fail closed
+        error = f"Reviewer completion rejected by Den: {exc}"
+        return DenCoderReviewerWorkflowResult(
+            status="failed",
+            coder=coder_result,
+            reviewer=reviewer_result,
+            review_request=review_request,
+            error=error,
+        )
     den_client.post_review_findings(
         task_id=task_id,
         review_request=review_request,
