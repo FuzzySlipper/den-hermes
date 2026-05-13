@@ -9,6 +9,11 @@ class RecordingMcpTools:
     def __init__(self):
         self.calls = []
         self.completion_response = {"id": 2001}
+        self.registration_response = {"summary": "registered worker coder-run (registered)", "worker_run": {"run_id": "coder-run"}}
+
+    def mcp_den_register_worker_run(self, **kwargs):
+        self.calls.append(("register_worker_run", kwargs))
+        return self.registration_response
 
     def mcp_den_send_message(self, **kwargs):
         self.calls.append(("send_message", kwargs))
@@ -44,6 +49,111 @@ def make_adapter(tools):
         base_branch="main",
         base_commit="a" * 40,
     )
+
+
+def test_den_mcp_adapter_registers_spawned_hermes_worker_run_with_expected_payload():
+    tools = RecordingMcpTools()
+    adapter = make_adapter(tools)
+
+    result = adapter.register_worker_run(
+        task_id=1368,
+        run_id="coder-run",
+        session_id="session-run",
+        role="coder",
+        branch="task/1368-hermes-native-delegation-exploration",
+        base_branch="main",
+        base_commit="a" * 40,
+        head_commit="b" * 40,
+        profile="den-hermes-worker",
+        provider="openrouter",
+        model="anthropic/claude-sonnet-4",
+        toolsets=["terminal", "file"],
+        workdir="/home/dev/den-hermes",
+        host="den-k8plus",
+        timeout_seconds=600,
+        artifact_path="/tmp/den-hermes/coder-run/completion.json",
+        log_path="/tmp/den-hermes/coder-run/worker.log",
+        prompt_packet_message_id=5791,
+        dedupe_key="1368:coder:coder-run",
+    )
+
+    assert result == tools.registration_response
+    assert tools.calls == [
+        (
+            "register_worker_run",
+            {
+                "project_id": "den-hermes-bridge",
+                "task_id": 1368,
+                "requested_by": "den-hermes-runner",
+                "role": "coder",
+                "substrate": "spawned_hermes",
+                "run_id": "coder-run",
+                "session_id": "session-run",
+                "branch": "task/1368-hermes-native-delegation-exploration",
+                "base_branch": "main",
+                "base_commit": "a" * 40,
+                "head_commit": "b" * 40,
+                "profile": "den-hermes-worker",
+                "provider": "openrouter",
+                "model": "anthropic/claude-sonnet-4",
+                "toolsets": "terminal,file",
+                "workdir": "/home/dev/den-hermes",
+                "host": "den-k8plus",
+                "timeout_seconds": 600,
+                "artifact_path": "/tmp/den-hermes/coder-run/completion.json",
+                "log_path": "/tmp/den-hermes/coder-run/worker.log",
+                "prompt_packet_message_id": 5791,
+                "dedupe_key": "1368:coder:coder-run",
+            },
+        )
+    ]
+
+
+def test_den_mcp_adapter_rejects_failed_registration_before_completion_post():
+    tools = RecordingMcpTools()
+    tools.registration_response = {"error": "task_id 1368 was not found"}
+    adapter = make_adapter(tools)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        adapter.register_worker_run(task_id=1368, run_id="coder-run", role="coder")
+
+    assert "registration" in str(excinfo.value)
+    assert "task_id 1368" in str(excinfo.value)
+    assert [name for name, _ in tools.calls] == ["register_worker_run"]
+
+
+def test_den_mcp_adapter_rejects_mismatched_registration_run_id():
+    tools = RecordingMcpTools()
+    tools.registration_response = {"worker_run": {"run_id": "different-run"}}
+    adapter = make_adapter(tools)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        adapter.register_worker_run(task_id=1368, run_id="coder-run", role="coder")
+
+    assert "different-run" in str(excinfo.value)
+    assert "coder-run" in str(excinfo.value)
+
+
+def test_den_mcp_adapter_posts_completion_after_registered_run_with_same_identity():
+    tools = RecordingMcpTools()
+    adapter = make_adapter(tools)
+
+    adapter.register_worker_run(task_id=1368, run_id="coder-run", session_id="session-run", role="coder")
+    adapter.mark_worker_completed(
+        task_id=1368,
+        run_id="coder-run",
+        role="coder",
+        artifact={
+            "status": "completed",
+            "branch": "task/1368-hermes-native-delegation-exploration",
+            "head_commit": "b" * 40,
+            "tests_run": [{"command": "python -m pytest -q", "result": "12 passed"}],
+            "summary": "Implemented successfully.",
+        },
+    )
+
+    assert [name for name, _ in tools.calls] == ["register_worker_run", "post_worker_completion_packet"]
+    assert tools.calls[0][1]["run_id"] == tools.calls[1][1]["run_id"] == "coder-run"
 
 
 def test_den_mcp_adapter_requests_review_with_verified_coder_metadata():

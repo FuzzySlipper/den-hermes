@@ -30,6 +30,62 @@ class DenMcpAdapter:
             intent="handoff",
         )
 
+    def register_worker_run(
+        self,
+        *,
+        task_id: int,
+        run_id: str,
+        role: str,
+        session_id: str | None = None,
+        branch: str | None = None,
+        base_branch: str | None = None,
+        base_commit: str | None = None,
+        head_commit: str | None = None,
+        profile: str | None = None,
+        provider: str | None = None,
+        model: str | None = None,
+        toolsets: Sequence[str] | str | None = None,
+        workdir: str | None = None,
+        host: str | None = None,
+        timeout_seconds: int | None = None,
+        artifact_path: str | None = None,
+        log_path: str | None = None,
+        prompt_packet_message_id: int | None = None,
+        state_file_ref: str | None = None,
+        dedupe_key: str | None = None,
+    ) -> Any:
+        args: dict[str, Any] = {
+            "project_id": self.project_id,
+            "task_id": task_id,
+            "requested_by": self.requested_by,
+            "role": role,
+            "substrate": "spawned_hermes",
+            "run_id": run_id,
+        }
+        optional = {
+            "session_id": session_id,
+            "branch": branch,
+            "base_branch": base_branch or self.base_branch,
+            "base_commit": base_commit or self.base_commit,
+            "head_commit": head_commit,
+            "profile": profile,
+            "provider": provider,
+            "model": model,
+            "toolsets": _csv_or_none(toolsets),
+            "workdir": workdir,
+            "host": host,
+            "timeout_seconds": timeout_seconds,
+            "artifact_path": artifact_path,
+            "log_path": log_path,
+            "prompt_packet_message_id": prompt_packet_message_id,
+            "state_file_ref": state_file_ref,
+            "dedupe_key": dedupe_key,
+        }
+        args.update({key: value for key, value in optional.items() if value is not None})
+        response = self.tools.mcp_den_register_worker_run(**args)
+        _ensure_worker_registration_accepted(response, run_id=run_id, role=role)
+        return response
+
     def mark_worker_completed(self, *, task_id: int, run_id: str, role: str, artifact: Mapping[str, Any]) -> Any:
         response = self.tools.mcp_den_post_worker_completion_packet(
             **self._completion_packet_args(task_id=task_id, run_id=run_id, role=role, artifact=artifact)
@@ -171,6 +227,22 @@ def _packet_type_for_role(role: str) -> str:
     }.get(role, "worker_failure_packet")
 
 
+def _ensure_worker_registration_accepted(response: Any, *, run_id: str, role: str) -> None:
+    payload = _response_payload(response)
+    if not isinstance(payload, Mapping):
+        return
+    worker_run = payload.get("worker_run")
+    if isinstance(worker_run, Mapping):
+        returned_run_id = worker_run.get("run_id")
+        if returned_run_id is not None and returned_run_id != run_id:
+            raise RuntimeError(
+                f"Den registered {role} worker under unexpected run_id {returned_run_id!r}; expected {run_id!r}"
+            )
+    if payload.get("error") or payload.get("status") == "error" or payload.get("failure_category"):
+        summary = payload.get("summary") or payload.get("error") or "Den rejected worker registration"
+        raise RuntimeError(f"Den rejected {role} worker registration for run {run_id}: {summary}")
+
+
 def _ensure_completion_packet_accepted(response: Any, *, run_id: str, role: str) -> None:
     payload = _response_payload(response)
     if not isinstance(payload, Mapping):
@@ -197,6 +269,14 @@ def _response_payload(response: Any) -> Any:
         except json.JSONDecodeError:
             return response
     return response
+
+
+def _csv_or_none(value: Sequence[str] | str | None) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    return ",".join(str(item) for item in value)
 
 
 def _json_or_none(value: Any) -> str | None:
