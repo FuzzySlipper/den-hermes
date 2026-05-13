@@ -1,0 +1,115 @@
+# Sample central spawned-Hermes runtime registry.
+# Copy to /home/agents/profiles/den-hermes-runner/runtime/spawned-hermes-runtimes.yaml
+# or point DEN_HERMES_RUNTIME_REGISTRY at an operator-owned copy.
+# Do not put API keys, auth tokens, .env contents, auth.json contents, or full environment dumps here.
+
+schema_version: 1
+registry_id: den-hermes-runner-defaults
+updated_at: "2026-05-13T00:00:00Z"
+updated_by: patch
+notes: >-
+  Central spawned-Hermes runtime picks for Den orchestrator roles.
+
+defaults:
+  substrate: spawned_hermes
+  hermes_binary: hermes
+  run_root: /tmp/den-hermes
+  artifact_filename: completion.json
+  log_filename: worker.log
+  profile_required: true
+  provider_required: true
+  model_required: true
+  timeout_seconds: 900
+  toolsets: [terminal, file]
+  workdir: /home/dev/den-hermes
+  preflight:
+    enabled: true
+    prompt: "Reply with exactly: PROFILE_OK"
+    expected_substring: PROFILE_OK
+    timeout_seconds: 300
+  audit:
+    record_registry_id: true
+    record_registry_version: true
+    record_role_runtime_id: true
+    record_resolved_at: true
+    record_override_reason: true
+
+roles:
+  coder:
+    runtime_id: coder-primary
+    profile: den-hermes-runner
+    provider: openai-codex
+    model: gpt-5.5
+    toolsets: [terminal, file]
+    timeout_seconds: 1800
+    reasoning_effort: high
+    max_retries: 1
+    preflight:
+      enabled: true
+    launch:
+      source: den-worker
+      extra_args: []
+
+  reviewer:
+    runtime_id: reviewer-primary
+    profile: den-hermes-runner
+    provider: openai-codex
+    model: gpt-5.5
+    toolsets: [terminal, file]
+    timeout_seconds: 1500
+    reasoning_effort: high
+    max_retries: 1
+    preflight:
+      enabled: true
+    launch:
+      source: den-worker
+      extra_args: []
+
+  validator:
+    runtime_id: validator-primary
+    profile: den-hermes-runner
+    provider: openai-codex
+    model: gpt-5.5
+    toolsets: [terminal, file]
+    timeout_seconds: 1200
+    reasoning_effort: medium
+    max_retries: 0
+    preflight:
+      enabled: true
+    launch:
+      source: den-worker
+      extra_args: []
+
+  drift_checker:
+    runtime_id: drift-checker-primary
+    profile: den-hermes-runner
+    provider: openai-codex
+    model: gpt-5.5
+    toolsets: [terminal, file]
+    timeout_seconds: 900
+    reasoning_effort: medium
+    max_retries: 0
+    preflight:
+      enabled: true
+    launch:
+      source: den-worker
+      extra_args: []
+
+  packet_auditor:
+    runtime_id: packet-auditor-primary
+    profile: den-hermes-runner
+    provider: openai-codex
+    model: gpt-5.5
+    toolsets: [terminal, file]
+    timeout_seconds: 900
+    reasoning_effort: medium
+    max_retries: 0
+    preflight:
+      enabled: true
+    launch:
+      source: den-worker
+      extra_args: []
+
+role_aliases:
+  drift: drift_checker
+  audit: packet_auditor
