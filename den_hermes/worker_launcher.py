@@ -19,6 +19,14 @@ class HermesWorkerResult:
     command: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True)
+class CoderReviewerSequenceResult:
+    status: str
+    coder: HermesWorkerResult
+    reviewer: HermesWorkerResult | None = None
+    error: str | None = None
+
+
 def run_hermes_worker(
     *,
     task_id: int,
@@ -118,6 +126,8 @@ def run_hermes_worker(
         run_id=run_id,
         role=role,
     )
+    if validation_error is None:
+        validation_error = _validate_artifact_shape(artifact=artifact, role=role)
     if validation_error:
         return HermesWorkerResult(
             status="failed",
@@ -135,6 +145,80 @@ def run_hermes_worker(
         stderr=completed.stderr,
         artifact=artifact,
         command=tuple(command),
+    )
+
+
+def run_coder_reviewer_sequence(
+    *,
+    task_id: int,
+    prompt: str,
+    run_root: str | Path,
+    coder: Mapping[str, Any],
+    reviewer: Mapping[str, Any],
+    cwd: str | Path | None = None,
+    env_overrides: Mapping[str, str] | None = None,
+    timeout_seconds: int = 300,
+) -> CoderReviewerSequenceResult:
+    """Run a fakeable coder -> reviewer sequence with artifact handoff."""
+
+    run_root_path = Path(run_root)
+    coder_run_id = str(coder["run_id"])
+    coder_result = run_hermes_worker(
+        task_id=task_id,
+        run_id=coder_run_id,
+        role="coder",
+        prompt=prompt,
+        expected_artifact=run_root_path / coder_run_id / "completion.json",
+        provider=_optional_str(coder, "provider"),
+        model=_optional_str(coder, "model"),
+        profile=_optional_str(coder, "profile"),
+        toolsets=coder.get("toolsets"),
+        cwd=cwd,
+        env_overrides=env_overrides,
+        timeout_seconds=timeout_seconds,
+    )
+    if coder_result.status != "completed" or coder_result.artifact is None:
+        return CoderReviewerSequenceResult(
+            status="failed",
+            coder=coder_result,
+            error=coder_result.error or "Coder worker did not complete",
+        )
+
+    reviewer_run_id = str(reviewer["run_id"])
+    reviewer_prompt = (
+        f"{prompt.rstrip()}\n\n"
+        "CODER COMPLETION TO REVIEW\n"
+        f"Branch: {coder_result.artifact['branch']}\n"
+        f"Head commit: {coder_result.artifact['head_commit']}\n"
+        f"Tests run: {json.dumps(coder_result.artifact['tests_run'], sort_keys=True)}\n"
+        f"Coder summary: {coder_result.artifact.get('summary', '')}\n"
+    )
+    reviewer_result = run_hermes_worker(
+        task_id=task_id,
+        run_id=reviewer_run_id,
+        role="reviewer",
+        prompt=reviewer_prompt,
+        expected_artifact=run_root_path / reviewer_run_id / "completion.json",
+        provider=_optional_str(reviewer, "provider"),
+        model=_optional_str(reviewer, "model"),
+        profile=_optional_str(reviewer, "profile"),
+        toolsets=reviewer.get("toolsets"),
+        cwd=cwd,
+        env_overrides=env_overrides,
+        timeout_seconds=timeout_seconds,
+    )
+    if reviewer_result.status != "completed" or reviewer_result.artifact is None:
+        return CoderReviewerSequenceResult(
+            status="failed",
+            coder=coder_result,
+            reviewer=reviewer_result,
+            error=reviewer_result.error or "Reviewer worker did not complete",
+        )
+
+    return CoderReviewerSequenceResult(
+        status="completed",
+        coder=coder_result,
+        reviewer=reviewer_result,
     )
 
 
@@ -184,3 +268,29 @@ def _validate_artifact_identity(
     if artifact.get("role") != role:
         return f"Role mismatch in completion artifact: expected {role}, got {artifact.get('role')!r}"
     return None
+
+
+def _validate_artifact_shape(*, artifact: Mapping[str, Any], role: str) -> str | None:
+    if role == "coder":
+        for field in ("branch", "head_commit", "tests_run", "summary", "status"):
+            if not artifact.get(field):
+                return f"Missing required coder completion field: {field}"
+        head_commit = artifact.get("head_commit")
+        if not isinstance(head_commit, str) or len(head_commit) != 40:
+            return "Invalid coder completion field: head_commit must be a full 40-character commit SHA"
+        if not isinstance(artifact.get("tests_run"), list):
+            return "Invalid coder completion field: tests_run must be a list"
+    if role == "reviewer":
+        for field in ("verdict", "findings", "summary", "status"):
+            if field not in artifact:
+                return f"Missing required reviewer completion field: {field}"
+        if artifact.get("verdict") not in {"looks_good", "changes_requested", "blocked", "follow_up_needed"}:
+            return f"Invalid reviewer verdict: {artifact.get('verdict')!r}"
+        if not isinstance(artifact.get("findings"), list):
+            return "Invalid reviewer completion field: findings must be a list"
+    return None
+
+
+def _optional_str(mapping: Mapping[str, Any], key: str) -> str | None:
+    value = mapping.get(key)
+    return str(value) if value is not None else None
