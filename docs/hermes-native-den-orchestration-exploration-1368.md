@@ -376,6 +376,20 @@ This still avoids real Hermes/LLM execution and Den MCP side effects, but it pro
 
 Remaining unimplemented pieces include durable Den worker-run rows/status APIs, Den review-round creation, branch existence checks against git, richer finding schemas, abort/rerun/cleanup controls, and a real Hermes smoke test.
 
+### Spike A.3 result — git verification before reviewer launch
+
+Implemented the next real-testing preparation step in commit `10deca1d072b70c6e89a42b7d7bdc7aa7e5d07d7`:
+
+- `run_coder_reviewer_sequence(..., verify_git=True)` now verifies the coder artifact's `branch` exists as a local git branch before reviewer launch.
+- It verifies the reported `head_commit` resolves to a commit and that the branch tip equals that reported head.
+- If git verification fails, the sequence fails closed after the coder artifact and does not launch the reviewer.
+- Tests create temporary real git repositories to cover both missing-branch blocking and successful branch/head resolution.
+- Validation command: `python -m pytest -q` → `9 passed`.
+
+This moves the bridge closer to a real local Hermes smoke test: the reviewer will no longer inspect a claimed branch/head unless the parent can independently resolve that evidence in git.
+
+Remaining unimplemented pieces now include durable Den worker-run rows/status APIs, Den review-round creation, richer reviewer finding schemas, retry loops, abort/rerun/cleanup controls, and a real Hermes/LLM smoke test.
+
 ### delegate_task provider/model override spike
 
 - Unit-test `_resolve_delegation_credentials` with explicit call overrides.
