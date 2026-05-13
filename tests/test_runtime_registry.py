@@ -3,12 +3,17 @@ from pathlib import Path
 import pytest
 
 from den_hermes.runtime_registry import (
+    DEFAULT_RUNTIME_REGISTRY_PATH,
     RuntimeRegistryError,
     resolve_role_runtime,
 )
 
 
 SAMPLE_REGISTRY = Path(__file__).resolve().parents[1] / "config" / "spawned-hermes-runtimes.sample.yaml"
+
+
+def test_default_runtime_registry_path_is_operator_central():
+    assert DEFAULT_RUNTIME_REGISTRY_PATH == Path("/home/agents/runtime/spawned-hermes-runtimes.yaml")
 
 
 def test_resolver_loads_required_roles_from_sample_config():

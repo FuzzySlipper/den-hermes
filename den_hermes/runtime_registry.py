@@ -15,6 +15,7 @@ CANONICAL_ROLES = frozenset({"coder", "reviewer", "validator", "drift_checker", 
 SECRETISH_PATTERN = re.compile(r"(?i)(sk-[a-z0-9_-]{8,}|api[_-]?key|auth[_-]?token|secret|bearer\s+)")
 DEFAULT_PREFLIGHT_PROMPT = "Reply with exactly: PROFILE_OK"
 DEFAULT_PREFLIGHT_EXPECTED = "PROFILE_OK"
+DEFAULT_RUNTIME_REGISTRY_PATH = Path("/home/agents/runtime/spawned-hermes-runtimes.yaml")
 
 
 class RuntimeRegistryError(ValueError):
@@ -233,7 +234,7 @@ def _registry_path(registry_path: str | Path | None) -> Path:
     env_path = os.environ.get("DEN_HERMES_RUNTIME_REGISTRY")
     if env_path:
         return Path(env_path)
-    return Path("/home/agents/profiles/den-hermes-runner/runtime/spawned-hermes-runtimes.yaml")
+    return DEFAULT_RUNTIME_REGISTRY_PATH
 
 
 def _mapping(value: Any, field: str) -> Mapping[str, Any]:

@@ -238,6 +238,8 @@ class DenMcpAdapter:
                     "finding_ids": _json_or_none(artifact.get("finding_ids")),
                 }
             )
+            if "tests_run" in artifact:
+                args["tests_run"] = json.dumps(list(artifact.get("tests_run") or []))
         return args
 
 

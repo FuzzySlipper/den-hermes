@@ -215,6 +215,32 @@ def test_den_mcp_adapter_posts_completion_after_registered_run_with_same_identit
     assert json.loads(completion_args["tests_run"]) == [{"command": "python -m pytest -q", "result": "12 passed"}]
 
 
+def test_den_mcp_adapter_posts_reviewer_completion_test_evidence_when_present():
+    tools = RecordingMcpTools()
+    adapter = make_adapter(tools)
+
+    adapter.mark_worker_completed(
+        task_id=1368,
+        run_id="reviewer-run",
+        role="reviewer",
+        artifact={
+            "status": "completed",
+            "verdict": "looks_good",
+            "findings": [],
+            "finding_ids": [901, 902],
+            "tests_run": [{"command": "python -m pytest tests/ -q", "result": "54 passed"}],
+            "summary": "Reviewed successfully.",
+        },
+    )
+
+    completion_args = tools.calls[0][1]
+    assert completion_args["packet_type"] == "review_findings_packet"
+    assert completion_args["finding_ids"] == "[901, 902]"
+    assert json.loads(completion_args["tests_run"]) == [
+        {"command": "python -m pytest tests/ -q", "result": "54 passed"}
+    ]
+
+
 def test_den_mcp_adapter_observes_registered_completion_via_worker_tools():
     tools = StatefulFakeDenTools()
     adapter = make_adapter(tools)

@@ -1,5 +1,5 @@
 # Sample central spawned-Hermes runtime registry.
-# Copy to /home/agents/profiles/den-hermes-runner/runtime/spawned-hermes-runtimes.yaml
+# Copy to /home/agents/runtime/spawned-hermes-runtimes.yaml
 # or point DEN_HERMES_RUNTIME_REGISTRY at an operator-owned copy.
 # Do not put API keys, auth tokens, .env contents, auth.json contents, or full environment dumps here.
 

@@ -17,7 +17,7 @@ Use a **central spawned-Hermes role-runtime registry** resolved by `den-hermes-b
 Recommended active registry path on this fleet:
 
 ```text
-/home/agents/profiles/den-hermes-runner/runtime/spawned-hermes-runtimes.yaml
+/home/agents/runtime/spawned-hermes-runtimes.yaml
 ```
 
 Recommended repo-managed reference/sample path:
@@ -48,16 +48,16 @@ A Den document should mirror the current registry contract and optionally the sa
 
 ### 4.1 Active registry
 
-The active registry is an operator-editable YAML file under the runner profile's shared configuration area:
+The active registry is an operator-editable YAML file under the shared agent runtime area:
 
 ```text
-/home/agents/profiles/den-hermes-runner/runtime/spawned-hermes-runtimes.yaml
+/home/agents/runtime/spawned-hermes-runtimes.yaml
 ```
 
 Why this location:
 
 - It is central for this bridge runner profile and not tied to any one Den project.
-- It lives next to the profile credentials/auth context that spawned workers already depend on, while not exposing credential contents.
+- It is separated from profile credential/auth state while still living under the shared `/home/agents` operational tree.
 - It is easy for operators to edit without changing Den task metadata.
 - It can be backed up, diffed, and copied between runner hosts.
 - It keeps runtime launch independent of Den doc availability during outage/degraded periods.
@@ -274,7 +274,7 @@ The resolver should return a typed object that is already safe to hand to launch
 {
   "schema_version": 1,
   "registry_id": "den-hermes-runner-defaults",
-  "registry_path": "/home/agents/profiles/den-hermes-runner/runtime/spawned-hermes-runtimes.yaml",
+  "registry_path": "/home/agents/runtime/spawned-hermes-runtimes.yaml",
   "registry_fingerprint": "sha256:...",
   "resolved_at": "2026-05-13T00:00:00Z",
   "role": "coder",
@@ -371,7 +371,7 @@ den-hermes runtime matrix
 Example output:
 
 ```text
-Registry: den-hermes-runner-defaults (/home/agents/profiles/den-hermes-runner/runtime/spawned-hermes-runtimes.yaml)
+Registry: den-hermes-runner-defaults (/home/agents/runtime/spawned-hermes-runtimes.yaml)
 Fingerprint: sha256:...
 
 ROLE            PROFILE             PROVIDER       MODEL     TOOLSETS        TIMEOUT  RUNTIME
@@ -559,7 +559,7 @@ Recommendation: use profiles for credentials/personality/tool availability, not 
 
 ## 15. Final recommendation
 
-Implement #1387 as a small Python resolver over one central YAML registry. Keep the active registry in the runner profile configuration area, ship a repo sample, mirror the design/sanitized matrix in Den docs, and make all launcher paths resolve role runtimes before Den registration.
+Implement #1387 as a small Python resolver over one central YAML registry. Keep the active registry in the shared agent runtime area, ship a repo sample, mirror the design/sanitized matrix in Den docs, and make all launcher paths resolve role runtimes before Den registration.
 
 The normal operator move should be:
 
@@ -585,7 +585,7 @@ result = run_den_coder_reviewer_workflow(
     cwd="/home/dev/den-hermes",
     coder={"run_id": "coder-run"},
     reviewer={"run_id": "reviewer-run"},
-    runtime_registry_path="/home/agents/profiles/den-hermes-runner/runtime/spawned-hermes-runtimes.yaml",
+    runtime_registry_path="/home/agents/runtime/spawned-hermes-runtimes.yaml",
 )
 ```
 
@@ -619,4 +619,4 @@ OK coder profile=den-hermes-runner provider=openai-codex model=gpt-5.5 exit=0
 OK reviewer profile=den-hermes-runner provider=openai-codex model=gpt-5.5 exit=0
 ```
 
-To change the active reviewer pick, edit the active registry file (normally `/home/agents/profiles/den-hermes-runner/runtime/spawned-hermes-runtimes.yaml`), run `validate`, then run `preflight --roles reviewer`. Do not edit Den project/task metadata to change runtime picks.
+To change the active reviewer pick, edit the active registry file (normally `/home/agents/runtime/spawned-hermes-runtimes.yaml`), run `validate`, then run `preflight --roles reviewer`. Do not edit Den project/task metadata to change runtime picks.

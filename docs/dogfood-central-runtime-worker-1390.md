@@ -5,7 +5,7 @@ This is a disposable real spawned-Hermes dogfood report for `den-hermes-bridge` 
 Central spawned-Hermes role-runtime registry path used by the parent orchestrator:
 
 ```text
-/home/agents/profiles/den-hermes-runner/runtime/spawned-hermes-runtimes.yaml
+/home/agents/runtime/spawned-hermes-runtimes.yaml
 ```
 
 ## Parent orchestrator verification checklist
