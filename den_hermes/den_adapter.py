@@ -50,6 +50,7 @@ class DenMcpAdapter:
         timeout_seconds: int | None = None,
         artifact_path: str | None = None,
         log_path: str | None = None,
+        runtime_id: str | None = None,
         prompt_packet_message_id: int | None = None,
         state_file_ref: str | None = None,
         dedupe_key: str | None = None,

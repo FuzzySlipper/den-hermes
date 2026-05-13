@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from den_hermes.runtime_registry import RuntimeRegistryError, resolve_role_runtime
+
 
 @dataclass(frozen=True)
 class HermesWorkerResult:
@@ -251,6 +253,7 @@ def run_den_coder_reviewer_workflow(
     cwd: str | Path | None = None,
     env_overrides: Mapping[str, str] | None = None,
     timeout_seconds: int = 300,
+    runtime_registry_path: str | Path | None = None,
     verify_git: bool = False,
 ) -> DenCoderReviewerWorkflowResult:
     """Run coder -> Den review request -> reviewer with a fakeable Den client.
@@ -262,21 +265,44 @@ def run_den_coder_reviewer_workflow(
 
     run_root_path = Path(run_root)
     cwd_path = str(cwd) if cwd is not None else None
-    coder_run_id = str(coder["run_id"])
+    try:
+        coder_runtime = _resolve_workflow_worker_config(
+            role="coder",
+            worker=coder,
+            registry_path=runtime_registry_path,
+            run_id=str(coder["run_id"]),
+        )
+        reviewer_runtime = _resolve_workflow_worker_config(
+            role="reviewer",
+            worker=reviewer,
+            registry_path=runtime_registry_path,
+            run_id=str(reviewer["run_id"]),
+        )
+    except (KeyError, RuntimeRegistryError, ValueError) as exc:
+        error = f"Runtime resolver failed: {exc}"
+        return DenCoderReviewerWorkflowResult(
+            status="failed",
+            coder=HermesWorkerResult(status="failed", exit_code=None, stdout="", stderr="", error=error),
+            error=error,
+        )
+    coder_timeout_seconds = int(coder_runtime.get("timeout_seconds", timeout_seconds))
+    reviewer_timeout_seconds = int(reviewer_runtime.get("timeout_seconds", timeout_seconds))
+    coder_run_id = str(coder_runtime["run_id"])
     coder_artifact_path = run_root_path / coder_run_id / "completion.json"
     try:
         den_client.register_worker_run(
             task_id=task_id,
             run_id=coder_run_id,
             role="coder",
-            profile=_optional_str(coder, "profile"),
-            provider=_optional_str(coder, "provider"),
-            model=_optional_str(coder, "model"),
-            toolsets=coder.get("toolsets"),
+            profile=_optional_str(coder_runtime, "profile"),
+            provider=_optional_str(coder_runtime, "provider"),
+            model=_optional_str(coder_runtime, "model"),
+            toolsets=coder_runtime.get("toolsets"),
             workdir=cwd_path,
-            timeout_seconds=timeout_seconds,
+            timeout_seconds=coder_timeout_seconds,
             artifact_path=str(coder_artifact_path),
             log_path=str(run_root_path / coder_run_id / "worker.log"),
+            runtime_id=_optional_str(coder_runtime, "runtime_id"),
             dedupe_key=f"{task_id}:coder:{coder_run_id}",
         )
     except Exception as exc:  # noqa: BLE001 - fail closed before subprocess launch
@@ -293,13 +319,13 @@ def run_den_coder_reviewer_workflow(
         role="coder",
         prompt=prompt,
         expected_artifact=coder_artifact_path,
-        provider=_optional_str(coder, "provider"),
-        model=_optional_str(coder, "model"),
-        profile=_optional_str(coder, "profile"),
-        toolsets=coder.get("toolsets"),
+        provider=_optional_str(coder_runtime, "provider"),
+        model=_optional_str(coder_runtime, "model"),
+        profile=_optional_str(coder_runtime, "profile"),
+        toolsets=coder_runtime.get("toolsets"),
         cwd=cwd,
         env_overrides=env_overrides,
-        timeout_seconds=timeout_seconds,
+        timeout_seconds=coder_timeout_seconds,
     )
     if coder_result.status == "completed" and coder_result.artifact is not None:
         try:
@@ -331,7 +357,7 @@ def run_den_coder_reviewer_workflow(
         coder_run_id=coder_run_id,
     )
 
-    reviewer_run_id = str(reviewer["run_id"])
+    reviewer_run_id = str(reviewer_runtime["run_id"])
     reviewer_artifact_path = run_root_path / reviewer_run_id / "completion.json"
     try:
         den_client.register_worker_run(
@@ -340,14 +366,15 @@ def run_den_coder_reviewer_workflow(
             role="reviewer",
             branch=coder_result.artifact["branch"],
             head_commit=coder_result.artifact["head_commit"],
-            profile=_optional_str(reviewer, "profile"),
-            provider=_optional_str(reviewer, "provider"),
-            model=_optional_str(reviewer, "model"),
-            toolsets=reviewer.get("toolsets"),
+            profile=_optional_str(reviewer_runtime, "profile"),
+            provider=_optional_str(reviewer_runtime, "provider"),
+            model=_optional_str(reviewer_runtime, "model"),
+            toolsets=reviewer_runtime.get("toolsets"),
             workdir=cwd_path,
-            timeout_seconds=timeout_seconds,
+            timeout_seconds=reviewer_timeout_seconds,
             artifact_path=str(reviewer_artifact_path),
             log_path=str(run_root_path / reviewer_run_id / "worker.log"),
+            runtime_id=_optional_str(reviewer_runtime, "runtime_id"),
             dedupe_key=f"{task_id}:reviewer:{reviewer_run_id}",
         )
     except Exception as exc:  # noqa: BLE001 - fail closed before reviewer subprocess launch
@@ -374,13 +401,13 @@ def run_den_coder_reviewer_workflow(
         role="reviewer",
         prompt=reviewer_prompt,
         expected_artifact=reviewer_artifact_path,
-        provider=_optional_str(reviewer, "provider"),
-        model=_optional_str(reviewer, "model"),
-        profile=_optional_str(reviewer, "profile"),
-        toolsets=reviewer.get("toolsets"),
+        provider=_optional_str(reviewer_runtime, "provider"),
+        model=_optional_str(reviewer_runtime, "model"),
+        profile=_optional_str(reviewer_runtime, "profile"),
+        toolsets=reviewer_runtime.get("toolsets"),
         cwd=cwd,
         env_overrides=env_overrides,
-        timeout_seconds=timeout_seconds,
+        timeout_seconds=reviewer_timeout_seconds,
     )
     if reviewer_result.status != "completed" or reviewer_result.artifact is None:
         error = reviewer_result.error or "Reviewer worker did not complete"
@@ -492,6 +519,42 @@ def _validate_artifact_shape(*, artifact: Mapping[str, Any], role: str) -> str |
         if not isinstance(artifact.get("findings"), list):
             return "Invalid reviewer completion field: findings must be a list"
     return None
+
+
+def _resolve_workflow_worker_config(
+    *,
+    role: str,
+    worker: Mapping[str, Any],
+    registry_path: str | Path | None,
+    run_id: str,
+) -> dict[str, Any]:
+    config = dict(worker)
+    if registry_path is None:
+        return config
+
+    runtime_fields = {"profile", "provider", "model", "toolsets", "timeout_seconds", "runtime_id"}
+    overrides = {key: config[key] for key in runtime_fields if key in config}
+    runtime = resolve_role_runtime(
+        role,
+        registry_path=registry_path,
+        run_id=run_id,
+        overrides=overrides or None,
+        allow_runtime_override=bool(config.get("allow_runtime_override", False)),
+        override_reason=_optional_str(config, "override_reason"),
+        requested_by=_optional_str(config, "requested_by"),
+    )
+    resolved = {
+        "run_id": run_id,
+        "runtime_id": runtime.runtime_id,
+        "profile": runtime.profile,
+        "provider": runtime.provider,
+        "model": runtime.model,
+        "toolsets": list(runtime.toolsets),
+        "timeout_seconds": runtime.timeout_seconds,
+    }
+    if runtime.override is not None:
+        resolved["runtime_override"] = dict(runtime.override)
+    return resolved
 
 
 def _optional_str(mapping: Mapping[str, Any], key: str) -> str | None:

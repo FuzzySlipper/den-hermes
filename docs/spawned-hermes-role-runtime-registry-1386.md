@@ -571,3 +571,30 @@ den-hermes runtime matrix
 ```
 
 Then all subsequent coder/reviewer/validator/drift/packet-auditor launches use the new central picks and record the resolved profile/provider/model/toolsets in Den worker-run metadata for audit.
+
+## 16. Launcher integration example (#1388)
+
+The first launcher integration resolves coder/reviewer runtimes when `run_den_coder_reviewer_workflow(...)` receives a registry path:
+
+```python
+result = run_den_coder_reviewer_workflow(
+    den_client=den,
+    task_id=1388,
+    prompt="Use the bounded Den packet context.",
+    run_root="/tmp/den-hermes",
+    cwd="/home/dev/den-hermes",
+    coder={"run_id": "coder-run"},
+    reviewer={"run_id": "reviewer-run"},
+    runtime_registry_path="/home/agents/profiles/den-hermes-runner/runtime/spawned-hermes-runtimes.yaml",
+)
+```
+
+With the registry enabled:
+
+- `coder` and `reviewer` only need run identity at the call site; profile/provider/model/toolsets/timeouts come from the central registry.
+- The Hermes subprocess command is explicit: `hermes --profile <resolved-profile> chat --provider <resolved-provider> --model <resolved-model> --toolsets <resolved-toolsets> ...`.
+- Den registration receives the resolved profile/provider/model/toolsets/timeout and the local bridge records the resolved `runtime_id` when the injected Den client supports it.
+- Hidden per-call runtime fields such as `coder={"provider": "..."}` are rejected unless they are declared as audited emergency overrides with `allow_runtime_override`, `override_reason`, and `requested_by`.
+- Resolver failures happen before Den registration and before any subprocess launch.
+
+Existing low-level tests still support explicit inline profile/provider/model values for fake/manual flows without a registry path. Durable Den orchestrator paths should pass the registry path (or use `DEN_HERMES_RUNTIME_REGISTRY` once launcher wiring is promoted to always-on central resolution).

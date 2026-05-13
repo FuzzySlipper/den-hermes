@@ -131,6 +131,59 @@ def read_fake_calls(tmp_path: Path) -> list[dict]:
     ]
 
 
+def write_runtime_registry(tmp_path: Path, *, coder_model="model-coder", reviewer_model="model-reviewer") -> Path:
+    registry = tmp_path / "runtime-registry.yaml"
+    registry.write_text(
+        f"""
+schema_version: 1
+registry_id: test-launcher-registry
+defaults:
+  substrate: spawned_hermes
+  hermes_binary: hermes
+  run_root: {tmp_path / 'runs'}
+  artifact_filename: completion.json
+  log_filename: worker.log
+  profile_required: true
+  provider_required: true
+  model_required: true
+  timeout_seconds: 600
+  toolsets: [file]
+  workdir: {tmp_path}
+roles:
+  coder:
+    runtime_id: coder-runtime
+    profile: den-coder-profile
+    provider: provider-coder
+    model: {coder_model}
+    toolsets: [terminal, file]
+    timeout_seconds: 901
+  reviewer:
+    runtime_id: reviewer-runtime
+    profile: den-reviewer-profile
+    provider: provider-reviewer
+    model: {reviewer_model}
+    toolsets: [file]
+    timeout_seconds: 902
+  validator:
+    runtime_id: validator-runtime
+    profile: den-validator-profile
+    provider: provider-validator
+    model: model-validator
+  drift_checker:
+    runtime_id: drift-runtime
+    profile: den-drift-profile
+    provider: provider-drift
+    model: model-drift
+  packet_auditor:
+    runtime_id: audit-runtime
+    profile: den-audit-profile
+    provider: provider-audit
+    model: model-audit
+"""
+    )
+    return registry
+
+
 class RecordingDenClient:
     def __init__(
         self,
@@ -386,6 +439,117 @@ def test_sequence_git_verification_allows_reviewer_when_branch_head_resolve(tmp_
     assert result.status == "completed"
     assert result.coder.artifact["head_commit"] == head
     assert [call["env"]["DEN_WORKER_ROLE"] for call in read_fake_calls(tmp_path)] == ["coder", "reviewer"]
+
+
+def test_den_workflow_uses_resolved_runtime_for_coder_and_reviewer(tmp_path):
+    head = init_git_repo(tmp_path)
+    subprocess.run(["git", "checkout", "-b", "task/1368-fake"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    env = fake_env(tmp_path)
+    env["FAKE_HEAD"] = head
+    den = RecordingDenClient()
+    registry = write_runtime_registry(tmp_path)
+
+    result = run_den_coder_reviewer_workflow(
+        den_client=den,
+        task_id=1368,
+        prompt="Use the Den task context to implement and review task 1368.",
+        run_root=tmp_path / ".den" / "runs",
+        cwd=tmp_path,
+        verify_git=True,
+        coder={"run_id": "coder-run"},
+        reviewer={"run_id": "reviewer-run"},
+        runtime_registry_path=registry,
+        env_overrides=env,
+    )
+
+    assert result.status == "completed"
+    coder_registration = den.events[0][4]
+    reviewer_registration = den.events[4][4]
+    assert coder_registration["profile"] == "den-coder-profile"
+    assert coder_registration["provider"] == "provider-coder"
+    assert coder_registration["model"] == "model-coder"
+    assert coder_registration["toolsets"] == ["terminal", "file"]
+    assert coder_registration["timeout_seconds"] == 901
+    assert coder_registration["runtime_id"] == "coder-runtime"
+    assert reviewer_registration["profile"] == "den-reviewer-profile"
+    assert reviewer_registration["provider"] == "provider-reviewer"
+    assert reviewer_registration["model"] == "model-reviewer"
+    assert reviewer_registration["runtime_id"] == "reviewer-runtime"
+    calls = read_fake_calls(tmp_path)
+    assert calls[0]["argv"][calls[0]["argv"].index("--profile") + 1] == "den-coder-profile"
+    assert calls[0]["argv"][calls[0]["argv"].index("--model") + 1] == "model-coder"
+    assert calls[1]["argv"][calls[1]["argv"].index("--profile") + 1] == "den-reviewer-profile"
+    assert calls[1]["argv"][calls[1]["argv"].index("--model") + 1] == "model-reviewer"
+
+
+def test_den_workflow_central_runtime_change_changes_launch_args(tmp_path):
+    head = init_git_repo(tmp_path)
+    subprocess.run(["git", "checkout", "-b", "task/1368-fake"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    env = fake_env(tmp_path)
+    env["FAKE_HEAD"] = head
+    registry = write_runtime_registry(tmp_path, coder_model="model-coder-v2", reviewer_model="model-reviewer-v2")
+
+    result = run_den_coder_reviewer_workflow(
+        den_client=RecordingDenClient(),
+        task_id=1368,
+        prompt="Use the Den task context to implement and review task 1368.",
+        run_root=tmp_path / ".den" / "runs",
+        cwd=tmp_path,
+        verify_git=True,
+        coder={"run_id": "coder-run"},
+        reviewer={"run_id": "reviewer-run"},
+        runtime_registry_path=registry,
+        env_overrides=env,
+    )
+
+    assert result.status == "completed"
+    calls = read_fake_calls(tmp_path)
+    assert calls[0]["argv"][calls[0]["argv"].index("--model") + 1] == "model-coder-v2"
+    assert calls[1]["argv"][calls[1]["argv"].index("--model") + 1] == "model-reviewer-v2"
+
+
+def test_den_workflow_resolver_failure_prevents_worker_launch(tmp_path):
+    registry = write_runtime_registry(tmp_path)
+    registry.write_text(registry.read_text().replace("    profile: den-coder-profile\n", "", 1))
+    den = RecordingDenClient()
+
+    result = run_den_coder_reviewer_workflow(
+        den_client=den,
+        task_id=1368,
+        prompt="Use the Den task context to implement and review task 1368.",
+        run_root=tmp_path / ".den" / "runs",
+        cwd=tmp_path,
+        coder={"run_id": "coder-run"},
+        reviewer={"run_id": "reviewer-run"},
+        runtime_registry_path=registry,
+        env_overrides=fake_env(tmp_path),
+    )
+
+    assert result.status == "failed"
+    assert "runtime resolver failed" in result.error.lower()
+    assert den.events == []
+    assert not (tmp_path / "fake-hermes-call.jsonl").exists()
+
+
+def test_den_workflow_rejects_hidden_runtime_override_when_registry_enabled(tmp_path):
+    den = RecordingDenClient()
+
+    result = run_den_coder_reviewer_workflow(
+        den_client=den,
+        task_id=1368,
+        prompt="Use the Den task context to implement and review task 1368.",
+        run_root=tmp_path / ".den" / "runs",
+        cwd=tmp_path,
+        coder={"run_id": "coder-run", "provider": "hidden-provider"},
+        reviewer={"run_id": "reviewer-run"},
+        runtime_registry_path=write_runtime_registry(tmp_path),
+        env_overrides=fake_env(tmp_path),
+    )
+
+    assert result.status == "failed"
+    assert "allow_runtime_override" in result.error
+    assert den.events == []
+    assert not (tmp_path / "fake-hermes-call.jsonl").exists()
 
 
 def test_den_workflow_registers_coder_before_launching_worker(tmp_path):
