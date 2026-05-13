@@ -1,0 +1,185 @@
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass
+from typing import Any, Mapping, Sequence
+
+
+@dataclass(frozen=True)
+class DenMcpAdapter:
+    """Adapter from spawned-Hermes workflow events to Den MCP tool calls.
+
+    The `tools` object is intentionally injected so tests can use a recorder and
+    the runner can pass an object exposing the real `mcp_den_*` callables.
+    """
+
+    tools: Any
+    project_id: str
+    requested_by: str
+    base_branch: str
+    base_commit: str
+    reviewer_identity: str | None = None
+
+    def mark_worker_started(self, *, task_id: int, run_id: str, role: str) -> Any:
+        return self.tools.mcp_den_send_message(
+            project_id=self.project_id,
+            sender=self.requested_by,
+            task_id=task_id,
+            content=f"Spawned-Hermes {role} worker `{run_id}` started.",
+            metadata={"type": "spawned_hermes_worker_started", "run_id": run_id, "role": role},
+            intent="handoff",
+        )
+
+    def mark_worker_completed(self, *, task_id: int, run_id: str, role: str, artifact: Mapping[str, Any]) -> Any:
+        return self.tools.mcp_den_post_worker_completion_packet(
+            **self._completion_packet_args(task_id=task_id, run_id=run_id, role=role, artifact=artifact)
+        )
+
+    def mark_worker_failed(self, *, task_id: int, run_id: str, role: str, error: str) -> Any:
+        return self.tools.mcp_den_post_worker_completion_packet(
+            project_id=self.project_id,
+            run_id=run_id,
+            requested_by=self.requested_by,
+            status="failed",
+            role=role,
+            packet_type="worker_failure_packet",
+            summary=error,
+            failure_category="spawned_hermes_worker_failed",
+            recovery_guidance=(
+                "Inspect spawned-Hermes stdout/stderr and completion artifact path, "
+                "then rerun or abort the local worker."
+            ),
+            dedupe_key=f"{run_id}:failed",
+        )
+
+    def request_review(
+        self,
+        *,
+        task_id: int,
+        branch: str,
+        head_commit: str,
+        tests_run: Sequence[Any],
+        coder_run_id: str,
+    ) -> Any:
+        return self.tools.mcp_den_request_review(
+            project_id=self.project_id,
+            task_id=task_id,
+            requested_by=self.requested_by,
+            branch=branch,
+            base_branch=self.base_branch,
+            base_commit=self.base_commit,
+            head_commit=head_commit,
+            tests_run=json.dumps(list(tests_run)),
+            notes=f"Spawned-Hermes coder run {coder_run_id} produced verified branch/head evidence.",
+            run_id=coder_run_id,
+        )
+
+    def post_review_findings(
+        self,
+        *,
+        task_id: int,
+        review_request: Mapping[str, Any],
+        reviewer_run_id: str,
+        verdict: str,
+        findings: Sequence[Mapping[str, Any]],
+        summary: str,
+    ) -> None:
+        review_round_id = _review_round_id(review_request)
+        thread_id = _review_thread_id(review_request)
+        reviewer = self.reviewer_identity or f"{self.requested_by}-reviewer"
+
+        for finding in findings:
+            self.tools.mcp_den_create_review_finding(
+                review_round_id=review_round_id,
+                created_by=reviewer,
+                category=str(finding.get("category", "acceptance_gap")),
+                summary=str(finding.get("summary", "Reviewer finding")),
+                notes=finding.get("notes"),
+                file_references=_json_or_none(finding.get("file_references")),
+                test_commands=_json_or_none(finding.get("test_commands")),
+                run_id=reviewer_run_id,
+                subagent_role="reviewer",
+            )
+
+        self.tools.mcp_den_post_review_findings(
+            project_id=self.project_id,
+            task_id=task_id,
+            review_round_id=review_round_id,
+            sender=reviewer,
+            thread_id=thread_id,
+            notes=summary,
+            run_id=reviewer_run_id,
+            subagent_role="reviewer",
+        )
+        self.tools.mcp_den_set_review_verdict(
+            review_round_id=review_round_id,
+            verdict=verdict,
+            decided_by=reviewer,
+            notes=summary,
+            run_id=reviewer_run_id,
+            subagent_role="reviewer",
+        )
+
+    def _completion_packet_args(
+        self,
+        *,
+        task_id: int,
+        run_id: str,
+        role: str,
+        artifact: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        packet_type = _packet_type_for_role(role)
+        args: dict[str, Any] = {
+            "project_id": self.project_id,
+            "run_id": run_id,
+            "requested_by": self.requested_by,
+            "status": str(artifact.get("status", "completed")),
+            "role": role,
+            "packet_type": packet_type,
+            "summary": str(artifact.get("summary", "Spawned-Hermes worker completed.")),
+            "dedupe_key": f"{run_id}:completed",
+        }
+        if role == "coder":
+            args.update(
+                {
+                    "branch": artifact.get("branch"),
+                    "head_commit": artifact.get("head_commit"),
+                    "base_commit": artifact.get("base_commit", self.base_commit),
+                    "tests_run": json.dumps(list(artifact.get("tests_run", []))),
+                }
+            )
+        if role == "reviewer":
+            args.update(
+                {
+                    "finding_ids": _json_or_none(artifact.get("finding_ids")),
+                }
+            )
+        return args
+
+
+def _packet_type_for_role(role: str) -> str:
+    return {
+        "coder": "implementation_packet",
+        "reviewer": "review_findings_packet",
+        "validator": "validation_packet",
+        "drift_checker": "drift_check_packet",
+        "packet_auditor": "packet_audit_packet",
+    }.get(role, "worker_failure_packet")
+
+
+def _json_or_none(value: Any) -> str | None:
+    if value is None:
+        return None
+    return json.dumps(value)
+
+
+def _review_round_id(review_request: Mapping[str, Any]) -> int:
+    value = review_request.get("review_round_id", review_request.get("id"))
+    if value is None:
+        raise ValueError("review_request must include review_round_id or id")
+    return int(value)
+
+
+def _review_thread_id(review_request: Mapping[str, Any]) -> int | None:
+    value = review_request.get("message_id", review_request.get("thread_id"))
+    return int(value) if value is not None else None

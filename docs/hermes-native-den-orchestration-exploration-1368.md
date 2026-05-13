@@ -419,6 +419,23 @@ This still does not create live Den review findings. It locks in the mapping poi
 
 Remaining unimplemented pieces now include a real Den MCP client adapter, live Den review-round/finding creation, retry loops, abort/rerun/cleanup controls, and a real Hermes/LLM smoke test.
 
+### Spike A.6 result — Den MCP adapter mapping layer
+
+Implemented a first real adapter mapping layer in `den_hermes/den_adapter.py`:
+
+- Added `DenMcpAdapter`, which accepts an injected object exposing the real `mcp_den_*` callables. This keeps tests fake while preserving the production call shape.
+- `mark_worker_started(...)` maps local spawned-Hermes lifecycle to a Den task-thread message with structured metadata.
+- `mark_worker_completed(...)` maps worker artifacts to `mcp_den_post_worker_completion_packet`, including coder branch/head/tests and packet type selection by role.
+- `mark_worker_failed(...)` maps failures to a `worker_failure_packet` with recovery guidance.
+- `request_review(...)` maps verified coder branch/head/tests to `mcp_den_request_review` with configured project/base branch/base commit metadata.
+- `post_review_findings(...)` maps reviewer artifacts to `mcp_den_create_review_finding`, `mcp_den_post_review_findings`, and `mcp_den_set_review_verdict` call sequences.
+- Tests use `RecordingMcpTools` to assert exact MCP argument payloads without mutating live Den.
+- Validation command: `python -m pytest -q` → `15 passed`.
+
+This is the first non-fake Den adapter implementation, but it remains tested via injected test doubles. A later live smoke should instantiate it with real MCP tool callables and run against a disposable Den task/repo before using it on substantial code work.
+
+Remaining unimplemented pieces now include live Den adapter smoke execution, richer finding normalization/validation, retry loops, abort/rerun/cleanup controls, and a real Hermes/LLM smoke test.
+
 ### delegate_task provider/model override spike
 
 - Unit-test `_resolve_delegation_credentials` with explicit call overrides.
