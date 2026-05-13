@@ -1,11 +1,14 @@
 import json
 
+import pytest
+
 from den_hermes.den_adapter import DenMcpAdapter
 
 
 class RecordingMcpTools:
     def __init__(self):
         self.calls = []
+        self.completion_response = {"id": 2001}
 
     def mcp_den_send_message(self, **kwargs):
         self.calls.append(("send_message", kwargs))
@@ -13,7 +16,7 @@ class RecordingMcpTools:
 
     def mcp_den_post_worker_completion_packet(self, **kwargs):
         self.calls.append(("post_worker_completion_packet", kwargs))
-        return {"id": 2001}
+        return self.completion_response
 
     def mcp_den_request_review(self, **kwargs):
         self.calls.append(("request_review", kwargs))
@@ -190,3 +193,31 @@ def test_den_mcp_adapter_posts_worker_completion_packets_for_completed_and_faile
             },
         ),
     ]
+
+
+def test_den_mcp_adapter_fails_closed_when_worker_completion_is_rejected():
+    tools = RecordingMcpTools()
+    tools.completion_response = {
+        "completion_state": "missing_run",
+        "failure_category": "missing_worker_run",
+        "summary": "Worker run/session 'smoke-run' was not found in project 'den-hermes-bridge'.",
+        "diagnostics": ["Worker run/session 'smoke-run' was not found in project 'den-hermes-bridge'."],
+    }
+    adapter = make_adapter(tools)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        adapter.mark_worker_completed(
+            task_id=1370,
+            run_id="smoke-run",
+            role="coder",
+            artifact={
+                "status": "completed",
+                "branch": "main",
+                "head_commit": "b" * 40,
+                "tests_run": [{"command": "python -m pytest -q", "result": "15 passed"}],
+                "summary": "Synthetic smoke completion.",
+            },
+        )
+
+    assert "missing_run" in str(excinfo.value)
+    assert "smoke-run" in str(excinfo.value)

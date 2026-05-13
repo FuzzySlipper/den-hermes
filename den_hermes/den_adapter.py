@@ -31,12 +31,14 @@ class DenMcpAdapter:
         )
 
     def mark_worker_completed(self, *, task_id: int, run_id: str, role: str, artifact: Mapping[str, Any]) -> Any:
-        return self.tools.mcp_den_post_worker_completion_packet(
+        response = self.tools.mcp_den_post_worker_completion_packet(
             **self._completion_packet_args(task_id=task_id, run_id=run_id, role=role, artifact=artifact)
         )
+        _ensure_completion_packet_accepted(response, run_id=run_id, role=role)
+        return response
 
     def mark_worker_failed(self, *, task_id: int, run_id: str, role: str, error: str) -> Any:
-        return self.tools.mcp_den_post_worker_completion_packet(
+        response = self.tools.mcp_den_post_worker_completion_packet(
             project_id=self.project_id,
             run_id=run_id,
             requested_by=self.requested_by,
@@ -51,6 +53,8 @@ class DenMcpAdapter:
             ),
             dedupe_key=f"{run_id}:failed",
         )
+        _ensure_completion_packet_accepted(response, run_id=run_id, role=role)
+        return response
 
     def request_review(
         self,
@@ -165,6 +169,34 @@ def _packet_type_for_role(role: str) -> str:
         "drift_checker": "drift_check_packet",
         "packet_auditor": "packet_audit_packet",
     }.get(role, "worker_failure_packet")
+
+
+def _ensure_completion_packet_accepted(response: Any, *, run_id: str, role: str) -> None:
+    payload = _response_payload(response)
+    if not isinstance(payload, Mapping):
+        return
+    completion_state = payload.get("completion_state")
+    failure_category = payload.get("failure_category")
+    if completion_state in {"missing_run", "malformed", "rejected"} or failure_category:
+        summary = payload.get("summary") or payload.get("error") or "Den rejected worker completion packet"
+        raise RuntimeError(
+            f"Den rejected {role} completion packet for run {run_id}: "
+            f"completion_state={completion_state!r}, failure_category={failure_category!r}, summary={summary}"
+        )
+
+
+def _response_payload(response: Any) -> Any:
+    if isinstance(response, str):
+        try:
+            return json.loads(response)
+        except json.JSONDecodeError:
+            return response
+    if isinstance(response, Mapping) and isinstance(response.get("result"), str):
+        try:
+            return json.loads(response["result"])
+        except json.JSONDecodeError:
+            return response
+    return response
 
 
 def _json_or_none(value: Any) -> str | None:

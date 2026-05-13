@@ -443,3 +443,37 @@ Remaining unimplemented pieces now include live Den adapter smoke execution, ric
 - Unit-test ACP override precedence.
 - Unit-test invalid provider returns `tool_error` without launching a child.
 - Unit-test dynamic schema includes the new fields and safety wording.
+
+## Live adapter smoke — task #1370 (2026-05-13)
+
+After the initial adapter mapping was merged to `main`, Patch approved a constrained live adapter smoke. The smoke used task `#1370` as a child of `#1368` and synthetic spawned-Hermes worker run ids only. It did not launch Pi/tmux/docker workers and did not launch real LLM coder/reviewer workers.
+
+Live payloads tested:
+
+- `mcp_den_send_message` for coder/reviewer worker-start lifecycle notes: accepted (`#5779`, `#5781`).
+- `mcp_den_request_review` with adapter-shaped branch/base/head/tests metadata: accepted, creating review round `#673` and message `#5780`.
+- `mcp_den_create_review_finding`: accepted, creating synthetic finding `#730` / `R1370-1`.
+- `mcp_den_post_review_findings`: accepted, creating review feedback message `#5782`.
+- `mcp_den_set_review_verdict`: accepted with `follow_up_needed` on review round `#673`.
+
+Important live finding:
+
+- `mcp_den_post_worker_completion_packet` rejected both synthetic coder and reviewer run ids with `completion_state="missing_run"` / `failure_category="missing_worker_run"`.
+- This means the current Den completion-packet endpoint is tied to a pre-existing Den worker-run/session record. A pure local spawned-Hermes run cannot be reconciled through that endpoint unless `den-hermes-bridge` first creates/registers a durable worker run record or Den adds an API for local/spawned worker-run registration.
+
+Code follow-up from the smoke:
+
+- `DenMcpAdapter.mark_worker_completed(...)` and `mark_worker_failed(...)` now fail closed if Den returns a rejected completion payload such as `missing_run`, `malformed`, `rejected`, or any `failure_category`.
+- This prevents the orchestrator wrapper from silently treating rejected completion packets as successful lifecycle reconciliation.
+- Added regression coverage: `test_den_mcp_adapter_fails_closed_when_worker_completion_is_rejected`.
+
+Validation after the live smoke fix:
+
+```text
+python -m pytest -q
+16 passed
+```
+
+Recommended next design step:
+
+- Add a Den-native local/spawned worker registration path before using `post_worker_completion_packet`, or change the adapter to an explicit non-worker-run mode that posts task-thread receipt messages and review requests while leaving `post_worker_completion_packet` reserved for tracked Den worker runs.
