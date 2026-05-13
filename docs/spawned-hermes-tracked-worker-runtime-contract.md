@@ -376,3 +376,74 @@ Docs validation:
 ## 12. Implementation north star
 
 The local spawned-Hermes substrate should feel like a Den worker runtime, not a shell script wrapper. The bridge may spawn a process, but Den owns the run identity and completion state. The bridge owns local execution and verification. Neither side should treat process exit, prose summaries, or unregistered run IDs as authoritative completion evidence.
+
+
+## 13. Implemented rollout status — tasks #1374-#1380
+
+The tracked `spawned_hermes` path has now been implemented and smoke-tested across the bridge/Core split.
+
+Implemented server/facade behavior:
+
+- `mcp_den_register_worker_run` registers a durable Den worker run with `substrate="spawned_hermes"` before a local Hermes process is launched.
+- `mcp_den_post_worker_completion_packet` remains authoritative only for registered worker runs; unregistered synthetic IDs still fail closed as `missing_run` / `missing_worker_run`.
+- `mcp_den_get_latest_worker_completion`, `mcp_den_get_worker_run`, and `mcp_den_get_worker_run_status` observe registered spawned-Hermes runs and reconciled completion packets.
+- `abort_worker_run`, `cleanup_worker_run`, and `rerun_worker_run` are substrate-aware. Core does not claim to abort an active spawned-Hermes process when it has no local process handle; the bridge/local runner owns process termination.
+
+Implemented bridge behavior:
+
+- `DenMcpAdapter.register_worker_run(...)` fails closed if the MCP tool is missing, Den rejects registration, or Den returns a mismatched run ID.
+- `run_den_coder_reviewer_workflow(...)` registers coder and reviewer runs before launch, posts completion packets only after artifact verification, and stops before the next gate if Den rejects registration or completion.
+- `SpawnedHermesLifecycle` tracks best-effort local process handles while the parent bridge process is alive, combines Den status with local process state, aborts live local subprocesses, cleans local artifacts idempotently, and derives rerun configs from launch metadata without stale artifact/log/PID fields.
+
+Live smoke evidence:
+
+- Synthetic registered completion smoke: run `spawned-hermes-smoke-1377-20260513T105710Z`, completion message `#5797`, status observed as `completed`.
+- Real Hermes oneshot smoke: run `live-hermes-smoke-1380-20260513T114902Z`, session `worker-744e11a4b3fc00bf`, completion message `#5805`, status observed as `runtime=completed`, `completion=posted_completed`.
+- The real smoke required invoking the child process with an explicit named Hermes profile: `hermes --profile den-hermes-runner --oneshot ... --toolsets file`. The default profile selected DeepSeek and failed without `DEEPSEEK_API_KEY`; named profiles carry copied `.env` and `auth.json` credentials.
+
+Current validation evidence:
+
+- `den-hermes`: `python -m pytest -q` → 33 passed.
+- `den-core`: `dotnet test -v minimal` → Core 463 passed and Server 103 passed when the lifecycle-control changes were implemented.
+
+## 14. Operator rollout guidance
+
+### Choosing a substrate
+
+Use direct `delegate_task` when the work is short-lived, synchronous, and acceptable to lose if the parent turn is interrupted. It is best for research fan-out, code review helpers, and context-efficient analysis. Because it is parent-turn-bound and summary-only, do not use it as the default durable Den coder/reviewer substrate.
+
+Use `spawned_hermes` when Den needs a local Hermes worker with per-role profile/provider/model/toolsets, deterministic artifacts, logs, timeout/exit handling, abort/cleanup/rerun semantics, and authoritative completion through `post_worker_completion_packet`.
+
+Use Pi/Docker workers when stronger sandboxing, server-managed isolation, or the existing Pi runtime behaviors are specifically required. Pi remains useful for environments where local profile credentials should not be exposed to a broad local process profile, or where Docker isolation is a hard requirement.
+
+### Required launch sequence
+
+1. Prepare or reference a bounded Den context packet when possible.
+2. Compute deterministic per-run `artifact` and `log` paths.
+3. Call `register_worker_run` with `substrate="spawned_hermes"`, role, profile/provider/model/toolsets, workdir, branch/base/head metadata, timeout, and artifact/log handles.
+4. Spawn Hermes only after registration is accepted.
+5. Invoke child Hermes with the explicit named profile that owns the required `.env`/`auth.json`, for example `--profile den-hermes-runner`; do not rely on the default profile.
+6. Require the child to write a structured JSON artifact.
+7. Verify artifact identity (`task_id`, `run_id`, `role`) and role-specific fields.
+8. For coder artifacts, verify branch/head evidence before requesting review.
+9. Post `post_worker_completion_packet` for the tracked run and fail closed if Den rejects it.
+10. Advance review/finding/verdict state only after Den status/latest-completion observes the expected packet.
+
+### Failure signatures
+
+- `missing_run` / `missing_worker_run`: completion was posted for an unregistered run. Register first; do not treat this as success.
+- provider configuration failure before artifact creation: the child Hermes CLI likely used the wrong profile or lacks `.env` / `auth.json`; rerun with an explicit `--profile` and/or configured provider/model.
+- process exit 0 but no artifact: mark `incomplete` or post a failure packet; prose stdout is not a completion receipt.
+- artifact identity mismatch: post/record failure, do not request review.
+- Den completion rejection after artifact verification: fail closed and stop the workflow before reviewer/validator registration.
+- active spawned-Hermes abort through Core returns blocked/no local process handle: terminate from the bridge process that owns the subprocess handle, then reconcile Den with a failure/abort packet.
+
+### Artifact, log, cleanup, rerun, and retention
+
+Artifacts and logs should be per-run and should include the run ID in the path. Keep them through at least the review/debug window; destructive local deletion should be explicit. `cleanup_worker_run` is idempotent for terminal Den records, but local artifact retention is an operator policy rather than automatic proof of success.
+
+Rerun should allocate/register a fresh run ID linked to the prior run. Do not overwrite old logs or artifacts. Copy launch metadata such as profile/provider/model/toolsets/workdir/branch/base/head, but drop stale artifact paths, log paths, PIDs, and process/session handles.
+
+### Credential and safety boundary
+
+Den metadata may store profile names, provider names, model names, toolsets, and paths. It must not store `.env`, `auth.json`, raw API keys, OAuth tokens, provider credential pools, or complete environment dumps. Workers should receive the minimum toolsets needed for the role; `file` may be enough for a smoke, while coder/reviewer roles usually need more carefully scoped `terminal`/`file`/Den access.

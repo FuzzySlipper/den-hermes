@@ -477,3 +477,33 @@ python -m pytest -q
 Recommended next design step:
 
 - Add a Den-native local/spawned worker registration path before using `post_worker_completion_packet`, or change the adapter to an explicit non-worker-run mode that posts task-thread receipt messages and review requests while leaving `post_worker_completion_packet` reserved for tracked Den worker runs.
+
+
+## Implementation update — tracked spawned-Hermes runtime completed (tasks #1372-#1380)
+
+The recommended staged hybrid path was implemented after the original exploration. The current state is no longer only a spike: `spawned_hermes` is now a first-class tracked Den worker substrate for the bridge path.
+
+Key updates:
+
+- Den/Core now supports registering local spawned-Hermes worker runs before process launch through `mcp_den_register_worker_run`.
+- Completion packets are still intentionally tied to tracked worker runs. The live `missing_run` finding from #1370 remains the correct invariant and is now handled by registration-before-completion.
+- The bridge adapter fails closed when registration or `post_worker_completion_packet` reconciliation is rejected.
+- Fake coder→reviewer tests prove registration, launch, artifact verification, review request gating, reviewer registration, findings/verdict publication, and failure paths.
+- A constrained real Hermes smoke succeeded using explicit profile invocation: `hermes --profile den-hermes-runner --oneshot <bounded prompt> --toolsets file`.
+
+Successful live smoke evidence:
+
+- task: #1384, child of #1380
+- run: `live-hermes-smoke-1380-20260513T114902Z`
+- session: `worker-744e11a4b3fc00bf`
+- artifact: `/tmp/den-hermes/live-hermes-smoke-1380-20260513T114902Z/completion.json`
+- Den completion message: #5805 (`implementation_packet`, `completed`)
+- Den status: `runtime=completed`, `completion=posted_completed`
+
+Operational lesson: spawned subprocesses must use the intended named Hermes profile. On this host, the default profile selected DeepSeek and failed without `DEEPSEEK_API_KEY`; `--profile den-hermes-runner` picked up the copied `.env` / `auth.json` credentials and passed the smoke.
+
+Updated recommendation:
+
+- Durable Den worker workflows should use tracked `spawned_hermes` or Pi, not raw direct `delegate_task`.
+- Direct `delegate_task` remains valuable for synchronous helper subagents, but its summary-only parent-turn-bound semantics are not enough for authoritative Den worker lifecycle.
+- The durable spawned-Hermes contract is now documented in `spawned-hermes-tracked-worker-runtime-contract` and `docs/tracked-spawned-hermes-worker-rollout-guidance.md`.
