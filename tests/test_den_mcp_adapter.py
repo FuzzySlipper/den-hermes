@@ -122,6 +122,19 @@ def test_den_mcp_adapter_rejects_failed_registration_before_completion_post():
     assert [name for name, _ in tools.calls] == ["register_worker_run"]
 
 
+def test_den_mcp_adapter_reports_missing_registration_tool_before_launch():
+    class MissingRegistrationTools:
+        pass
+
+    adapter = make_adapter(MissingRegistrationTools())
+
+    with pytest.raises(RuntimeError) as excinfo:
+        adapter.register_worker_run(task_id=1368, run_id="coder-run", role="coder")
+
+    assert "mcp_den_register_worker_run" in str(excinfo.value)
+    assert "deploy" in str(excinfo.value)
+
+
 def test_den_mcp_adapter_rejects_mismatched_registration_run_id():
     tools = RecordingMcpTools()
     tools.registration_response = {"worker_run": {"run_id": "different-run"}}

@@ -261,14 +261,38 @@ def run_den_coder_reviewer_workflow(
     """
 
     run_root_path = Path(run_root)
+    cwd_path = str(cwd) if cwd is not None else None
     coder_run_id = str(coder["run_id"])
+    coder_artifact_path = run_root_path / coder_run_id / "completion.json"
+    try:
+        den_client.register_worker_run(
+            task_id=task_id,
+            run_id=coder_run_id,
+            role="coder",
+            profile=_optional_str(coder, "profile"),
+            provider=_optional_str(coder, "provider"),
+            model=_optional_str(coder, "model"),
+            toolsets=coder.get("toolsets"),
+            workdir=cwd_path,
+            timeout_seconds=timeout_seconds,
+            artifact_path=str(coder_artifact_path),
+            log_path=str(run_root_path / coder_run_id / "worker.log"),
+            dedupe_key=f"{task_id}:coder:{coder_run_id}",
+        )
+    except Exception as exc:  # noqa: BLE001 - fail closed before subprocess launch
+        error = f"Coder worker registration failed: {exc}"
+        return DenCoderReviewerWorkflowResult(
+            status="failed",
+            coder=HermesWorkerResult(status="failed", exit_code=None, stdout="", stderr="", error=error),
+            error=error,
+        )
     den_client.mark_worker_started(task_id=task_id, run_id=coder_run_id, role="coder")
     coder_result = run_hermes_worker(
         task_id=task_id,
         run_id=coder_run_id,
         role="coder",
         prompt=prompt,
-        expected_artifact=run_root_path / coder_run_id / "completion.json",
+        expected_artifact=coder_artifact_path,
         provider=_optional_str(coder, "provider"),
         model=_optional_str(coder, "model"),
         profile=_optional_str(coder, "profile"),
@@ -304,6 +328,33 @@ def run_den_coder_reviewer_workflow(
     )
 
     reviewer_run_id = str(reviewer["run_id"])
+    reviewer_artifact_path = run_root_path / reviewer_run_id / "completion.json"
+    try:
+        den_client.register_worker_run(
+            task_id=task_id,
+            run_id=reviewer_run_id,
+            role="reviewer",
+            branch=coder_result.artifact["branch"],
+            head_commit=coder_result.artifact["head_commit"],
+            profile=_optional_str(reviewer, "profile"),
+            provider=_optional_str(reviewer, "provider"),
+            model=_optional_str(reviewer, "model"),
+            toolsets=reviewer.get("toolsets"),
+            workdir=cwd_path,
+            timeout_seconds=timeout_seconds,
+            artifact_path=str(reviewer_artifact_path),
+            log_path=str(run_root_path / reviewer_run_id / "worker.log"),
+            dedupe_key=f"{task_id}:reviewer:{reviewer_run_id}",
+        )
+    except Exception as exc:  # noqa: BLE001 - fail closed before reviewer subprocess launch
+        error = f"Reviewer worker registration failed: {exc}"
+        return DenCoderReviewerWorkflowResult(
+            status="failed",
+            coder=coder_result,
+            reviewer=HermesWorkerResult(status="failed", exit_code=None, stdout="", stderr="", error=error),
+            review_request=review_request,
+            error=error,
+        )
     den_client.mark_worker_started(task_id=task_id, run_id=reviewer_run_id, role="reviewer")
     reviewer_prompt = (
         f"{prompt.rstrip()}\n\n"
@@ -318,7 +369,7 @@ def run_den_coder_reviewer_workflow(
         run_id=reviewer_run_id,
         role="reviewer",
         prompt=reviewer_prompt,
-        expected_artifact=run_root_path / reviewer_run_id / "completion.json",
+        expected_artifact=reviewer_artifact_path,
         provider=_optional_str(reviewer, "provider"),
         model=_optional_str(reviewer, "model"),
         profile=_optional_str(reviewer, "profile"),

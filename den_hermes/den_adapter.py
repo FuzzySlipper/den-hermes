@@ -82,7 +82,13 @@ class DenMcpAdapter:
             "dedupe_key": dedupe_key,
         }
         args.update({key: value for key, value in optional.items() if value is not None})
-        response = self.tools.mcp_den_register_worker_run(**args)
+        register_tool = getattr(self.tools, "mcp_den_register_worker_run", None)
+        if register_tool is None:
+            raise RuntimeError(
+                "Den MCP tool mcp_den_register_worker_run is unavailable; deploy the spawned-Hermes "
+                "worker registration API before launching tracked local workers."
+            )
+        response = register_tool(**args)
         _ensure_worker_registration_accepted(response, run_id=run_id, role=role)
         return response
 
