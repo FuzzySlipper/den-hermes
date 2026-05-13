@@ -350,6 +350,16 @@ No live workflow was run in this exploration. A safe next spike would be one of:
 - Verify missing completion artifact causes failed/incomplete worker status.
 - Verify a good completion packet advances to review request creation only after branch/head/test fields are present.
 
+### Spike A result — 2026-05-12
+
+Implemented the first thin spawned-Hermes launcher spike in commit `130167ab64c7a7ec90405d2e50a5513934147e6f`:
+
+- `den_hermes/worker_launcher.py` adds `run_hermes_worker(...)`, a minimal subprocess runner that invokes `hermes chat`, passes Den worker identity through environment variables, injects an expected-artifact contract into the prompt, captures stdout/stderr/exit code, and validates the returned completion artifact.
+- `tests/test_spawned_hermes_worker.py` installs a fake `hermes` executable in a temporary `PATH` and verifies command construction, provider/model/profile/toolset arguments, Den identity environment, stdout capture, missing artifact fail-closed behavior, nonzero exit handling, malformed JSON handling, and mismatched task/run/role identity rejection.
+- Validation command: `python -m pytest -q` → `5 passed`.
+
+This confirms the spawned-Hermes bridge surface can be quite small if it is scoped to subprocess launch plus artifact reconciliation. It does not yet implement Den MCP worker-run persistence, review request creation, branch/head/test schema enforcement beyond identity, or real Hermes execution.
+
 ### delegate_task provider/model override spike
 
 - Unit-test `_resolve_delegation_credentials` with explicit call overrides.
