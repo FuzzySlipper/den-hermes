@@ -388,7 +388,22 @@ Implemented the next real-testing preparation step in commit `10deca1d072b70c6e8
 
 This moves the bridge closer to a real local Hermes smoke test: the reviewer will no longer inspect a claimed branch/head unless the parent can independently resolve that evidence in git.
 
-Remaining unimplemented pieces now include durable Den worker-run rows/status APIs, Den review-round creation, richer reviewer finding schemas, retry loops, abort/rerun/cleanup controls, and a real Hermes/LLM smoke test.
+Remaining unimplemented pieces now include a real Den MCP client adapter, live Den review-round creation, richer reviewer finding schemas, retry loops, abort/rerun/cleanup controls, and a real Hermes/LLM smoke test.
+
+### Spike A.4 result — fake Den lifecycle/review adapter
+
+Implemented the first Den-facing orchestration wrapper around the spawned-Hermes launcher:
+
+- Added `run_den_coder_reviewer_workflow(...)`, which takes a fakeable `den_client` adapter.
+- The wrapper records worker lifecycle transitions through the adapter: coder started, coder completed/failed, reviewer started, reviewer completed/failed.
+- It requests review only after the coder artifact has passed normal artifact validation plus optional local git verification.
+- If coder git verification fails, it records a coder failure, does not request review, and does not launch reviewer.
+- Tests use `RecordingDenClient` to assert transition order and prove review request creation is gated by verified coder branch/head/tests evidence.
+- Validation command: `python -m pytest -q` → `11 passed`.
+
+This is still intentionally fake-Den: no live Den MCP worker-run rows or review rounds are created. The value is the transition contract. The next step can replace `RecordingDenClient` with a real Den MCP adapter once the lifecycle shape is stable.
+
+Remaining unimplemented pieces now include a real Den MCP client adapter, live Den review-round creation, richer reviewer finding schemas, retry loops, abort/rerun/cleanup controls, and a real Hermes/LLM smoke test.
 
 ### delegate_task provider/model override spike
 

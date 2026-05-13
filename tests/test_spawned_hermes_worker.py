@@ -3,7 +3,11 @@ import os
 import subprocess
 from pathlib import Path
 
-from den_hermes.worker_launcher import run_coder_reviewer_sequence, run_hermes_worker
+from den_hermes.worker_launcher import (
+    run_coder_reviewer_sequence,
+    run_den_coder_reviewer_workflow,
+    run_hermes_worker,
+)
 
 
 FAKE_HEAD = "0123456789abcdef0123456789abcdef01234567"
@@ -124,6 +128,24 @@ def read_fake_calls(tmp_path: Path) -> list[dict]:
         for line in (tmp_path / "fake-hermes-call.jsonl").read_text().splitlines()
         if line.strip()
     ]
+
+
+class RecordingDenClient:
+    def __init__(self):
+        self.events = []
+
+    def mark_worker_started(self, *, task_id, run_id, role):
+        self.events.append(("started", task_id, run_id, role))
+
+    def mark_worker_completed(self, *, task_id, run_id, role, artifact):
+        self.events.append(("completed", task_id, run_id, role, artifact))
+
+    def mark_worker_failed(self, *, task_id, run_id, role, error):
+        self.events.append(("failed", task_id, run_id, role, error))
+
+    def request_review(self, *, task_id, branch, head_commit, tests_run, coder_run_id):
+        self.events.append(("review_requested", task_id, branch, head_commit, tests_run, coder_run_id))
+        return {"review_round_id": 321}
 
 
 def test_spawned_hermes_worker_success_captures_command_and_artifact(tmp_path):
@@ -340,3 +362,65 @@ def test_sequence_git_verification_allows_reviewer_when_branch_head_resolve(tmp_
     assert result.status == "completed"
     assert result.coder.artifact["head_commit"] == head
     assert [call["env"]["DEN_WORKER_ROLE"] for call in read_fake_calls(tmp_path)] == ["coder", "reviewer"]
+
+
+def test_den_workflow_records_status_and_requests_review_after_verified_coder(tmp_path):
+    head = init_git_repo(tmp_path)
+    subprocess.run(["git", "checkout", "-b", "task/1368-fake"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    env = fake_env(tmp_path)
+    env["FAKE_HEAD"] = head
+    den = RecordingDenClient()
+
+    result = run_den_coder_reviewer_workflow(
+        den_client=den,
+        task_id=1368,
+        prompt="Use the Den task context to implement and review task 1368.",
+        run_root=tmp_path / ".den" / "runs",
+        cwd=tmp_path,
+        verify_git=True,
+        coder={"run_id": "coder-run"},
+        reviewer={"run_id": "reviewer-run"},
+        env_overrides=env,
+    )
+
+    assert result.status == "completed"
+    assert result.review_request == {"review_round_id": 321}
+    assert den.events[0] == ("started", 1368, "coder-run", "coder")
+    assert den.events[1][0:4] == ("completed", 1368, "coder-run", "coder")
+    assert den.events[2] == (
+        "review_requested",
+        1368,
+        "task/1368-fake",
+        head,
+        [{"command": "pytest tests/ -q", "result": "passed"}],
+        "coder-run",
+    )
+    assert den.events[3] == ("started", 1368, "reviewer-run", "reviewer")
+    assert den.events[4][0:4] == ("completed", 1368, "reviewer-run", "reviewer")
+
+
+def test_den_workflow_does_not_request_review_or_launch_reviewer_when_coder_git_fails(tmp_path):
+    init_git_repo(tmp_path)
+    den = RecordingDenClient()
+
+    result = run_den_coder_reviewer_workflow(
+        den_client=den,
+        task_id=1368,
+        prompt="Use the Den task context to implement and review task 1368.",
+        run_root=tmp_path / ".den" / "runs",
+        cwd=tmp_path,
+        verify_git=True,
+        coder={"run_id": "coder-run"},
+        reviewer={"run_id": "reviewer-run"},
+        env_overrides=fake_env(tmp_path),
+    )
+
+    assert result.status == "failed"
+    assert result.review_request is None
+    assert [event[0:4] for event in den.events] == [
+        ("started", 1368, "coder-run", "coder"),
+        ("completed", 1368, "coder-run", "coder"),
+        ("failed", 1368, "coder-run", "coder"),
+    ]
+    assert "branch" in den.events[-1][-1].lower()
+    assert [call["env"]["DEN_WORKER_ROLE"] for call in read_fake_calls(tmp_path)] == ["coder"]

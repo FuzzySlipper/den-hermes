@@ -27,6 +27,15 @@ class CoderReviewerSequenceResult:
     error: str | None = None
 
 
+@dataclass(frozen=True)
+class DenCoderReviewerWorkflowResult:
+    status: str
+    coder: HermesWorkerResult
+    reviewer: HermesWorkerResult | None = None
+    review_request: Any | None = None
+    error: str | None = None
+
+
 def run_hermes_worker(
     *,
     task_id: int,
@@ -228,6 +237,118 @@ def run_coder_reviewer_sequence(
         status="completed",
         coder=coder_result,
         reviewer=reviewer_result,
+    )
+
+
+def run_den_coder_reviewer_workflow(
+    *,
+    den_client: Any,
+    task_id: int,
+    prompt: str,
+    run_root: str | Path,
+    coder: Mapping[str, Any],
+    reviewer: Mapping[str, Any],
+    cwd: str | Path | None = None,
+    env_overrides: Mapping[str, str] | None = None,
+    timeout_seconds: int = 300,
+    verify_git: bool = False,
+) -> DenCoderReviewerWorkflowResult:
+    """Run coder -> Den review request -> reviewer with a fakeable Den client.
+
+    This bridge-shaped wrapper records worker lifecycle transitions through a
+    deliberately small adapter interface, and it only requests review after a
+    coder artifact has passed local validation and optional git verification.
+    """
+
+    run_root_path = Path(run_root)
+    coder_run_id = str(coder["run_id"])
+    den_client.mark_worker_started(task_id=task_id, run_id=coder_run_id, role="coder")
+    coder_result = run_hermes_worker(
+        task_id=task_id,
+        run_id=coder_run_id,
+        role="coder",
+        prompt=prompt,
+        expected_artifact=run_root_path / coder_run_id / "completion.json",
+        provider=_optional_str(coder, "provider"),
+        model=_optional_str(coder, "model"),
+        profile=_optional_str(coder, "profile"),
+        toolsets=coder.get("toolsets"),
+        cwd=cwd,
+        env_overrides=env_overrides,
+        timeout_seconds=timeout_seconds,
+    )
+    if coder_result.status == "completed" and coder_result.artifact is not None:
+        den_client.mark_worker_completed(
+            task_id=task_id,
+            run_id=coder_run_id,
+            role="coder",
+            artifact=coder_result.artifact,
+        )
+    else:
+        error = coder_result.error or "Coder worker did not complete"
+        den_client.mark_worker_failed(task_id=task_id, run_id=coder_run_id, role="coder", error=error)
+        return DenCoderReviewerWorkflowResult(status="failed", coder=coder_result, error=error)
+
+    if verify_git:
+        git_error = _verify_git_branch_head(coder_result.artifact, cwd=cwd)
+        if git_error:
+            den_client.mark_worker_failed(task_id=task_id, run_id=coder_run_id, role="coder", error=git_error)
+            return DenCoderReviewerWorkflowResult(status="failed", coder=coder_result, error=git_error)
+
+    review_request = den_client.request_review(
+        task_id=task_id,
+        branch=coder_result.artifact["branch"],
+        head_commit=coder_result.artifact["head_commit"],
+        tests_run=coder_result.artifact["tests_run"],
+        coder_run_id=coder_run_id,
+    )
+
+    reviewer_run_id = str(reviewer["run_id"])
+    den_client.mark_worker_started(task_id=task_id, run_id=reviewer_run_id, role="reviewer")
+    reviewer_prompt = (
+        f"{prompt.rstrip()}\n\n"
+        "CODER COMPLETION TO REVIEW\n"
+        f"Branch: {coder_result.artifact['branch']}\n"
+        f"Head commit: {coder_result.artifact['head_commit']}\n"
+        f"Tests run: {json.dumps(coder_result.artifact['tests_run'], sort_keys=True)}\n"
+        f"Coder summary: {coder_result.artifact.get('summary', '')}\n"
+    )
+    reviewer_result = run_hermes_worker(
+        task_id=task_id,
+        run_id=reviewer_run_id,
+        role="reviewer",
+        prompt=reviewer_prompt,
+        expected_artifact=run_root_path / reviewer_run_id / "completion.json",
+        provider=_optional_str(reviewer, "provider"),
+        model=_optional_str(reviewer, "model"),
+        profile=_optional_str(reviewer, "profile"),
+        toolsets=reviewer.get("toolsets"),
+        cwd=cwd,
+        env_overrides=env_overrides,
+        timeout_seconds=timeout_seconds,
+    )
+    if reviewer_result.status != "completed" or reviewer_result.artifact is None:
+        error = reviewer_result.error or "Reviewer worker did not complete"
+        den_client.mark_worker_failed(task_id=task_id, run_id=reviewer_run_id, role="reviewer", error=error)
+        return DenCoderReviewerWorkflowResult(
+            status="failed",
+            coder=coder_result,
+            reviewer=reviewer_result,
+            review_request=review_request,
+            error=error,
+        )
+
+    den_client.mark_worker_completed(
+        task_id=task_id,
+        run_id=reviewer_run_id,
+        role="reviewer",
+        artifact=reviewer_result.artifact,
+    )
+    return DenCoderReviewerWorkflowResult(
+        status="completed",
+        coder=coder_result,
+        reviewer=reviewer_result,
+        review_request=review_request,
     )
 
 
