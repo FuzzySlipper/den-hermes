@@ -40,6 +40,48 @@ class RecordingMcpTools:
         self.calls.append(("set_review_verdict", kwargs))
         return {"ok": True}
 
+    def mcp_den_get_latest_worker_completion(self, **kwargs):
+        self.calls.append(("get_latest_worker_completion", kwargs))
+        return {"completion_state": "completed", "run_id": kwargs["run_id"]}
+
+    def mcp_den_get_worker_run_status(self, **kwargs):
+        self.calls.append(("get_worker_run_status", kwargs))
+        return {"worker_run": {"run_id": kwargs["run_id"], "state": "completed"}}
+
+
+class StatefulFakeDenTools:
+    def __init__(self):
+        self.runs = {}
+        self.completions = {}
+        self.calls = []
+
+    def mcp_den_register_worker_run(self, **kwargs):
+        self.calls.append(("register_worker_run", kwargs))
+        run_id = kwargs["run_id"]
+        self.runs[run_id] = {"run_id": run_id, "role": kwargs["role"], "state": "started"}
+        return {"worker_run": self.runs[run_id]}
+
+    def mcp_den_post_worker_completion_packet(self, **kwargs):
+        self.calls.append(("post_worker_completion_packet", kwargs))
+        run_id = kwargs["run_id"]
+        if run_id not in self.runs:
+            return {"completion_state": "missing_run", "failure_category": "missing_worker_run"}
+        completion = {"completion_state": "completed", "run_id": run_id, "role": kwargs["role"], **kwargs}
+        self.completions[run_id] = completion
+        self.runs[run_id] = {**self.runs[run_id], "state": "completed"}
+        return completion
+
+    def mcp_den_get_latest_worker_completion(self, **kwargs):
+        self.calls.append(("get_latest_worker_completion", kwargs))
+        return self.completions.get(kwargs["run_id"], {"completion_state": "missing_packet"})
+
+    def mcp_den_get_worker_run_status(self, **kwargs):
+        self.calls.append(("get_worker_run_status", kwargs))
+        run = self.runs.get(kwargs["run_id"])
+        if run is None:
+            return {"state": "missing_run"}
+        return {"worker_run": run, "latest_completion": self.completions.get(kwargs["run_id"])}
+
 
 def make_adapter(tools):
     return DenMcpAdapter(
@@ -167,6 +209,42 @@ def test_den_mcp_adapter_posts_completion_after_registered_run_with_same_identit
 
     assert [name for name, _ in tools.calls] == ["register_worker_run", "post_worker_completion_packet"]
     assert tools.calls[0][1]["run_id"] == tools.calls[1][1]["run_id"] == "coder-run"
+    completion_args = tools.calls[1][1]
+    assert completion_args["branch"] == "task/1368-hermes-native-delegation-exploration"
+    assert completion_args["head_commit"] == "b" * 40
+    assert json.loads(completion_args["tests_run"]) == [{"command": "python -m pytest -q", "result": "12 passed"}]
+
+
+def test_den_mcp_adapter_observes_registered_completion_via_worker_tools():
+    tools = StatefulFakeDenTools()
+    adapter = make_adapter(tools)
+
+    adapter.register_worker_run(task_id=1377, run_id="coder-run", role="coder")
+    adapter.mark_worker_completed(
+        task_id=1377,
+        run_id="coder-run",
+        role="coder",
+        artifact={
+            "status": "completed",
+            "branch": "task/1377-synthetic",
+            "head_commit": "b" * 40,
+            "tests_run": [{"command": "python -m pytest tests/test_den_mcp_adapter.py -q", "result": "passed"}],
+            "summary": "Synthetic registered completion.",
+        },
+    )
+
+    latest = adapter.get_latest_worker_completion(task_id=1377, run_id="coder-run", role="coder")
+    status = adapter.get_worker_run_status(task_id=1377, run_id="coder-run")
+
+    assert latest["completion_state"] == "completed"
+    assert latest["run_id"] == "coder-run"
+    assert status["worker_run"]["state"] == "completed"
+    assert [name for name, _ in tools.calls] == [
+        "register_worker_run",
+        "post_worker_completion_packet",
+        "get_latest_worker_completion",
+        "get_worker_run_status",
+    ]
 
 
 def test_den_mcp_adapter_requests_review_with_verified_coder_metadata():

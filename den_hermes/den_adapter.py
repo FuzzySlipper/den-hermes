@@ -118,6 +118,23 @@ class DenMcpAdapter:
         _ensure_completion_packet_accepted(response, run_id=run_id, role=role)
         return response
 
+    def get_latest_worker_completion(self, *, task_id: int, run_id: str, role: str | None = None) -> Any:
+        args: dict[str, Any] = {
+            "project_id": self.project_id,
+            "task_id": task_id,
+            "run_id": run_id,
+        }
+        if role is not None:
+            args["role"] = role
+        return self.tools.mcp_den_get_latest_worker_completion(**args)
+
+    def get_worker_run_status(self, *, task_id: int, run_id: str) -> Any:
+        return self.tools.mcp_den_get_worker_run_status(
+            project_id=self.project_id,
+            task_id=task_id,
+            run_id=run_id,
+        )
+
     def request_review(
         self,
         *,
