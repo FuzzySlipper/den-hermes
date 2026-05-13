@@ -360,6 +360,22 @@ Implemented the first thin spawned-Hermes launcher spike in commit `130167ab64c7
 
 This confirms the spawned-Hermes bridge surface can be quite small if it is scoped to subprocess launch plus artifact reconciliation. It does not yet implement Den MCP worker-run persistence, review request creation, branch/head/test schema enforcement beyond identity, or real Hermes execution.
 
+### Spike A.2 result — fake coder → reviewer sequence
+
+Implemented the next spawned-Hermes sequence spike in commit `fae403839fd4ab5bd5e92e247cfbbac76f7bf233`:
+
+- `run_hermes_worker(...)` now validates role-specific artifact shape:
+  - coder artifacts require `status`, `branch`, full 40-character `head_commit`, `tests_run`, and `summary`;
+  - reviewer artifacts require `status`, `verdict`, `findings`, and `summary`.
+- `run_coder_reviewer_sequence(...)` runs a coder worker, fails closed if coder completion is invalid, then passes verified coder branch/head/tests into the reviewer prompt.
+- The fake `hermes` test harness now appends JSONL call records so tests can assert sequential coder then reviewer launches.
+- Tests verify distinct coder/reviewer runtime args: profile, provider, model, and toolsets.
+- Validation command: `python -m pytest -q` → `7 passed`.
+
+This still avoids real Hermes/LLM execution and Den MCP side effects, but it proves the local bridge can model the critical sequence boundary: verified coder artifact first, reviewer receives only verified branch/head/test evidence, and runtime selection is explicit per role.
+
+Remaining unimplemented pieces include durable Den worker-run rows/status APIs, Den review-round creation, branch existence checks against git, richer finding schemas, abort/rerun/cleanup controls, and a real Hermes smoke test.
+
 ### delegate_task provider/model override spike
 
 - Unit-test `_resolve_delegation_credentials` with explicit call overrides.
