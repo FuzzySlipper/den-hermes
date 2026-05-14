@@ -1,7 +1,14 @@
 import json
 from pathlib import Path
 
-from den_hermes.channels_bridge import DenChannelsResponseBridge, DenChannelsWakeBridge, InMemoryWakeStore, JsonFileWakeStore, WakeResult
+from den_hermes.channels_bridge import (
+    DenChannelsResponseBridge,
+    DenChannelsWakeBridge,
+    InMemoryWakeStore,
+    JsonFileWakeStore,
+    SpawnedHermesProfileWakeTransport,
+    WakeResult,
+)
 
 
 class RecordingDenTools:
@@ -251,6 +258,127 @@ def test_binding_without_profile_fails_closed():
     assert result.status == "failed"
     assert result.diagnostic == "Hermes profile binding hermes:den-k8:den-hermes-runner:gateway-main has no profile"
     assert transport.wakes == []
+
+
+def test_core_binding_with_json_metadata_resolves_profile():
+    tools = RecordingDenTools(
+        [
+            active_binding(
+                profile=None,
+                metadata=json.dumps({"profile": "den-hermes-runner", "machine": "den-k8plus"}),
+                instance_id="den-k8plus:den-hermes-runner:coder:canary",
+            )
+        ]
+    )
+    transport = RecordingHermesTransport()
+    bridge = DenChannelsWakeBridge(den_tools=tools, hermes_transport=transport, store=InMemoryWakeStore())
+
+    result = bridge.handle_delivery(delivery())
+
+    assert result.status == "delivered"
+    assert transport.wakes[0]["envelope"]["target"]["profile"] == "den-hermes-runner"
+    assert result.adapter_instance_id == "den-k8plus:den-hermes-runner:coder:canary"
+
+
+class FakePopen:
+    def __init__(self, command, *, cwd, env, stdout, stderr, text):
+        self.command = command
+        self.cwd = cwd
+        self.env = env
+        self.stdout = stdout
+        self.stderr = stderr
+        self.text = text
+        self.pid = 4242
+
+
+def test_spawned_hermes_profile_transport_launches_profile_from_runtime_registry(tmp_path):
+    registry = tmp_path / "runtimes.yaml"
+    registry.write_text(
+        """
+        schema_version: 1
+        registry_id: test-registry
+        defaults:
+          substrate: spawned_hermes
+          hermes_binary: /bin/hermes-test
+          run_root: RUN_ROOT
+          artifact_filename: completion.json
+          log_filename: worker.log
+          timeout_seconds: 300
+          toolsets: [terminal]
+          workdir: WORKDIR
+          preflight: {enabled: false}
+        roles:
+          coder:
+            runtime_id: coder-primary
+            profile: den-hermes-runner
+            provider: test-provider
+            model: test-model
+            toolsets: [terminal, file]
+            timeout_seconds: 600
+            launch: {source: den-channels-wake, extra_args: []}
+          reviewer:
+            runtime_id: reviewer-primary
+            profile: den-hermes-runner
+            provider: test-provider
+            model: test-model
+            toolsets: [terminal]
+            timeout_seconds: 600
+            launch: {source: den-worker, extra_args: []}
+          validator:
+            runtime_id: validator-primary
+            profile: den-hermes-runner
+            provider: test-provider
+            model: test-model
+            toolsets: [terminal]
+            timeout_seconds: 600
+            launch: {source: den-worker, extra_args: []}
+          drift_checker:
+            runtime_id: drift-checker-primary
+            profile: den-hermes-runner
+            provider: test-provider
+            model: test-model
+            toolsets: [terminal]
+            timeout_seconds: 600
+            launch: {source: den-worker, extra_args: []}
+          packet_auditor:
+            runtime_id: packet-auditor-primary
+            profile: den-hermes-runner
+            provider: test-provider
+            model: test-model
+            toolsets: [terminal]
+            timeout_seconds: 600
+            launch: {source: den-worker, extra_args: []}
+        """.replace("RUN_ROOT", str(tmp_path / "runs")).replace("WORKDIR", str(tmp_path))
+    )
+    launches = []
+
+    def popen_factory(*args, **kwargs):
+        proc = FakePopen(*args, **kwargs)
+        launches.append(proc)
+        return proc
+
+    transport = SpawnedHermesProfileWakeTransport(
+        runtime_registry_path=registry,
+        popen_factory=popen_factory,
+        run_id_factory=lambda: "wake-run-1",
+    )
+
+    result = transport.wake_profile(binding=active_binding(role="coder"), envelope={"type": "den_delivery", "delivery_request_id": 123})
+
+    proc = launches[0]
+    assert result["session_id"] == "wake-run-1"
+    assert result["external_message_id"].endswith("/wake-run-1/envelope.json")
+    assert proc.command[:6] == ["/bin/hermes-test", "--profile", "den-hermes-runner", "chat", "--provider", "test-provider"]
+    assert "--model" in proc.command
+    assert "test-model" in proc.command
+    assert "--toolsets" in proc.command
+    assert "terminal,file" in proc.command
+    assert "--source" in proc.command
+    assert "den-channels-wake" in proc.command
+    assert proc.cwd == str(tmp_path)
+    assert proc.env["DEN_DELIVERY_REQUEST_ID"] == "123"
+    envelope_path = tmp_path / "runs" / "wake-run-1" / "envelope.json"
+    assert json.loads(envelope_path.read_text())["delivery_request_id"] == 123
 
 
 def test_binding_resolver_enforces_exact_project_agent_role_status_locally():

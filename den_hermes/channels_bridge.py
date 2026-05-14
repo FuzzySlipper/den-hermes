@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import subprocess
+import uuid
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Mapping, Protocol
@@ -34,6 +37,101 @@ class ResponseResult:
 
 class HermesWakeTransport(Protocol):
     def wake_profile(self, *, binding: Mapping[str, Any], envelope: Mapping[str, Any]) -> Mapping[str, Any]: ...
+
+
+class SpawnedHermesProfileWakeTransport:
+    """Production Hermes profile wake transport backed by the spawned-Hermes runtime registry.
+
+    The wake bridge resolves identity and idempotency before this class is called.
+    This transport keeps the process launch bounded: it writes the sanitized Den
+    delivery envelope to a per-run file, starts the selected Hermes profile with a
+    prompt that points at that file, and returns immediately with local launch
+    handles. Den remains the durable source of truth for the delivery itself.
+    """
+
+    def __init__(
+        self,
+        *,
+        runtime_registry_path: str | Path | None = None,
+        popen_factory: Any = subprocess.Popen,
+        run_id_factory: Any | None = None,
+        source: str = "den-channels-wake",
+    ) -> None:
+        self.runtime_registry_path = runtime_registry_path
+        self.popen_factory = popen_factory
+        self.run_id_factory = run_id_factory or _default_wake_run_id
+        self.source = source
+
+    def wake_profile(self, *, binding: Mapping[str, Any], envelope: Mapping[str, Any]) -> Mapping[str, Any]:
+        from den_hermes.runtime_registry import DEFAULT_RUNTIME_REGISTRY_PATH, resolve_role_runtime
+
+        role = _required_str(binding, "role")
+        binding_profile = _binding_profile(binding)
+        if not binding_profile:
+            raise RuntimeError(f"binding {_binding_instance_id(binding)} has no Hermes profile")
+        run_id = str(self.run_id_factory())
+        runtime = resolve_role_runtime(
+            role,
+            registry_path=self.runtime_registry_path or DEFAULT_RUNTIME_REGISTRY_PATH,
+            run_id=run_id,
+        )
+        if runtime.profile != binding_profile:
+            raise RuntimeError(
+                f"binding profile {binding_profile!r} does not match runtime registry profile {runtime.profile!r} for role {role}"
+            )
+
+        run_dir = Path(runtime.run_root) / run_id
+        run_dir.mkdir(parents=True, exist_ok=True)
+        envelope_path = run_dir / "envelope.json"
+        prompt_path = run_dir / "prompt.txt"
+        log_path = Path(runtime.log_path or (run_dir / runtime.log_filename))
+        envelope_path.write_text(json.dumps(dict(envelope), sort_keys=True, indent=2))
+        prompt = _wake_prompt(envelope_path=envelope_path, binding=binding)
+        prompt_path.write_text(prompt)
+
+        command = [runtime.hermes_binary, "--profile", runtime.profile, "chat"]
+        if runtime.provider:
+            command.extend(["--provider", runtime.provider])
+        if runtime.model:
+            command.extend(["--model", runtime.model])
+        if runtime.toolsets:
+            command.extend(["--toolsets", ",".join(runtime.toolsets)])
+        command.extend(runtime.extra_args)
+        command.extend(["--source", self.source or runtime.source, "-q", prompt])
+
+        env = os.environ.copy()
+        env.update(
+            {
+                "DEN_DELIVERY_ENVELOPE": str(envelope_path),
+                "DEN_DELIVERY_REQUEST_ID": str(envelope.get("delivery_request_id", "")),
+                "DEN_DELIVERY_CORRELATION_ID": str(envelope.get("correlation_id") or ""),
+                "DEN_HERMES_BINDING_INSTANCE_ID": _binding_instance_id(binding),
+                "DEN_HERMES_PROFILE": binding_profile,
+                "DEN_HERMES_WAKE_RUN_ID": run_id,
+            }
+        )
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_handle = log_path.open("a", encoding="utf-8")
+        try:
+            process = self.popen_factory(
+                command,
+                cwd=runtime.workdir,
+                env=env,
+                stdout=log_handle,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+        finally:
+            log_handle.close()
+
+        return {
+            "session_id": run_id,
+            "external_message_id": str(envelope_path),
+            "pid": getattr(process, "pid", None),
+            "log_path": str(log_path),
+            "prompt_path": str(prompt_path),
+            "runtime_id": runtime.runtime_id,
+        }
 
 
 class InMemoryWakeStore:
@@ -505,9 +603,36 @@ def _binding_transport_kind(binding: Mapping[str, Any]) -> str:
 
 
 def _binding_profile(binding: Mapping[str, Any]) -> str:
-    metadata = binding.get("metadata") if isinstance(binding.get("metadata"), Mapping) else {}
+    metadata = _binding_metadata(binding)
     value = binding.get("profile") or metadata.get("profile") or ""
     return str(value)
+
+
+def _binding_metadata(binding: Mapping[str, Any]) -> Mapping[str, Any]:
+    raw = binding.get("metadata")
+    if isinstance(raw, Mapping):
+        return raw
+    if isinstance(raw, str) and raw.strip():
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            return {}
+        return parsed if isinstance(parsed, Mapping) else {}
+    return {}
+
+
+def _default_wake_run_id() -> str:
+    return f"wake-{uuid.uuid4().hex[:12]}"
+
+
+def _wake_prompt(*, envelope_path: Path, binding: Mapping[str, Any]) -> str:
+    return (
+        "You were woken by a Den Channels delivery.\n"
+        f"Read the sanitized Den delivery envelope from: {envelope_path}\n"
+        "Refresh Den state using the source pointers before acting.\n"
+        "Preserve delivery_request_id, dedupe_key, and correlation_id in any Den-visible response.\n"
+        f"Target Hermes profile binding: {_binding_instance_id(binding)}.\n"
+    )
 
 
 def _sanitize_mapping(value: Mapping[str, Any]) -> dict[str, Any]:
