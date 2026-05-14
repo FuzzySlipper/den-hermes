@@ -23,6 +23,104 @@ class OrchestratorActionType(str, Enum):
     FAILED = "failed"
 
 
+class McpHttpTools:
+    """Minimal StreamableHTTP MCP tool proxy for Den MCP tool calls."""
+
+    def __init__(self, url: str, *, transport: Any | None = None, timeout_seconds: int = 120):
+        self.url = url
+        self.transport = transport or _default_http_transport()
+        self.timeout_seconds = timeout_seconds
+        self._session_id: str | None = None
+        self._next_id = 1
+
+    def __getattr__(self, name: str) -> Any:
+        if not name.startswith("mcp_den_"):
+            raise AttributeError(name)
+
+        def call_tool(**kwargs: Any) -> Any:
+            return self.call_tool(name, kwargs)
+
+        return call_tool
+
+    def call_tool(self, name: str, arguments: Mapping[str, Any]) -> Any:
+        self._ensure_session()
+        response = self._post(
+            {
+                "jsonrpc": "2.0",
+                "id": self._allocate_id(),
+                "method": "tools/call",
+                "params": {"name": _mcp_remote_tool_name(name), "arguments": dict(arguments)},
+            },
+            include_session=True,
+        )
+        result = _mcp_result_from_response(response)
+        if isinstance(result, Mapping) and "content" in result:
+            content = result.get("content")
+            if isinstance(content, list) and content and isinstance(content[0], Mapping):
+                text = content[0].get("text")
+                if isinstance(text, str):
+                    try:
+                        return json.loads(text)
+                    except json.JSONDecodeError:
+                        return text
+        return result
+
+    def _ensure_session(self) -> None:
+        if self._session_id is not None:
+            return
+        response = self._post(
+            {
+                "jsonrpc": "2.0",
+                "id": self._allocate_id(),
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-03-26",
+                    "capabilities": {},
+                    "clientInfo": {"name": "den-hermes-orchestrator", "version": "0.1"},
+                },
+            },
+            include_session=False,
+        )
+        session_id = response.headers.get("Mcp-Session-Id")
+        if not session_id:
+            raise RuntimeError("MCP initialize response missing Mcp-Session-Id header")
+        self._session_id = session_id
+        self._post(
+            {"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}},
+            include_session=True,
+        )
+
+    def _post(self, payload: Mapping[str, Any], *, include_session: bool) -> Any:
+        headers = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
+        if include_session:
+            if self._session_id is None:
+                raise RuntimeError("MCP session is not initialized")
+            headers["Mcp-Session-Id"] = self._session_id
+        response = self.transport.post(
+            self.url,
+            headers=headers,
+            json=dict(payload),
+            timeout=self.timeout_seconds,
+        )
+        response.raise_for_status()
+        return response
+
+    def _allocate_id(self) -> int:
+        value = self._next_id
+        self._next_id += 1
+        return value
+
+
+def _default_http_transport() -> Any:
+    import requests
+
+    return requests.Session()
+
+
+def _mcp_remote_tool_name(name: str) -> str:
+    return name.removeprefix("mcp_den_")
+
+
 @dataclass(frozen=True)
 class OrchestratorAction:
     type: OrchestratorActionType
@@ -860,17 +958,16 @@ def handle_review_outcome(
 
 
 def build_mcp_adapter(*, project_id: str, requested_by: str) -> DenWorkflowAdapter:
-    """Build a real MCP-backed adapter.
+    """Build a Den MCP-backed adapter for live orchestrator runs."""
 
-    Hermes exposes MCP tools to the agent process, not automatically to arbitrary
-    Python subprocesses. Future wiring can pass a concrete tools object here;
-    for now this explicit error keeps the module CLI fail-closed instead of
-    silently pretending it can reach Den.
-    """
-
-    raise RuntimeError(
-        "No Den MCP tools object was injected. Use decide_next_action() with an injected "
-        "DenWorkflowAdapter from Hermes, or wire build_mcp_adapter in a future integration task."
+    url = os.environ.get("DEN_HERMES_MCP_URL") or os.environ.get("DEN_MCP_URL")
+    if not url:
+        raise RuntimeError("DEN_HERMES_MCP_URL or DEN_MCP_URL must be set for live Den MCP orchestrator access")
+    timeout = int(os.environ.get("DEN_HERMES_MCP_TIMEOUT", "120"))
+    return DenWorkflowAdapter(
+        tools=McpHttpTools(url, timeout_seconds=timeout),
+        project_id=project_id,
+        requested_by=requested_by,
     )
 
 
@@ -954,8 +1051,11 @@ def _selected_runtime_registry_path(runtime_registry_path: str | Path | None) ->
 
 def _packet_message_id(packet: Mapping[str, Any]) -> int:
     value = packet.get("message_id", packet.get("id"))
+    if value is None and isinstance(packet.get("packet"), Mapping):
+        nested = packet["packet"]
+        value = nested.get("message_id", nested.get("id"))
     if value is None:
-        raise ValueError("coder context packet response must include message_id or id")
+        raise ValueError("context packet response must include message_id or id")
     return int(value)
 
 
@@ -1067,6 +1167,26 @@ def _coerce_mapping_response(response: Any) -> Mapping[str, Any]:
     if isinstance(response, Mapping):
         return response
     raise TypeError(f"Expected mapping response, got {type(response).__name__}")
+
+
+def _mcp_result_from_response(response: Any) -> Any:
+    payloads = []
+    for raw_line in str(response.text or "").splitlines():
+        line = raw_line.strip()
+        if not line.startswith("data:"):
+            continue
+        data = line.removeprefix("data:").strip()
+        if data:
+            payloads.append(json.loads(data))
+    if not payloads:
+        return {}
+    payload = payloads[-1]
+    if "error" in payload:
+        error = payload["error"]
+        if isinstance(error, Mapping):
+            raise RuntimeError(str(error.get("message") or error))
+        raise RuntimeError(str(error))
+    return payload.get("result", {})
 
 
 def _task_status(summary: Mapping[str, Any]) -> str | None:
