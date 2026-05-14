@@ -92,3 +92,37 @@ def test_build_mcp_adapter_requires_explicit_mcp_url(monkeypatch):
 
 def test_packet_message_id_accepts_nested_den_mcp_packet_response():
     assert _packet_message_id({"summary": "created packet", "packet": {"message_id": 5863}}) == 5863
+
+
+class PlainJsonTransport(RecordingMcpTransport):
+    def post(self, url, *, headers, json, timeout):  # noqa: A002
+        self.posts.append({"url": url, "headers": headers, "json": json, "timeout": timeout})
+        if json["method"] == "initialize":
+            return FakeResponse(200, json_dumps({"jsonrpc": "2.0", "id": json["id"], "result": {}}), {"Mcp-Session-Id": self.session_id})
+        if json["method"] == "notifications/initialized":
+            return FakeResponse(202, "", {})
+        payload = self.responses.pop(0)
+        return FakeResponse(200, json_dumps({"jsonrpc": "2.0", "id": json["id"], "result": payload}), {})
+
+
+def json_dumps(payload):
+    return json.dumps(payload)
+
+
+def test_mcp_http_tools_accepts_plain_json_mcp_response():
+    transport = PlainJsonTransport(
+        responses=[{"content": [{"type": "text", "text": json.dumps({"review_round_id": 77})}]}]
+    )
+    tools = McpHttpTools("http://den.example/mcp", transport=transport)
+
+    response = tools.mcp_den_request_review(task_id=1401)
+
+    assert response == {"review_round_id": 77}
+
+
+def test_mcp_http_tools_reports_empty_tool_text_with_tool_name():
+    transport = RecordingMcpTransport(responses=[{"content": [{"type": "text", "text": ""}]}])
+    tools = McpHttpTools("http://den.example/mcp", transport=transport)
+
+    with pytest.raises(RuntimeError, match="request_review.*empty text"):
+        tools.mcp_den_request_review(task_id=1401)

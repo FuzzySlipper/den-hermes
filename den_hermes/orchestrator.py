@@ -44,26 +44,18 @@ class McpHttpTools:
 
     def call_tool(self, name: str, arguments: Mapping[str, Any]) -> Any:
         self._ensure_session()
+        remote_name = _mcp_remote_tool_name(name)
         response = self._post(
             {
                 "jsonrpc": "2.0",
                 "id": self._allocate_id(),
                 "method": "tools/call",
-                "params": {"name": _mcp_remote_tool_name(name), "arguments": dict(arguments)},
+                "params": {"name": remote_name, "arguments": dict(arguments)},
             },
             include_session=True,
         )
         result = _mcp_result_from_response(response)
-        if isinstance(result, Mapping) and "content" in result:
-            content = result.get("content")
-            if isinstance(content, list) and content and isinstance(content[0], Mapping):
-                text = content[0].get("text")
-                if isinstance(text, str):
-                    try:
-                        return json.loads(text)
-                    except json.JSONDecodeError:
-                        return text
-        return result
+        return _decode_mcp_tool_result(result, tool_name=remote_name)
 
     def _ensure_session(self) -> None:
         if self._session_id is not None:
@@ -1178,6 +1170,8 @@ def _mcp_result_from_response(response: Any) -> Any:
         data = line.removeprefix("data:").strip()
         if data:
             payloads.append(json.loads(data))
+    if not payloads and str(response.text or "").strip():
+        payloads.append(json.loads(str(response.text).strip()))
     if not payloads:
         return {}
     payload = payloads[-1]
@@ -1187,6 +1181,27 @@ def _mcp_result_from_response(response: Any) -> Any:
             raise RuntimeError(str(error.get("message") or error))
         raise RuntimeError(str(error))
     return payload.get("result", {})
+
+
+def _decode_mcp_tool_result(result: Any, *, tool_name: str) -> Any:
+    if not isinstance(result, Mapping) or "content" not in result:
+        return result
+    content = result.get("content")
+    if not isinstance(content, list) or not content:
+        raise RuntimeError(f"MCP tool {tool_name} returned no content entries")
+    first = content[0]
+    if not isinstance(first, Mapping):
+        raise RuntimeError(f"MCP tool {tool_name} returned non-object content entry")
+    text = first.get("text")
+    if not isinstance(text, str):
+        raise RuntimeError(f"MCP tool {tool_name} returned content without text")
+    if not text.strip():
+        raise RuntimeError(f"MCP tool {tool_name} returned empty text content")
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as exc:
+        preview = text[:200]
+        raise RuntimeError(f"MCP tool {tool_name} returned non-JSON text content: {preview!r}") from exc
 
 
 def _task_status(summary: Mapping[str, Any]) -> str | None:
