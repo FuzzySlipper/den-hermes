@@ -3,6 +3,8 @@ import os
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from den_hermes.worker_launcher import (
     run_coder_reviewer_sequence,
     run_den_coder_reviewer_workflow,
@@ -78,6 +80,38 @@ if role == "reviewer":
     }
     if tests_run:
         artifact["tests_run"] = tests_run
+elif role == "validator":
+    artifact = {
+        "task_id": artifact_task_id,
+        "run_id": artifact_run_id,
+        "role": artifact_role,
+        "status": "completed",
+        "verdict": os.environ.get("FAKE_VALIDATOR_VERDICT", "passed"),
+        "tests_run": json.loads(os.environ.get("FAKE_VALIDATOR_TESTS_RUN", '[{"command": "pytest tests/ -q", "result": "passed"}]')),
+        "summary": "fake validator passed",
+    }
+elif role == "drift_checker":
+    artifact = {
+        "task_id": artifact_task_id,
+        "run_id": artifact_run_id,
+        "role": artifact_role,
+        "status": "completed",
+        "verdict": os.environ.get("FAKE_DRIFT_VERDICT", "passed"),
+        "checked_refs": json.loads(os.environ.get("FAKE_DRIFT_CHECKED_REFS", '["main", "task/1399-gates"]')),
+        "notes": "fake drift check passed",
+        "summary": os.environ.get("FAKE_DRIFT_SUMMARY", "fake drift checker passed"),
+    }
+elif role == "packet_auditor":
+    artifact = {
+        "task_id": artifact_task_id,
+        "run_id": artifact_run_id,
+        "role": artifact_role,
+        "status": "completed",
+        "verdict": os.environ.get("FAKE_AUDIT_VERDICT", "passed"),
+        "audited_packets": json.loads(os.environ.get("FAKE_AUDITED_PACKETS", '[5793]')),
+        "notes": "fake packet audit passed",
+        "summary": os.environ.get("FAKE_AUDIT_SUMMARY", "fake packet auditor passed"),
+    }
 else:
     fake_branch = os.environ.get("FAKE_BRANCH", "task/1368-fake")
     fake_head = os.environ.get("FAKE_HEAD", "0123456789abcdef0123456789abcdef01234567")
@@ -360,6 +394,91 @@ def test_coder_artifact_requires_branch_head_commit_and_tests(tmp_path):
     assert result.status == "failed"
     assert result.artifact is None
     assert "head_commit" in result.error
+
+
+
+def test_validator_artifact_requires_validation_evidence(tmp_path):
+    env = fake_env(tmp_path)
+    env["FAKE_VALIDATOR_TESTS_RUN"] = "[]"
+
+    result = run_hermes_worker(
+        task_id=1368,
+        run_id="validator-run",
+        role="validator",
+        prompt="Validate task 1368.",
+        expected_artifact=tmp_path / ".den" / "runs" / "validator-run" / "completion.json",
+        cwd=tmp_path,
+        env_overrides=env,
+    )
+
+    assert result.status == "failed"
+    assert result.artifact is None
+    assert "validation evidence" in result.error
+
+
+def test_drift_checker_artifact_requires_checked_refs_or_packets(tmp_path):
+    env = fake_env(tmp_path)
+    env["FAKE_DRIFT_CHECKED_REFS"] = "[]"
+
+    result = run_hermes_worker(
+        task_id=1368,
+        run_id="drift-run",
+        role="drift_checker",
+        prompt="Check drift for task 1368.",
+        expected_artifact=tmp_path / ".den" / "runs" / "drift-run" / "completion.json",
+        cwd=tmp_path,
+        env_overrides=env,
+    )
+
+    assert result.status == "failed"
+    assert result.artifact is None
+    assert "checked_refs" in result.error
+
+
+def test_packet_auditor_artifact_requires_audited_packets(tmp_path):
+    env = fake_env(tmp_path)
+    env["FAKE_AUDITED_PACKETS"] = "[]"
+
+    result = run_hermes_worker(
+        task_id=1368,
+        run_id="audit-run",
+        role="packet_auditor",
+        prompt="Audit packets for task 1368.",
+        expected_artifact=tmp_path / ".den" / "runs" / "audit-run" / "completion.json",
+        cwd=tmp_path,
+        env_overrides=env,
+    )
+
+    assert result.status == "failed"
+    assert result.artifact is None
+    assert "audited_packets" in result.error
+
+
+@pytest.mark.parametrize(
+    ("role", "env_key"),
+    [
+        ("validator", "FAKE_VALIDATOR_VERDICT"),
+        ("drift_checker", "FAKE_DRIFT_VERDICT"),
+        ("packet_auditor", "FAKE_AUDIT_VERDICT"),
+    ],
+)
+def test_gate_role_artifact_rejects_non_passing_verdict(tmp_path, role, env_key):
+    env = fake_env(tmp_path)
+    env[env_key] = "failed"
+
+    result = run_hermes_worker(
+        task_id=1368,
+        run_id=f"{role}-run",
+        role=role,
+        prompt=f"Run {role} gate.",
+        expected_artifact=tmp_path / ".den" / "runs" / f"{role}-run" / "completion.json",
+        cwd=tmp_path,
+        env_overrides=env,
+    )
+
+    assert result.status == "failed"
+    assert result.artifact is None
+    assert "verdict" in result.error
 
 
 def test_fake_coder_then_reviewer_sequence_uses_distinct_runtime_args(tmp_path):

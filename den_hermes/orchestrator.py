@@ -73,6 +73,19 @@ class ReviewLoopResult:
 
 
 @dataclass(frozen=True)
+class GateRolePathResult:
+    status: str
+    run_id: str
+    role: str
+    verdict: str | None = None
+    evidence: dict[str, Any] = field(default_factory=dict)
+    artifact_path: str | None = None
+    latest_completion: Mapping[str, Any] | None = None
+    worker_status: Mapping[str, Any] | None = None
+    error: str | None = None
+
+
+@dataclass(frozen=True)
 class DenWorkflowAdapter:
     """Small Den workflow-state adapter for the orchestrator skeleton.
 
@@ -181,6 +194,36 @@ class DenWorkflowAdapter:
         args.update({key: value for key, value in optional.items() if value is not None})
         return _coerce_mapping_response(self.tools.mcp_den_prepare_reviewer_context_packet(**args))
 
+    def prepare_gate_context_packet(
+        self,
+        *,
+        task_id: int,
+        role: str,
+        branch: str | None = None,
+        head_commit: str | None = None,
+        base_branch: str | None = None,
+        base_commit: str | None = None,
+        allowed_scope: str | None = None,
+        notes: str | None = None,
+    ) -> Mapping[str, Any]:
+        tool_name = _prepare_packet_tool_for_role(role)
+        prepare_tool = getattr(self.tools, tool_name)
+        args: dict[str, Any] = {
+            "project_id": self.project_id,
+            "task_id": task_id,
+            "requested_by": self.requested_by,
+        }
+        optional = {
+            "branch": branch,
+            "head_commit": head_commit,
+            "base_branch": base_branch,
+            "base_commit": base_commit,
+            "allowed_scope": allowed_scope,
+            "notes": notes,
+        }
+        args.update({key: value for key, value in optional.items() if value is not None})
+        return _coerce_mapping_response(prepare_tool(**args))
+
     def register_worker_run(self, **kwargs: Any) -> Mapping[str, Any]:
         normalized = dict(kwargs)
         normalized.pop("runtime_id", None)
@@ -216,7 +259,7 @@ class DenWorkflowAdapter:
             "status": str(artifact.get("status", "completed")),
             "role": role,
             "packet_type": _packet_type_for_role(role),
-            "summary": str(artifact.get("summary", "Spawned-Hermes worker completed.")),
+            "summary": _completion_summary_for_role(role=role, artifact=artifact),
             "dedupe_key": f"{run_id}:completed",
         }
         if role == "coder":
@@ -233,6 +276,8 @@ class DenWorkflowAdapter:
                 args["finding_ids"] = json.dumps(list(artifact.get("finding_ids") or []))
             if "tests_run" in artifact:
                 args["tests_run"] = json.dumps(list(artifact.get("tests_run") or []))
+        if role == "validator" and "tests_run" in artifact:
+            args["tests_run"] = json.dumps(list(artifact.get("tests_run") or []))
         response = self.tools.mcp_den_post_worker_completion_packet(**args)
         payload = _coerce_mapping_response(response)
         _ensure_den_did_not_reject(payload, context=f"worker completion for {run_id}")
@@ -634,6 +679,123 @@ def run_tracked_reviewer_path(
     )
 
 
+def run_tracked_gate_role_path(
+    adapter: DenWorkflowAdapter,
+    *,
+    task_id: int,
+    role: str,
+    prompt: str,
+    run_id: str,
+    branch: str | None = None,
+    head_commit: str | None = None,
+    cwd: str | Path | None = None,
+    env_overrides: Mapping[str, str] | None = None,
+    runtime_registry_path: str | Path | None = None,
+    base_branch: str | None = None,
+    base_commit: str | None = None,
+    allowed_scope: str | None = None,
+) -> GateRolePathResult:
+    """Run an optional post-review gate role through tracked spawned-Hermes."""
+
+    if role not in {"validator", "drift_checker", "packet_auditor"}:
+        return GateRolePathResult(status="failed", run_id=run_id, role=role, error=f"Unsupported gate role: {role}")
+    try:
+        packet = adapter.prepare_gate_context_packet(
+            task_id=task_id,
+            role=role,
+            branch=branch,
+            head_commit=head_commit,
+            base_branch=base_branch,
+            base_commit=base_commit,
+            allowed_scope=allowed_scope,
+            notes=f"Prepared by spawned-Hermes orchestrator {role} gate path.",
+        )
+        packet_message_id = _packet_message_id(packet)
+        runtime = resolve_role_runtime(
+            role,
+            registry_path=_selected_runtime_registry_path(runtime_registry_path),
+            run_id=run_id,
+        )
+    except (AttributeError, RuntimeRegistryError, KeyError, TypeError, ValueError) as exc:
+        return GateRolePathResult(status="failed", run_id=run_id, role=role, error=str(exc))
+
+    artifact_path = runtime.artifact_path or str(Path(runtime.run_root) / run_id / runtime.artifact_filename)
+    log_path = runtime.log_path or str(Path(runtime.run_root) / run_id / runtime.log_filename)
+    try:
+        adapter.register_worker_run(
+            task_id=task_id,
+            run_id=run_id,
+            role=role,
+            branch=branch,
+            head_commit=head_commit,
+            base_branch=base_branch,
+            base_commit=base_commit,
+            profile=runtime.profile,
+            provider=runtime.provider,
+            model=runtime.model,
+            toolsets=list(runtime.toolsets),
+            workdir=str(cwd) if cwd is not None else runtime.workdir,
+            timeout_seconds=runtime.timeout_seconds,
+            artifact_path=artifact_path,
+            log_path=log_path,
+            runtime_id=runtime.runtime_id,
+            prompt_packet_message_id=packet_message_id,
+            dedupe_key=f"{task_id}:{role}:{run_id}",
+        )
+    except Exception as exc:  # noqa: BLE001 - fail closed before subprocess launch
+        return GateRolePathResult(status="failed", run_id=run_id, role=role, artifact_path=artifact_path, error=str(exc))
+
+    adapter.mark_worker_started(task_id=task_id, run_id=run_id, role=role)
+    worker = run_hermes_worker(
+        task_id=task_id,
+        run_id=run_id,
+        role=role,
+        prompt=_gate_prompt_with_packet(
+            prompt=prompt,
+            role=role,
+            packet_message_id=packet_message_id,
+            branch=branch,
+            head_commit=head_commit,
+        ),
+        expected_artifact=artifact_path,
+        provider=runtime.provider,
+        model=runtime.model,
+        profile=runtime.profile,
+        toolsets=list(runtime.toolsets),
+        cwd=cwd if cwd is not None else runtime.workdir,
+        env_overrides=env_overrides,
+        timeout_seconds=runtime.timeout_seconds,
+    )
+    if worker.status != "completed" or worker.artifact is None:
+        error = worker.error or f"{role} worker did not complete"
+        adapter.mark_worker_failed(task_id=task_id, run_id=run_id, role=role, error=error)
+        return GateRolePathResult(status="failed", run_id=run_id, role=role, artifact_path=artifact_path, error=error)
+
+    try:
+        adapter.mark_worker_completed(task_id=task_id, run_id=run_id, role=role, artifact=worker.artifact)
+    except Exception as exc:  # noqa: BLE001 - Den rejected authoritative completion
+        return GateRolePathResult(
+            status="failed",
+            run_id=run_id,
+            role=role,
+            artifact_path=artifact_path,
+            error=f"{role} completion rejected by Den: {exc}",
+        )
+
+    latest_completion = adapter.get_latest_worker_completion(task_id=task_id, run_id=run_id, role=role)
+    worker_status = adapter.get_worker_run_status(task_id=task_id, run_id=run_id)
+    return GateRolePathResult(
+        status="completed",
+        run_id=run_id,
+        role=role,
+        verdict=str(worker.artifact.get("verdict", "passed")),
+        evidence=_gate_artifact_evidence(worker.artifact, role=role),
+        artifact_path=artifact_path,
+        latest_completion=latest_completion,
+        worker_status=worker_status,
+    )
+
+
 def handle_review_outcome(
     adapter: DenWorkflowAdapter,
     *,
@@ -741,6 +903,33 @@ def _packet_type_for_role(role: str) -> str:
     }.get(role, "worker_failure_packet")
 
 
+def _prepare_packet_tool_for_role(role: str) -> str:
+    tools = {
+        "validator": "mcp_den_prepare_validator_context_packet",
+        "drift_checker": "mcp_den_prepare_drift_checker_context_packet",
+        "packet_auditor": "mcp_den_prepare_packet_auditor_context_packet",
+    }
+    if role not in tools:
+        raise ValueError(f"No gate context packet tool for role: {role}")
+    return tools[role]
+
+
+def _gate_artifact_evidence(artifact: Mapping[str, Any], *, role: str) -> dict[str, Any]:
+    keys_by_role = {
+        "validator": ("tests_run", "validation_commands", "validation_results"),
+        "drift_checker": ("checked_refs", "checked_packets", "notes"),
+        "packet_auditor": ("audited_packets", "checked_packets", "notes"),
+    }
+    return {key: artifact[key] for key in keys_by_role.get(role, ()) if key in artifact}
+
+
+def _completion_summary_for_role(*, role: str, artifact: Mapping[str, Any]) -> str:
+    if role in {"validator", "drift_checker", "packet_auditor"}:
+        verdict = str(artifact.get("verdict", "unknown"))
+        return f"Spawned-Hermes {role} gate completed with verdict {verdict}."
+    return str(artifact.get("summary", "Spawned-Hermes worker completed."))
+
+
 def _json_or_none(value: Any) -> str | None:
     if value is None:
         return None
@@ -794,6 +983,25 @@ def _reviewer_prompt_with_packet(
         f"Branch: {branch}\n"
         f"Head commit: {head_commit}\n"
         f"Tests run: {json.dumps(tests_run, sort_keys=True)}\n"
+    )
+
+
+def _gate_prompt_with_packet(
+    *,
+    prompt: str,
+    role: str,
+    packet_message_id: int,
+    branch: str | None,
+    head_commit: str | None,
+) -> str:
+    branch_line = f"Branch: {branch}\n" if branch else ""
+    head_line = f"Head commit: {head_commit}\n" if head_commit else ""
+    return (
+        f"{prompt.rstrip()}\n\n"
+        f"DEN {role.upper()} CONTEXT PACKET\n"
+        f"Use Den task-thread packet message id {packet_message_id} as the bounded {role} context source.\n"
+        "GATE INPUTS\n"
+        f"{branch_line}{head_line}"
     )
 
 

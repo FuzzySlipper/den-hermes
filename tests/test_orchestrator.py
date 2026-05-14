@@ -5,10 +5,12 @@ import pytest
 
 from den_hermes.orchestrator import (
     DenWorkflowAdapter,
+    GateRolePathResult,
     OrchestratorAction,
     OrchestratorActionType,
     decide_next_action,
     main,
+    run_tracked_gate_role_path,
     run_tracked_coder_path,
     run_tracked_reviewer_path,
     handle_review_outcome,
@@ -186,6 +188,18 @@ class RecordingCoderTools:
     def mcp_den_prepare_reviewer_context_packet(self, **kwargs):
         self.calls.append(("prepare_reviewer_context_packet", kwargs))
         return {"message_id": 5792}
+
+    def mcp_den_prepare_validator_context_packet(self, **kwargs):
+        self.calls.append(("prepare_validator_context_packet", kwargs))
+        return {"message_id": 5793}
+
+    def mcp_den_prepare_drift_checker_context_packet(self, **kwargs):
+        self.calls.append(("prepare_drift_checker_context_packet", kwargs))
+        return {"message_id": 5794}
+
+    def mcp_den_prepare_packet_auditor_context_packet(self, **kwargs):
+        self.calls.append(("prepare_packet_auditor_context_packet", kwargs))
+        return {"message_id": 5795}
 
     def mcp_den_request_review(self, **kwargs):
         self.calls.append(("request_review", kwargs))
@@ -672,3 +686,105 @@ def test_review_outcome_follow_up_only_findings_are_deferred_without_launch():
     assert result.status == "follow_up_deferred"
     assert result.finding_ids == [9002]
     assert tools.calls == []
+
+
+@pytest.mark.parametrize(
+    ("role", "prepare_call", "packet_type", "profile", "evidence_key"),
+    [
+        ("validator", "prepare_validator_context_packet", "validation_packet", "den-validator-profile", "tests_run"),
+        ("drift_checker", "prepare_drift_checker_context_packet", "drift_check_packet", "den-drift-profile", "checked_refs"),
+        ("packet_auditor", "prepare_packet_auditor_context_packet", "packet_audit_packet", "den-audit-profile", "audited_packets"),
+    ],
+)
+def test_tracked_gate_role_path_uses_role_context_runtime_and_packet_type(
+    tmp_path, role, prepare_call, packet_type, profile, evidence_key
+):
+    tools = RecordingCoderTools()
+    adapter = make_adapter(tools)
+
+    result = run_tracked_gate_role_path(
+        adapter,
+        task_id=1399,
+        role=role,
+        prompt=f"Run {role} gate.",
+        run_id=f"{role}-run",
+        branch="task/1399-gates",
+        head_commit=FAKE_HEAD,
+        cwd=tmp_path,
+        env_overrides=fake_env(tmp_path),
+        runtime_registry_path=write_runtime_registry(tmp_path),
+    )
+
+    assert isinstance(result, GateRolePathResult)
+    assert result.status == "completed"
+    assert result.verdict == "passed"
+    assert evidence_key in result.evidence
+    assert [name for name, _ in tools.calls] == [
+        prepare_call,
+        "register_worker_run",
+        "send_message",
+        "post_worker_completion_packet",
+        "get_latest_worker_completion",
+        "get_worker_run_status",
+    ]
+    registration = tools.calls[1][1]
+    assert registration["role"] == role
+    assert registration["profile"] == profile
+    assert registration["prompt_packet_message_id"] in {5793, 5794, 5795}
+    completion = tools.calls[3][1]
+    assert completion["packet_type"] == packet_type
+    if role == "validator":
+        assert json.loads(completion["tests_run"]) == result.evidence["tests_run"]
+    else:
+        assert "tests_run" not in completion
+        assert evidence_key not in completion["summary"]
+        assert completion["summary"] == f"Spawned-Hermes {role} gate completed with verdict passed."
+
+
+def test_tracked_gate_role_path_does_not_post_worker_controlled_drift_summary(tmp_path):
+    env = fake_env(tmp_path)
+    env["FAKE_DRIFT_SUMMARY"] = "checked_refs include SECRET_TOKEN=abc123"
+    tools = RecordingCoderTools()
+    adapter = make_adapter(tools)
+
+    result = run_tracked_gate_role_path(
+        adapter,
+        task_id=1399,
+        role="drift_checker",
+        prompt="Run drift gate.",
+        run_id="drift-run",
+        branch="task/1399-gates",
+        head_commit=FAKE_HEAD,
+        cwd=tmp_path,
+        env_overrides=env,
+        runtime_registry_path=write_runtime_registry(tmp_path),
+    )
+
+    assert result.status == "completed"
+    completion = [kwargs for name, kwargs in tools.calls if name == "post_worker_completion_packet"][0]
+    assert "SECRET_TOKEN" not in completion["summary"]
+    assert "checked_refs" not in completion["summary"]
+    assert completion["summary"] == "Spawned-Hermes drift_checker gate completed with verdict passed."
+
+
+def test_tracked_gate_role_path_registration_failure_prevents_launch(tmp_path):
+    tools = RecordingCoderTools(registration_response={"error": "validator registration rejected"})
+    adapter = make_adapter(tools)
+
+    result = run_tracked_gate_role_path(
+        adapter,
+        task_id=1399,
+        role="validator",
+        prompt="Validate.",
+        run_id="validator-run",
+        branch="task/1399-gates",
+        head_commit=FAKE_HEAD,
+        cwd=tmp_path,
+        env_overrides=fake_env(tmp_path),
+        runtime_registry_path=write_runtime_registry(tmp_path),
+    )
+
+    assert result.status == "failed"
+    assert "validator registration rejected" in result.error
+    assert [name for name, _ in tools.calls] == ["prepare_validator_context_packet", "register_worker_run"]
+    assert not (tmp_path / "fake-hermes-call.jsonl").exists()

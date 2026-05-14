@@ -518,6 +518,35 @@ def _validate_artifact_shape(*, artifact: Mapping[str, Any], role: str) -> str |
             return f"Invalid reviewer verdict: {artifact.get('verdict')!r}"
         if not isinstance(artifact.get("findings"), list):
             return "Invalid reviewer completion field: findings must be a list"
+    if role == "validator":
+        for field in ("verdict", "summary", "status"):
+            if not artifact.get(field):
+                return f"Missing required validator completion field: {field}"
+        if artifact.get("verdict") != "passed":
+            return f"Invalid validator verdict: {artifact.get('verdict')!r}"
+        has_tests = isinstance(artifact.get("tests_run"), list) and bool(artifact.get("tests_run"))
+        has_commands = isinstance(artifact.get("validation_commands"), list) and bool(artifact.get("validation_commands"))
+        has_results = isinstance(artifact.get("validation_results"), list) and bool(artifact.get("validation_results"))
+        if not (has_tests or has_commands or has_results):
+            return "Missing required validator validation evidence: tests_run, validation_commands, or validation_results"
+    if role == "drift_checker":
+        for field in ("verdict", "summary", "status"):
+            if not artifact.get(field):
+                return f"Missing required drift_checker completion field: {field}"
+        if artifact.get("verdict") != "passed":
+            return f"Invalid drift_checker verdict: {artifact.get('verdict')!r}"
+        has_refs = isinstance(artifact.get("checked_refs"), list) and bool(artifact.get("checked_refs"))
+        has_packets = isinstance(artifact.get("checked_packets"), list) and bool(artifact.get("checked_packets"))
+        if not (has_refs or has_packets):
+            return "Missing required drift_checker evidence: checked_refs or checked_packets"
+    if role == "packet_auditor":
+        for field in ("verdict", "summary", "status"):
+            if not artifact.get(field):
+                return f"Missing required packet_auditor completion field: {field}"
+        if artifact.get("verdict") != "passed":
+            return f"Invalid packet_auditor verdict: {artifact.get('verdict')!r}"
+        if not isinstance(artifact.get("audited_packets"), list) or not artifact.get("audited_packets"):
+            return "Missing required packet_auditor evidence: audited_packets"
     return None
 
 
