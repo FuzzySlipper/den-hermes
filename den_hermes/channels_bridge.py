@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Any, Mapping, Protocol
 
 SECRETISH_PATTERN = re.compile(r"(?i)(bearer\s+\S+|sk-[a-z0-9_.-]{8,}|api[_-]?key|auth[_-]?token|\btoken\b|authorization|password|secret)")
@@ -20,6 +21,17 @@ class WakeResult:
     diagnostic: str | None = None
 
 
+@dataclass(frozen=True)
+class ResponseResult:
+    status: str
+    delivery_request_id: int
+    dedupe_key: str
+    correlation_id: str | None
+    target_kind: str
+    message_id: str | int | None = None
+    diagnostic: str | None = None
+
+
 class HermesWakeTransport(Protocol):
     def wake_profile(self, *, binding: Mapping[str, Any], envelope: Mapping[str, Any]) -> Mapping[str, Any]: ...
 
@@ -27,6 +39,7 @@ class HermesWakeTransport(Protocol):
 class InMemoryWakeStore:
     def __init__(self) -> None:
         self._records: dict[tuple[str, int, str, str], WakeResult] = {}
+        self._reply_records: dict[tuple[int, str, str], ResponseResult] = {}
 
     def get(self, *, adapter_instance_id: str, delivery_request_id: int, dedupe_key: str, delivery_mode: str) -> WakeResult | None:
         result = self._records.get((adapter_instance_id, delivery_request_id, dedupe_key, delivery_mode))
@@ -45,6 +58,200 @@ class InMemoryWakeStore:
 
     def put(self, *, adapter_instance_id: str, delivery_request_id: int, dedupe_key: str, delivery_mode: str, result: WakeResult) -> None:
         self._records[(adapter_instance_id, delivery_request_id, dedupe_key, delivery_mode)] = result
+
+    def get_reply(self, *, delivery_request_id: int, dedupe_key: str, target_kind: str) -> ResponseResult | None:
+        result = self._reply_records.get((delivery_request_id, dedupe_key, target_kind))
+        if result is None:
+            return None
+        return ResponseResult(
+            status="duplicate",
+            delivery_request_id=result.delivery_request_id,
+            dedupe_key=result.dedupe_key,
+            correlation_id=result.correlation_id,
+            target_kind=result.target_kind,
+            message_id=result.message_id,
+            diagnostic=result.diagnostic,
+        )
+
+    def put_reply(self, *, delivery_request_id: int, dedupe_key: str, target_kind: str, result: ResponseResult) -> None:
+        self._reply_records[(delivery_request_id, dedupe_key, target_kind)] = result
+
+
+class JsonFileWakeStore(InMemoryWakeStore):
+    """Small JSON-backed idempotency store for single-host bridge retries."""
+
+    def __init__(self, path: str | Path):
+        self.path = Path(path)
+        super().__init__()
+        self._load()
+
+    def put(self, *, adapter_instance_id: str, delivery_request_id: int, dedupe_key: str, delivery_mode: str, result: WakeResult) -> None:
+        super().put(
+            adapter_instance_id=adapter_instance_id,
+            delivery_request_id=delivery_request_id,
+            dedupe_key=dedupe_key,
+            delivery_mode=delivery_mode,
+            result=result,
+        )
+        self._save()
+
+    def put_reply(self, *, delivery_request_id: int, dedupe_key: str, target_kind: str, result: ResponseResult) -> None:
+        super().put_reply(
+            delivery_request_id=delivery_request_id,
+            dedupe_key=dedupe_key,
+            target_kind=target_kind,
+            result=result,
+        )
+        self._save()
+
+    def _load(self) -> None:
+        if not self.path.exists():
+            return
+        data = json.loads(self.path.read_text())
+        for key_text, value in data.get("wake_records", {}).items():
+            adapter_instance_id, delivery_request_id, dedupe_key, delivery_mode = json.loads(key_text)
+            self._records[(adapter_instance_id, int(delivery_request_id), dedupe_key, delivery_mode)] = WakeResult(**value)
+        for key_text, value in data.get("reply_records", {}).items():
+            delivery_request_id, dedupe_key, target_kind = json.loads(key_text)
+            self._reply_records[(int(delivery_request_id), dedupe_key, target_kind)] = ResponseResult(**value)
+
+    def _save(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        data = {
+            "wake_records": {json.dumps(list(key)): asdict(value) for key, value in self._records.items()},
+            "reply_records": {json.dumps(list(key)): asdict(value) for key, value in self._reply_records.items()},
+        }
+        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
+        tmp.write_text(json.dumps(data, sort_keys=True))
+        tmp.replace(self.path)
+
+
+class DenChannelsResponseBridge:
+    def __init__(self, *, den_tools: Any, store: InMemoryWakeStore, gateway_client: Any | None = None):
+        self.den_tools = den_tools
+        self.store = store
+        self.gateway_client = gateway_client
+
+    def post_reply(self, delivery: Mapping[str, Any], *, body: str, run_id: str | None) -> ResponseResult:
+        delivery_request_id = _required_int(delivery, "delivery_request_id")
+        dedupe_key = _required_str(delivery, "dedupe_key")
+        correlation_id = _optional_str(delivery.get("correlation_id"))
+        response_target = _mapping(delivery.get("response_target", {"kind": "agent_stream"}), "response_target")
+        target_kind = _required_str(response_target, "kind")
+        try:
+            if target_kind in {"project_message", "user_notification"}:
+                _validated_response_project_id(delivery, response_target)
+        except ValueError as exc:
+            return ResponseResult(
+                status="failed",
+                delivery_request_id=delivery_request_id,
+                dedupe_key=dedupe_key,
+                correlation_id=correlation_id,
+                target_kind=target_kind,
+                diagnostic=str(exc),
+            )
+        duplicate = self.store.get_reply(
+            delivery_request_id=delivery_request_id,
+            dedupe_key=dedupe_key,
+            target_kind=target_kind,
+        )
+        if duplicate is not None:
+            return duplicate
+        metadata = _reply_metadata(delivery, run_id=run_id)
+        if target_kind == "project_message":
+            project_id = _validated_response_project_id(delivery, response_target)
+            response = self.den_tools.mcp_den_send_message(
+                project_id=project_id,
+                sender="den-hermes-bridge",
+                content=body,
+                task_id=_optional_int(response_target.get("task_id")) or _source_task_id(delivery),
+                thread_id=_optional_int(response_target.get("thread_id")),
+                metadata=metadata,
+                intent="den_channel_reply",
+            )
+        elif target_kind == "agent_stream":
+            target = _mapping(delivery.get("target"), "target")
+            response = self.den_tools.mcp_den_send_agent_stream_message(
+                sender="den-hermes-bridge",
+                event_type=str(response_target.get("event_type") or "answer"),
+                body=body,
+                project_id=_target_project_id(delivery),
+                task_id=_source_task_id(delivery),
+                recipient_agent=_required_str(target, "agent_identity"),
+                recipient_role=_optional_str(target.get("role")),
+                delivery_mode="notify",
+                metadata=metadata,
+                dedup_key=f"reply:{dedupe_key}:{target_kind}",
+            )
+        elif target_kind == "user_notification":
+            project_id = _validated_response_project_id(delivery, response_target)
+            response = self.den_tools.mcp_den_send_user_notification(
+                project_id=project_id,
+                sender="den-hermes-bridge",
+                content=body,
+                task_id=_optional_int(response_target.get("task_id")) or _source_task_id(delivery),
+                metadata=metadata,
+                urgency=_optional_str(response_target.get("urgency")) or "normal",
+            )
+        elif target_kind == "channel_message":
+            if self.gateway_client is None:
+                raise RuntimeError("channel_message response target requires a gateway_client")
+            response = self.gateway_client.post_channel_message(
+                channel_id=_required_str(response_target, "channel_id"),
+                body=body,
+                metadata=metadata,
+                dedupe_key=f"reply:{dedupe_key}:{target_kind}",
+            )
+        else:
+            raise ValueError(f"Unsupported response target kind: {target_kind}")
+        result = ResponseResult(
+            status="posted",
+            delivery_request_id=delivery_request_id,
+            dedupe_key=dedupe_key,
+            correlation_id=correlation_id,
+            target_kind=target_kind,
+            message_id=_response_id(response),
+        )
+        self.store.put_reply(
+            delivery_request_id=delivery_request_id,
+            dedupe_key=dedupe_key,
+            target_kind=target_kind,
+            result=result,
+        )
+        return result
+
+    def emit_lifecycle(self, delivery: Mapping[str, Any], *, lifecycle_event: str, run_id: str | None) -> ResponseResult:
+        target = _mapping(delivery.get("target"), "target")
+        noisy = lifecycle_event in {"received", "started", "idle", "heartbeat"}
+        metadata = _reply_metadata(delivery, run_id=run_id)
+        metadata.update(
+            {
+                "type": "hermes_lifecycle_event",
+                "stream_kind": "ops",
+                "lifecycle_event": lifecycle_event,
+                "event_visibility": "debug" if noisy else "summary",
+            }
+        )
+        response = self.den_tools.mcp_den_send_agent_stream_message(
+            sender="den-hermes-bridge",
+            event_type="note",
+            body=f"Hermes bridge lifecycle: {lifecycle_event}",
+            project_id=_target_project_id(delivery),
+            task_id=_source_task_id(delivery),
+            recipient_agent=_required_str(target, "agent_identity"),
+            recipient_role=_optional_str(target.get("role")),
+            delivery_mode="record_only" if noisy else "notify",
+            metadata=metadata,
+            dedup_key=f"lifecycle:{_required_str(delivery, 'dedupe_key')}:{lifecycle_event}",
+        )
+        return ResponseResult(
+            status="posted",
+            delivery_request_id=_required_int(delivery, "delivery_request_id"),
+            dedupe_key=_required_str(delivery, "dedupe_key"),
+            correlation_id=_optional_str(delivery.get("correlation_id")),
+            target_kind="agent_stream",
+            message_id=_response_id(response),
+        )
 
 
 class DenChannelsWakeBridge:
@@ -229,6 +436,48 @@ def _build_delivery_envelope(delivery: Mapping[str, Any], *, binding: Mapping[st
             "Acknowledge the delivery if possible.",
         ],
     }
+
+
+def _reply_metadata(delivery: Mapping[str, Any], *, run_id: str | None) -> dict[str, Any]:
+    return {
+        "type": "den_channel_reply",
+        "delivery_request_id": _required_int(delivery, "delivery_request_id"),
+        "attempt_id": _optional_int(delivery.get("attempt_id")),
+        "dedupe_key": _required_str(delivery, "dedupe_key"),
+        "correlation_id": _optional_str(delivery.get("correlation_id")),
+        "run_id": run_id,
+        "source": _sanitize_mapping(_mapping(delivery.get("source", {}), "source")),
+        "target": _sanitize_mapping(_mapping(delivery.get("target", {}), "target")),
+    }
+
+
+def _target_project_id(delivery: Mapping[str, Any]) -> str:
+    target = _mapping(delivery.get("target"), "target")
+    return _required_str(target, "project_id")
+
+
+def _validated_response_project_id(delivery: Mapping[str, Any], response_target: Mapping[str, Any]) -> str:
+    delivery_project_id = _target_project_id(delivery)
+    response_project_id = str(response_target.get("project_id") or delivery_project_id)
+    if response_project_id != delivery_project_id:
+        raise ValueError(f"response target project {response_project_id} is outside delivery project {delivery_project_id}")
+    return response_project_id
+
+
+def _response_id(response: Any) -> str | int | None:
+    if isinstance(response, str):
+        try:
+            response = json.loads(response)
+        except json.JSONDecodeError:
+            return response
+    if isinstance(response, Mapping):
+        value = response.get("id") or response.get("message_id")
+        if value is not None:
+            return value
+        result = response.get("result")
+        if isinstance(result, Mapping):
+            return result.get("id") or result.get("message_id")
+    return None
 
 
 def _extract_bindings(response: Any) -> list[Mapping[str, Any]]:
