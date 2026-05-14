@@ -49,6 +49,19 @@ class CoderPathResult:
 
 
 @dataclass(frozen=True)
+class ReviewerPathResult:
+    status: str
+    run_id: str
+    verdict: str | None = None
+    finding_ids: list[int] = field(default_factory=list)
+    artifact_path: str | None = None
+    latest_completion: Mapping[str, Any] | None = None
+    worker_status: Mapping[str, Any] | None = None
+    review_request: Mapping[str, Any] | None = None
+    error: str | None = None
+
+
+@dataclass(frozen=True)
 class DenWorkflowAdapter:
     """Small Den workflow-state adapter for the orchestrator skeleton.
 
@@ -105,6 +118,58 @@ class DenWorkflowAdapter:
         args.update({key: value for key, value in optional.items() if value is not None})
         return _coerce_mapping_response(self.tools.mcp_den_prepare_coder_context_packet(**args))
 
+    def request_review(
+        self,
+        *,
+        task_id: int,
+        branch: str,
+        head_commit: str,
+        tests_run: Any,
+        coder_run_id: str | None = None,
+        base_branch: str | None = None,
+        base_commit: str | None = None,
+    ) -> Mapping[str, Any]:
+        args: dict[str, Any] = {
+            "project_id": self.project_id,
+            "task_id": task_id,
+            "requested_by": self.requested_by,
+            "branch": branch,
+            "base_branch": base_branch or "main",
+            "base_commit": base_commit or "",
+            "head_commit": head_commit,
+            "tests_run": json.dumps(list(tests_run or [])),
+        }
+        if coder_run_id is not None:
+            args["run_id"] = coder_run_id
+        return _coerce_mapping_response(self.tools.mcp_den_request_review(**args))
+
+    def prepare_reviewer_context_packet(
+        self,
+        *,
+        task_id: int,
+        review_round_id: int | None,
+        branch: str,
+        head_commit: str,
+        base_branch: str | None = None,
+        base_commit: str | None = None,
+        notes: str | None = None,
+    ) -> Mapping[str, Any]:
+        args: dict[str, Any] = {
+            "project_id": self.project_id,
+            "task_id": task_id,
+            "requested_by": self.requested_by,
+            "branch": branch,
+            "head_commit": head_commit,
+        }
+        optional = {
+            "review_round_id": review_round_id,
+            "base_branch": base_branch,
+            "base_commit": base_commit,
+            "notes": notes,
+        }
+        args.update({key: value for key, value in optional.items() if value is not None})
+        return _coerce_mapping_response(self.tools.mcp_den_prepare_reviewer_context_packet(**args))
+
     def register_worker_run(self, **kwargs: Any) -> Mapping[str, Any]:
         normalized = dict(kwargs)
         normalized.pop("runtime_id", None)
@@ -139,7 +204,7 @@ class DenWorkflowAdapter:
             "requested_by": self.requested_by,
             "status": str(artifact.get("status", "completed")),
             "role": role,
-            "packet_type": "implementation_packet" if role == "coder" else "worker_failure_packet",
+            "packet_type": _packet_type_for_role(role),
             "summary": str(artifact.get("summary", "Spawned-Hermes worker completed.")),
             "dedupe_key": f"{run_id}:completed",
         }
@@ -152,6 +217,11 @@ class DenWorkflowAdapter:
                     "tests_run": json.dumps(list(artifact.get("tests_run", []))),
                 }
             )
+        if role == "reviewer":
+            if "finding_ids" in artifact:
+                args["finding_ids"] = json.dumps(list(artifact.get("finding_ids") or []))
+            if "tests_run" in artifact:
+                args["tests_run"] = json.dumps(list(artifact.get("tests_run") or []))
         response = self.tools.mcp_den_post_worker_completion_packet(**args)
         payload = _coerce_mapping_response(response)
         _ensure_den_did_not_reject(payload, context=f"worker completion for {run_id}")
@@ -179,6 +249,66 @@ class DenWorkflowAdapter:
             run_id=run_id,
         )
         return _coerce_mapping_response(response)
+
+    def create_review_finding(
+        self,
+        *,
+        review_round_id: int,
+        reviewer_run_id: str,
+        finding: Mapping[str, Any],
+    ) -> int:
+        response = self.tools.mcp_den_create_review_finding(
+            review_round_id=review_round_id,
+            created_by=f"{self.requested_by}-reviewer",
+            category=str(finding.get("category", "acceptance_gap")),
+            summary=str(finding.get("summary", "Reviewer finding")),
+            notes=finding.get("notes"),
+            file_references=_json_or_none(finding.get("file_references")),
+            test_commands=_json_or_none(finding.get("test_commands")),
+            run_id=reviewer_run_id,
+            subagent_role="reviewer",
+        )
+        payload = _coerce_mapping_response(response)
+        return int(payload.get("id"))
+
+    def post_review_findings_and_verdict(
+        self,
+        *,
+        task_id: int,
+        review_request: Mapping[str, Any],
+        reviewer_run_id: str,
+        verdict: str,
+        summary: str,
+    ) -> None:
+        review_round_id = _review_round_id(review_request)
+        thread_id = _review_thread_id(review_request)
+        reviewer = f"{self.requested_by}-reviewer"
+        findings_response = self.tools.mcp_den_post_review_findings(
+            project_id=self.project_id,
+            task_id=task_id,
+            review_round_id=review_round_id,
+            sender=reviewer,
+            thread_id=thread_id,
+            notes=summary,
+            run_id=reviewer_run_id,
+            subagent_role="reviewer",
+        )
+        _ensure_den_did_not_reject(
+            _coerce_mapping_response(findings_response),
+            context=f"review findings publication for {reviewer_run_id}",
+        )
+        verdict_response = self.tools.mcp_den_set_review_verdict(
+            review_round_id=review_round_id,
+            verdict=verdict,
+            decided_by=reviewer,
+            notes=summary,
+            run_id=reviewer_run_id,
+            subagent_role="reviewer",
+        )
+        _ensure_den_did_not_reject(
+            _coerce_mapping_response(verdict_response),
+            context=f"review verdict publication for {reviewer_run_id}",
+        )
 
 
 def decide_next_action(adapter: DenWorkflowAdapter, *, task_id: int, max_attempts: int = 3) -> OrchestratorAction:
@@ -329,6 +459,150 @@ def run_tracked_coder_path(
     )
 
 
+def run_tracked_reviewer_path(
+    adapter: DenWorkflowAdapter,
+    *,
+    task_id: int,
+    prompt: str,
+    run_id: str,
+    coder_artifact: Mapping[str, Any],
+    cwd: str | Path | None = None,
+    env_overrides: Mapping[str, str] | None = None,
+    runtime_registry_path: str | Path | None = None,
+    review_request: Mapping[str, Any] | None = None,
+    base_branch: str | None = None,
+    base_commit: str | None = None,
+) -> ReviewerPathResult:
+    """Run the tracked spawned-Hermes reviewer path after coder completion."""
+
+    missing = [field for field in ("branch", "head_commit", "tests_run") if not coder_artifact.get(field)]
+    if missing:
+        return ReviewerPathResult(
+            status="failed",
+            run_id=run_id,
+            error=f"Coder artifact missing required reviewer input fields: {', '.join(missing)}",
+        )
+    branch = str(coder_artifact["branch"])
+    head_commit = str(coder_artifact["head_commit"])
+    tests_run = list(coder_artifact.get("tests_run") or [])
+    try:
+        if review_request is None:
+            review_request = adapter.request_review(
+                task_id=task_id,
+                branch=branch,
+                head_commit=head_commit,
+                tests_run=tests_run,
+                coder_run_id=coder_artifact.get("run_id"),
+                base_branch=base_branch,
+                base_commit=base_commit,
+            )
+        review_round_id = _review_round_id(review_request)
+        packet = adapter.prepare_reviewer_context_packet(
+            task_id=task_id,
+            review_round_id=review_round_id,
+            branch=branch,
+            head_commit=head_commit,
+            base_branch=base_branch,
+            base_commit=base_commit,
+            notes="Prepared by spawned-Hermes orchestrator reviewer path.",
+        )
+        packet_message_id = _packet_message_id(packet)
+        runtime = resolve_role_runtime(
+            "reviewer",
+            registry_path=_selected_runtime_registry_path(runtime_registry_path),
+            run_id=run_id,
+        )
+    except (RuntimeRegistryError, KeyError, TypeError, ValueError) as exc:
+        return ReviewerPathResult(status="failed", run_id=run_id, review_request=review_request, error=str(exc))
+
+    artifact_path = runtime.artifact_path or str(Path(runtime.run_root) / run_id / runtime.artifact_filename)
+    log_path = runtime.log_path or str(Path(runtime.run_root) / run_id / runtime.log_filename)
+    try:
+        adapter.register_worker_run(
+            task_id=task_id,
+            run_id=run_id,
+            role="reviewer",
+            branch=branch,
+            head_commit=head_commit,
+            base_branch=base_branch,
+            base_commit=base_commit,
+            profile=runtime.profile,
+            provider=runtime.provider,
+            model=runtime.model,
+            toolsets=list(runtime.toolsets),
+            workdir=str(cwd) if cwd is not None else runtime.workdir,
+            timeout_seconds=runtime.timeout_seconds,
+            artifact_path=artifact_path,
+            log_path=log_path,
+            runtime_id=runtime.runtime_id,
+            prompt_packet_message_id=packet_message_id,
+            dedupe_key=f"{task_id}:reviewer:{run_id}",
+        )
+    except Exception as exc:  # noqa: BLE001 - fail closed before subprocess launch
+        return ReviewerPathResult(status="failed", run_id=run_id, review_request=review_request, artifact_path=artifact_path, error=str(exc))
+
+    adapter.mark_worker_started(task_id=task_id, run_id=run_id, role="reviewer")
+    worker = run_hermes_worker(
+        task_id=task_id,
+        run_id=run_id,
+        role="reviewer",
+        prompt=_reviewer_prompt_with_packet(
+            prompt=prompt,
+            packet_message_id=packet_message_id,
+            branch=branch,
+            head_commit=head_commit,
+            tests_run=tests_run,
+        ),
+        expected_artifact=artifact_path,
+        provider=runtime.provider,
+        model=runtime.model,
+        profile=runtime.profile,
+        toolsets=list(runtime.toolsets),
+        cwd=cwd if cwd is not None else runtime.workdir,
+        env_overrides=env_overrides,
+        timeout_seconds=runtime.timeout_seconds,
+    )
+    if worker.status != "completed" or worker.artifact is None:
+        error = worker.error or "Reviewer worker did not complete"
+        adapter.mark_worker_failed(task_id=task_id, run_id=run_id, role="reviewer", error=error)
+        return ReviewerPathResult(status="failed", run_id=run_id, review_request=review_request, artifact_path=artifact_path, error=error)
+
+    try:
+        finding_ids = [
+            adapter.create_review_finding(
+                review_round_id=review_round_id,
+                reviewer_run_id=run_id,
+                finding=finding,
+            )
+            for finding in worker.artifact.get("findings", [])
+        ]
+        reviewer_artifact = {**worker.artifact, "finding_ids": finding_ids}
+        adapter.mark_worker_completed(task_id=task_id, run_id=run_id, role="reviewer", artifact=reviewer_artifact)
+        verdict = str(worker.artifact["verdict"])
+        adapter.post_review_findings_and_verdict(
+            task_id=task_id,
+            review_request=review_request,
+            reviewer_run_id=run_id,
+            verdict=verdict,
+            summary=str(worker.artifact.get("summary", "")),
+        )
+    except Exception as exc:  # noqa: BLE001 - publication failures are fail-closed
+        return ReviewerPathResult(status="failed", run_id=run_id, review_request=review_request, artifact_path=artifact_path, error=str(exc))
+
+    latest_completion = adapter.get_latest_worker_completion(task_id=task_id, run_id=run_id, role="reviewer")
+    worker_status = adapter.get_worker_run_status(task_id=task_id, run_id=run_id)
+    return ReviewerPathResult(
+        status="completed",
+        run_id=run_id,
+        verdict=verdict,
+        finding_ids=finding_ids,
+        artifact_path=artifact_path,
+        latest_completion=latest_completion,
+        worker_status=worker_status,
+        review_request=review_request,
+    )
+
+
 def build_mcp_adapter(*, project_id: str, requested_by: str) -> DenWorkflowAdapter:
     """Build a real MCP-backed adapter.
 
@@ -363,6 +637,34 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
+def _packet_type_for_role(role: str) -> str:
+    return {
+        "coder": "implementation_packet",
+        "reviewer": "review_findings_packet",
+        "validator": "validation_packet",
+        "drift_checker": "drift_check_packet",
+        "packet_auditor": "packet_audit_packet",
+    }.get(role, "worker_failure_packet")
+
+
+def _json_or_none(value: Any) -> str | None:
+    if value is None:
+        return None
+    return json.dumps(value)
+
+
+def _review_round_id(review_request: Mapping[str, Any]) -> int:
+    value = review_request.get("review_round_id", review_request.get("id"))
+    if value is None:
+        raise ValueError("review_request must include review_round_id or id")
+    return int(value)
+
+
+def _review_thread_id(review_request: Mapping[str, Any]) -> int | None:
+    value = review_request.get("message_id", review_request.get("thread_id"))
+    return int(value) if value is not None else None
+
+
 def _selected_runtime_registry_path(runtime_registry_path: str | Path | None) -> str | Path:
     return runtime_registry_path or os.environ.get("DEN_HERMES_RUNTIME_REGISTRY") or DEFAULT_RUNTIME_REGISTRY_PATH
 
@@ -379,6 +681,25 @@ def _coder_prompt_with_packet(*, prompt: str, packet_message_id: int) -> str:
         f"{prompt.rstrip()}\n\n"
         "DEN CODER CONTEXT PACKET\n"
         f"Use Den task-thread packet message id {packet_message_id} as the bounded coder context source.\n"
+    )
+
+
+def _reviewer_prompt_with_packet(
+    *,
+    prompt: str,
+    packet_message_id: int,
+    branch: str,
+    head_commit: str,
+    tests_run: list[Any],
+) -> str:
+    return (
+        f"{prompt.rstrip()}\n\n"
+        "DEN REVIEWER CONTEXT PACKET\n"
+        f"Use Den task-thread packet message id {packet_message_id} as the bounded reviewer context source.\n"
+        "CODER COMPLETION TO REVIEW\n"
+        f"Branch: {branch}\n"
+        f"Head commit: {head_commit}\n"
+        f"Tests run: {json.dumps(tests_run, sort_keys=True)}\n"
     )
 
 

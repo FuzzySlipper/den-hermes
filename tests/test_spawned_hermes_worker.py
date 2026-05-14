@@ -66,6 +66,7 @@ if mode == "identity_mismatch":
 artifact_path.parent.mkdir(parents=True, exist_ok=True)
 if role == "reviewer":
     findings = json.loads(os.environ.get("FAKE_REVIEW_FINDINGS", "[]"))
+    tests_run = json.loads(os.environ.get("FAKE_REVIEW_TESTS_RUN", "[]"))
     artifact = {
         "task_id": artifact_task_id,
         "run_id": artifact_run_id,
@@ -75,6 +76,8 @@ if role == "reviewer":
         "findings": findings,
         "summary": "fake reviewer approved",
     }
+    if tests_run:
+        artifact["tests_run"] = tests_run
 else:
     fake_branch = os.environ.get("FAKE_BRANCH", "task/1368-fake")
     fake_head = os.environ.get("FAKE_HEAD", "0123456789abcdef0123456789abcdef01234567")
