@@ -144,6 +144,34 @@ Use narrow toolsets whenever possible. The real smoke used only `file`. Coder/re
 
 ## Live smoke evidence
 
+### Full orchestrator smoke (#1401)
+
+See `docs/spawned-hermes-orchestrator-rollout-1402.md` for the current coder → reviewer orchestrator workflow and operator checklist.
+
+Successful Den-driven spawned-Hermes orchestrator smoke:
+
+- task: #1401
+- coder run: `live-smoke-coder-01e67fad`
+- coder session: `worker-25466cb2b2b68a6b`
+- coder branch/head: `task/1401-live-smoke` @ `ea7d0bc3dca68b67b177d2c0edfd0476768eb7da`
+- coder artifact: `/tmp/den-hermes/live-smoke-coder-01e67fad/completion.json`
+- coder completion message: #5866 (`implementation_packet`, completed)
+- review round: #676
+- reviewer run: `live-smoke-reviewer-6c40827a`
+- reviewer session: `worker-4a139c6285a7f21f`
+- reviewer artifact: `/tmp/den-hermes/live-smoke-reviewer-6c40827a/completion.json`
+- reviewer completion message: #5871 (`review_findings_packet`, completed)
+- verdict: `looks_good`, findings: none
+
+Pre-smoke verification:
+
+- `python -m pytest -q` → 106 passed
+- `python -m den_hermes.runtime_ops preflight --roles coder,reviewer` → both roles passed
+
+Important live-smoke lesson: pass a full `base_commit` to `request_review` / reviewer path. An empty base commit produced a generic Den MCP `request_review` invocation error; after adding robust MCP diagnostics and using the full base SHA, the reviewer path completed.
+
+### Earlier single-worker smoke (#1384)
+
 Successful real spawned-Hermes smoke:
 
 - task: #1384
@@ -152,11 +180,6 @@ Successful real spawned-Hermes smoke:
 - artifact: `/tmp/den-hermes/live-hermes-smoke-1380-20260513T114902Z/completion.json`
 - completion message: #5805
 - status: `runtime=completed`, `completion=posted_completed`
-
-Pre-smoke verification:
-
-- `python -m pytest -q` → 33 passed
-- `hermes --profile den-hermes-runner --oneshot PROFILE_OK` → provider/profile preflight passed
 
 Earlier failed attempt:
 
