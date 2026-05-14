@@ -11,6 +11,8 @@ from den_hermes.orchestrator import (
     main,
     run_tracked_coder_path,
     run_tracked_reviewer_path,
+    handle_review_outcome,
+    CoderPathResult,
 )
 from test_spawned_hermes_worker import FAKE_HEAD, fake_env, init_git_repo, read_fake_calls, write_runtime_registry
 
@@ -171,6 +173,11 @@ class RecordingCoderTools:
         self.post_findings_response = post_findings_response or {"message_id": 655}
         self.verdict_response = verdict_response or {"ok": True}
         self.completions = {}
+        self.workflow_summary = {"current_review_state": {"review_round_id": 321, "verdict": "changes_requested"}}
+
+    def mcp_den_get_task_workflow_summary(self, **kwargs):
+        self.calls.append(("get_task_workflow_summary", kwargs))
+        return self.workflow_summary
 
     def mcp_den_prepare_coder_context_packet(self, **kwargs):
         self.calls.append(("prepare_coder_context_packet", kwargs))
@@ -222,6 +229,10 @@ class RecordingCoderTools:
     def mcp_den_set_review_verdict(self, **kwargs):
         self.calls.append(("set_review_verdict", kwargs))
         return self.verdict_response
+
+    def mcp_den_respond_to_review_finding(self, **kwargs):
+        self.calls.append(("respond_to_review_finding", kwargs))
+        return {"id": kwargs["review_finding_id"], "status": kwargs.get("status")}
 
 
 def test_cli_prints_json_action_without_launching_workers(monkeypatch, capsys):
@@ -287,6 +298,30 @@ def test_tracked_coder_path_prepares_context_registers_before_launch_and_posts_c
     assert "runtime_id" not in registration
     assert registration["artifact_path"] == result.artifact_path
     assert read_fake_calls(tmp_path)[0]["env"]["DEN_RUN_ID"] == "coder-run"
+
+
+def test_tracked_coder_path_propagates_claimed_review_findings_from_artifact(tmp_path):
+    head = init_git_repo(tmp_path)
+    subprocess.run(["git", "checkout", "-b", "task/1368-fake"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    env = fake_env(tmp_path)
+    env["FAKE_HEAD"] = head
+    env["FAKE_CLAIMED_FINDING_IDS"] = json.dumps([9001])
+    env["FAKE_RESPONSE_NOTES"] = "implemented requested fix"
+
+    result = run_tracked_coder_path(
+        make_adapter(RecordingCoderTools()),
+        task_id=1396,
+        prompt="Implement retry.",
+        run_id="coder-run",
+        cwd=tmp_path,
+        env_overrides=env,
+        runtime_registry_path=write_runtime_registry(tmp_path),
+        verify_git=True,
+    )
+
+    assert result.status == "completed"
+    assert result.claimed_finding_ids == [9001]
+    assert result.response_notes == "implemented requested fix"
 
 
 def test_tracked_coder_path_registration_failure_prevents_launch(tmp_path):
@@ -505,3 +540,135 @@ def test_tracked_reviewer_path_fails_closed_when_verdict_publication_is_rejected
     assert result.status == "failed"
     assert "verdict rejected" in result.error
     assert [name for name, _ in tools.calls][-2:] == ["post_review_findings", "set_review_verdict"]
+
+
+def test_review_outcome_changes_requested_retries_coder_and_claims_findings_fixed(tmp_path):
+    tools = RecordingCoderTools()
+    adapter = make_adapter(tools)
+    launches = []
+
+    def fake_coder_runner(adapter_arg, **kwargs):
+        launches.append(kwargs)
+        assert adapter_arg is adapter
+        assert "fix bug" in kwargs["prompt"]
+        return CoderPathResult(
+            status="completed",
+            run_id=kwargs["run_id"],
+            branch="task/retry",
+            head_commit="c" * 40,
+            artifact_path="/tmp/retry/completion.json",
+            claimed_finding_ids=[9001],
+            response_notes="fixed the bug",
+        )
+
+    result = handle_review_outcome(
+        adapter,
+        task_id=1398,
+        review_state={
+            "verdict": "changes_requested",
+            "attempt": 1,
+            "review_round_id": 321,
+            "findings": [{"id": 9001, "category": "blocking_bug", "summary": "fix bug"}],
+        },
+        prompt="Implement retry.",
+        next_coder_run_id="coder-retry-2",
+        max_attempts=3,
+        coder_runner=fake_coder_runner,
+    )
+
+    assert result.status == "retry_launched"
+    assert result.run_id == "coder-retry-2"
+    assert result.finding_ids == [9001]
+    assert launches[0]["run_id"] == "coder-retry-2"
+    assert [name for name, _ in tools.calls] == ["get_task_workflow_summary", "respond_to_review_finding"]
+    assert tools.calls[1][1]["status"] == "claimed_fixed"
+    assert tools.calls[1][1]["response_notes"] == "fixed the bug"
+
+
+def test_review_outcome_looks_good_returns_done_ready_without_launch():
+    tools = RecordingCoderTools()
+    adapter = make_adapter(tools)
+
+    result = handle_review_outcome(
+        adapter,
+        task_id=1398,
+        review_state={"verdict": "looks_good", "attempt": 1, "findings": []},
+        prompt="No retry.",
+        next_coder_run_id="unused",
+        coder_runner=lambda *_args, **_kwargs: pytest.fail("should not launch coder"),
+    )
+
+    assert result.status == "done_ready"
+    assert result.run_id is None
+    assert tools.calls == []
+
+
+def test_review_outcome_blocks_stale_changes_requested_when_newer_review_is_done():
+    tools = RecordingCoderTools()
+    tools.workflow_summary = {"current_review_state": {"review_round_id": 322, "verdict": "looks_good"}}
+    adapter = make_adapter(tools)
+
+    result = handle_review_outcome(
+        adapter,
+        task_id=1398,
+        review_state={
+            "verdict": "changes_requested",
+            "attempt": 1,
+            "review_round_id": 321,
+            "findings": [{"id": 9001, "category": "blocking_bug", "summary": "old bug"}],
+        },
+        prompt="Retry.",
+        next_coder_run_id="unused",
+        max_attempts=3,
+        coder_runner=lambda *_args, **_kwargs: pytest.fail("should not launch coder"),
+    )
+
+    assert result.status == "blocked"
+    assert "newer review state" in result.reason
+    assert [name for name, _ in tools.calls] == ["get_task_workflow_summary"]
+
+
+def test_review_outcome_max_attempts_blocks_without_launch():
+    tools = RecordingCoderTools()
+    adapter = make_adapter(tools)
+
+    result = handle_review_outcome(
+        adapter,
+        task_id=1398,
+        review_state={
+            "verdict": "changes_requested",
+            "attempt": 3,
+            "findings": [{"id": 9001, "category": "blocking_bug", "summary": "still broken"}],
+        },
+        prompt="Retry.",
+        next_coder_run_id="unused",
+        max_attempts=3,
+        coder_runner=lambda *_args, **_kwargs: pytest.fail("should not launch coder"),
+    )
+
+    assert result.status == "blocked"
+    assert "max attempts" in result.reason
+    assert result.finding_ids == [9001]
+    assert tools.calls == []
+
+
+def test_review_outcome_follow_up_only_findings_are_deferred_without_launch():
+    tools = RecordingCoderTools()
+    adapter = make_adapter(tools)
+
+    result = handle_review_outcome(
+        adapter,
+        task_id=1398,
+        review_state={
+            "verdict": "follow_up_needed",
+            "attempt": 1,
+            "findings": [{"id": 9002, "category": "follow_up_candidate", "summary": "nice to have"}],
+        },
+        prompt="Retry.",
+        next_coder_run_id="unused",
+        coder_runner=lambda *_args, **_kwargs: pytest.fail("should not launch coder"),
+    )
+
+    assert result.status == "follow_up_deferred"
+    assert result.finding_ids == [9002]
+    assert tools.calls == []

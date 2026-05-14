@@ -46,6 +46,8 @@ class CoderPathResult:
     latest_completion: Mapping[str, Any] | None = None
     worker_status: Mapping[str, Any] | None = None
     error: str | None = None
+    claimed_finding_ids: list[int] = field(default_factory=list)
+    response_notes: str | None = None
 
 
 @dataclass(frozen=True)
@@ -59,6 +61,15 @@ class ReviewerPathResult:
     worker_status: Mapping[str, Any] | None = None
     review_request: Mapping[str, Any] | None = None
     error: str | None = None
+
+
+@dataclass(frozen=True)
+class ReviewLoopResult:
+    status: str
+    reason: str
+    run_id: str | None = None
+    finding_ids: list[int] = field(default_factory=list)
+    coder_result: CoderPathResult | None = None
 
 
 @dataclass(frozen=True)
@@ -310,6 +321,24 @@ class DenWorkflowAdapter:
             context=f"review verdict publication for {reviewer_run_id}",
         )
 
+    def respond_to_review_finding(
+        self,
+        *,
+        finding_id: int,
+        response_notes: str,
+        status: str,
+    ) -> Mapping[str, Any]:
+        response = self.tools.mcp_den_respond_to_review_finding(
+            review_finding_id=finding_id,
+            responded_by=self.requested_by,
+            response_notes=response_notes,
+            status=status,
+            status_notes=response_notes,
+        )
+        payload = _coerce_mapping_response(response)
+        _ensure_den_did_not_reject(payload, context=f"review finding response for {finding_id}")
+        return payload
+
 
 def decide_next_action(adapter: DenWorkflowAdapter, *, task_id: int, max_attempts: int = 3) -> OrchestratorAction:
     """Read Den workflow state and return the next orchestrator action.
@@ -456,6 +485,8 @@ def run_tracked_coder_path(
         artifact_path=artifact_path,
         latest_completion=latest_completion,
         worker_status=worker_status,
+        claimed_finding_ids=[int(value) for value in worker.artifact.get("claimed_finding_ids", [])],
+        response_notes=worker.artifact.get("response_notes"),
     )
 
 
@@ -603,6 +634,69 @@ def run_tracked_reviewer_path(
     )
 
 
+def handle_review_outcome(
+    adapter: DenWorkflowAdapter,
+    *,
+    task_id: int,
+    review_state: Mapping[str, Any],
+    prompt: str,
+    next_coder_run_id: str,
+    max_attempts: int = 3,
+    coder_runner: Any = run_tracked_coder_path,
+    **coder_kwargs: Any,
+) -> ReviewLoopResult:
+    """Handle review verdicts and bounded coder retry policy."""
+
+    verdict = str(review_state.get("verdict", ""))
+    findings = [finding for finding in review_state.get("findings", []) if isinstance(finding, Mapping)]
+    finding_ids = [int(finding["id"]) for finding in findings if finding.get("id") is not None]
+    blocking_findings = [finding for finding in findings if str(finding.get("category")) != "follow_up_candidate"]
+    if verdict == "looks_good":
+        return ReviewLoopResult(status="done_ready", reason="review verdict looks_good", finding_ids=finding_ids)
+    if findings and not blocking_findings:
+        return ReviewLoopResult(status="follow_up_deferred", reason="only follow-up candidate findings remain", finding_ids=finding_ids)
+    if verdict != "changes_requested":
+        return ReviewLoopResult(status="blocked", reason=f"unhandled review verdict: {verdict}", finding_ids=finding_ids)
+
+    attempt = int(review_state.get("attempt", 1))
+    if attempt >= max_attempts:
+        return ReviewLoopResult(status="blocked", reason=f"max attempts reached ({attempt}/{max_attempts})", finding_ids=finding_ids)
+    stale_reason = _stale_review_reason(adapter=adapter, task_id=task_id, review_state=review_state)
+    if stale_reason is not None:
+        return ReviewLoopResult(status="blocked", reason=stale_reason, finding_ids=finding_ids)
+    retry_prompt = _retry_prompt_with_findings(prompt=prompt, findings=blocking_findings, attempt=attempt + 1, max_attempts=max_attempts)
+    coder_result = coder_runner(
+        adapter,
+        task_id=task_id,
+        prompt=retry_prompt,
+        run_id=next_coder_run_id,
+        **coder_kwargs,
+    )
+    if coder_result.status != "completed":
+        return ReviewLoopResult(
+            status="blocked",
+            reason=coder_result.error or "coder retry failed",
+            run_id=next_coder_run_id,
+            finding_ids=finding_ids,
+            coder_result=coder_result,
+        )
+    for finding in blocking_findings:
+        finding_id = finding.get("id")
+        if finding_id is not None and int(finding_id) in set(coder_result.claimed_finding_ids):
+            adapter.respond_to_review_finding(
+                finding_id=int(finding_id),
+                response_notes=coder_result.response_notes or f"Coder retry {next_coder_run_id} claims this finding is fixed.",
+                status="claimed_fixed",
+            )
+    return ReviewLoopResult(
+        status="retry_launched",
+        reason="changes_requested findings sent to coder retry",
+        run_id=next_coder_run_id,
+        finding_ids=finding_ids,
+        coder_result=coder_result,
+    )
+
+
 def build_mcp_adapter(*, project_id: str, requested_by: str) -> DenWorkflowAdapter:
     """Build a real MCP-backed adapter.
 
@@ -701,6 +795,38 @@ def _reviewer_prompt_with_packet(
         f"Head commit: {head_commit}\n"
         f"Tests run: {json.dumps(tests_run, sort_keys=True)}\n"
     )
+
+
+def _retry_prompt_with_findings(
+    *,
+    prompt: str,
+    findings: list[Mapping[str, Any]],
+    attempt: int,
+    max_attempts: int,
+) -> str:
+    finding_lines = [f"- #{finding.get('id')}: {finding.get('summary')}" for finding in findings]
+    return (
+        f"{prompt.rstrip()}\n\n"
+        f"REVIEW RETRY ATTEMPT {attempt}/{max_attempts}\n"
+        "Address these blocking review findings before reporting completion:\n"
+        + "\n".join(finding_lines)
+        + "\n"
+    )
+
+
+def _stale_review_reason(*, adapter: DenWorkflowAdapter, task_id: int, review_state: Mapping[str, Any]) -> str | None:
+    summary = adapter.get_task_workflow_summary(task_id=task_id)
+    current_review = summary.get("current_review_state")
+    if not isinstance(current_review, Mapping):
+        return None
+    expected_round = review_state.get("review_round_id")
+    current_round = current_review.get("review_round_id", current_review.get("id"))
+    current_verdict = current_review.get("verdict")
+    if expected_round is not None and current_round is not None and int(current_round) != int(expected_round):
+        return f"newer review state exists: round {current_round} supersedes {expected_round}"
+    if current_verdict in {"looks_good", "follow_up_needed"}:
+        return f"newer review state is already terminal: {current_verdict}"
+    return None
 
 
 def _ensure_den_did_not_reject(payload: Mapping[str, Any], *, context: str) -> None:

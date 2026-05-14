@@ -81,6 +81,7 @@ if role == "reviewer":
 else:
     fake_branch = os.environ.get("FAKE_BRANCH", "task/1368-fake")
     fake_head = os.environ.get("FAKE_HEAD", "0123456789abcdef0123456789abcdef01234567")
+    claimed_finding_ids = json.loads(os.environ.get("FAKE_CLAIMED_FINDING_IDS", "[]"))
     artifact = {
         "task_id": artifact_task_id,
         "run_id": artifact_run_id,
@@ -93,6 +94,9 @@ else:
         ],
         "summary": "fake worker completed",
     }
+    if claimed_finding_ids:
+        artifact["claimed_finding_ids"] = claimed_finding_ids
+        artifact["response_notes"] = os.environ.get("FAKE_RESPONSE_NOTES", "fake coder claims findings fixed")
 if mode == "missing_head_commit":
     artifact.pop("head_commit", None)
 artifact_path.write_text(json.dumps(artifact, indent=2))
