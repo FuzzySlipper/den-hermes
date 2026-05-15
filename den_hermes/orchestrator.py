@@ -17,6 +17,12 @@ class OrchestratorActionType(str, Enum):
     AWAIT_CODER = "await_coder"
     START_REVIEWER = "start_reviewer"
     AWAIT_REVIEWER = "await_reviewer"
+    START_VALIDATOR = "start_validator"
+    AWAIT_VALIDATOR = "await_validator"
+    START_DRIFT_CHECKER = "start_drift_checker"
+    AWAIT_DRIFT_CHECKER = "await_drift_checker"
+    START_PACKET_AUDITOR = "start_packet_auditor"
+    AWAIT_PACKET_AUDITOR = "await_packet_auditor"
     HANDLE_CHANGES_REQUESTED = "handle_changes_requested"
     DONE = "done"
     BLOCKED = "blocked"
@@ -352,6 +358,9 @@ class DenWorkflowAdapter:
             "summary": _completion_summary_for_role(role=role, artifact=artifact),
             "dedupe_key": f"{run_id}:completed",
         }
+        for field_name in ("branch", "head_commit", "base_commit", "review_round_id"):
+            if artifact.get(field_name) is not None:
+                args[field_name] = artifact.get(field_name)
         if role == "coder":
             args.update(
                 {
@@ -416,6 +425,26 @@ class DenWorkflowAdapter:
         )
         payload = _coerce_mapping_response(response)
         return int(payload.get("id"))
+
+    def set_review_finding_status(
+        self,
+        *,
+        finding_id: int,
+        status: str,
+        notes: str | None,
+        reviewer_run_id: str,
+    ) -> Mapping[str, Any]:
+        response = self.tools.mcp_den_set_review_finding_status(
+            review_finding_id=finding_id,
+            status=status,
+            updated_by=f"{self.requested_by}-reviewer",
+            notes=notes,
+            run_id=reviewer_run_id,
+            subagent_role="reviewer",
+        )
+        payload = _coerce_mapping_response(response)
+        _ensure_den_did_not_reject(payload, context=f"review finding status update for {finding_id}")
+        return payload
 
     def post_review_findings_and_verdict(
         self,
@@ -486,10 +515,11 @@ def decide_next_action(adapter: DenWorkflowAdapter, *, task_id: int, max_attempt
     summary = adapter.get_task_workflow_summary(task_id=task_id)
     decision = adapter.determine_orchestrator_next_action(task_id=task_id, max_attempts=max_attempts)
     task_status = _task_status(summary)
-    raw_action = _raw_next_action(decision, summary=summary, task_status=task_status)
+    effective_decision = _primary_decision_payload(decision)
+    raw_action = _raw_next_action(effective_decision, summary=summary, task_status=task_status)
     action_type = _normalize_action_type(raw_action, task_status=task_status)
-    reason = str(decision.get("reason") or decision.get("summary") or _default_reason(action_type))
-    details = _action_details(decision, summary=summary, task_status=task_status)
+    reason = str(effective_decision.get("reason") or effective_decision.get("summary") or _default_reason(action_type))
+    details = _action_details(effective_decision, summary=summary, task_status=task_status)
     return OrchestratorAction(
         type=action_type,
         reason=reason,
@@ -734,15 +764,20 @@ def run_tracked_reviewer_path(
         return ReviewerPathResult(status="failed", run_id=run_id, review_request=review_request, artifact_path=artifact_path, error=error)
 
     try:
-        finding_ids = [
-            adapter.create_review_finding(
-                review_round_id=review_round_id,
-                reviewer_run_id=run_id,
-                finding=finding,
-            )
-            for finding in worker.artifact.get("findings", [])
-        ]
-        reviewer_artifact = {**worker.artifact, "finding_ids": finding_ids}
+        finding_ids = _publish_reviewer_finding_entries(
+            adapter=adapter,
+            review_round_id=review_round_id,
+            reviewer_run_id=run_id,
+            findings=worker.artifact.get("findings", []),
+        )
+        reviewer_artifact = _artifact_with_repo_metadata(
+            worker.artifact,
+            branch=branch,
+            head_commit=head_commit,
+            base_commit=base_commit,
+            review_round_id=review_round_id,
+        )
+        reviewer_artifact = {**reviewer_artifact, "finding_ids": finding_ids}
         adapter.mark_worker_completed(task_id=task_id, run_id=run_id, role="reviewer", artifact=reviewer_artifact)
         verdict = str(worker.artifact["verdict"])
         adapter.post_review_findings_and_verdict(
@@ -862,7 +897,13 @@ def run_tracked_gate_role_path(
         return GateRolePathResult(status="failed", run_id=run_id, role=role, artifact_path=artifact_path, error=error)
 
     try:
-        adapter.mark_worker_completed(task_id=task_id, run_id=run_id, role=role, artifact=worker.artifact)
+        gate_artifact = _artifact_with_repo_metadata(
+            worker.artifact,
+            branch=branch,
+            head_commit=head_commit,
+            base_commit=base_commit,
+        )
+        adapter.mark_worker_completed(task_id=task_id, run_id=run_id, role=role, artifact=gate_artifact)
     except Exception as exc:  # noqa: BLE001 - Den rejected authoritative completion
         return GateRolePathResult(
             status="failed",
@@ -878,8 +919,8 @@ def run_tracked_gate_role_path(
         status="completed",
         run_id=run_id,
         role=role,
-        verdict=str(worker.artifact.get("verdict", "passed")),
-        evidence=_gate_artifact_evidence(worker.artifact, role=role),
+        verdict=str(gate_artifact.get("verdict", "passed")),
+        evidence=_gate_artifact_evidence(gate_artifact, role=role),
         artifact_path=artifact_path,
         latest_completion=latest_completion,
         worker_status=worker_status,
@@ -980,6 +1021,68 @@ def main(argv: list[str] | None = None) -> int:
         role = f" role={action.role}" if action.role else ""
         print(f"{action.type.value}{role}: {action.reason}")
     return 0
+
+
+def _artifact_with_repo_metadata(
+    artifact: Mapping[str, Any],
+    *,
+    branch: str | None = None,
+    head_commit: str | None = None,
+    base_commit: str | None = None,
+    review_round_id: int | None = None,
+) -> dict[str, Any]:
+    enriched = dict(artifact)
+    optional = {
+        "branch": branch,
+        "head_commit": head_commit,
+        "base_commit": base_commit,
+        "review_round_id": review_round_id,
+    }
+    for key, value in optional.items():
+        if value is not None:
+            enriched[key] = value
+    return enriched
+
+
+def _reviewer_existing_finding_id(finding: Mapping[str, Any]) -> int | None:
+    for key in ("id", "finding_id", "review_finding_id"):
+        value = finding.get(key)
+        if value is not None:
+            return int(value)
+    return None
+
+
+def _publish_reviewer_finding_entries(
+    *,
+    adapter: DenWorkflowAdapter,
+    review_round_id: int,
+    reviewer_run_id: str,
+    findings: Any,
+) -> list[int]:
+    finding_ids: list[int] = []
+    for finding in findings or []:
+        if not isinstance(finding, Mapping):
+            continue
+        existing_finding_id = _reviewer_existing_finding_id(finding)
+        status = finding.get("status")
+        if existing_finding_id is not None:
+            finding_ids.append(existing_finding_id)
+            if status:
+                adapter.set_review_finding_status(
+                    finding_id=existing_finding_id,
+                    status=str(status),
+                    notes=finding.get("notes") or finding.get("status_notes") or finding.get("summary"),
+                    reviewer_run_id=reviewer_run_id,
+                )
+            continue
+        finding_ids.append(
+            adapter.create_review_finding(
+                review_round_id=review_round_id,
+                reviewer_run_id=reviewer_run_id,
+                finding=finding,
+            )
+        )
+    return finding_ids
 
 
 def _packet_type_for_role(role: str) -> str:
@@ -1213,6 +1316,13 @@ def _task_status(summary: Mapping[str, Any]) -> str | None:
     return None
 
 
+def _primary_decision_payload(decision: Mapping[str, Any]) -> Mapping[str, Any]:
+    nested = decision.get("decision")
+    if isinstance(nested, Mapping):
+        return nested
+    return decision
+
+
 def _raw_next_action(decision: Mapping[str, Any], *, summary: Mapping[str, Any], task_status: str | None) -> str:
     for key in ("next_action", "action", "recommended_action", "state"):
         value = decision.get(key)
@@ -1248,6 +1358,27 @@ def _normalize_action_type(raw_action: str, *, task_status: str | None) -> Orche
         "await_reviewer": OrchestratorActionType.AWAIT_REVIEWER,
         "wait_for_reviewer": OrchestratorActionType.AWAIT_REVIEWER,
         "reviewer_running": OrchestratorActionType.AWAIT_REVIEWER,
+        "start_validator": OrchestratorActionType.START_VALIDATOR,
+        "launch_validator": OrchestratorActionType.START_VALIDATOR,
+        "validator_needed": OrchestratorActionType.START_VALIDATOR,
+        "run_validator": OrchestratorActionType.START_VALIDATOR,
+        "await_validator": OrchestratorActionType.AWAIT_VALIDATOR,
+        "wait_for_validator": OrchestratorActionType.AWAIT_VALIDATOR,
+        "validator_running": OrchestratorActionType.AWAIT_VALIDATOR,
+        "start_drift_checker": OrchestratorActionType.START_DRIFT_CHECKER,
+        "launch_drift_checker": OrchestratorActionType.START_DRIFT_CHECKER,
+        "drift_checker_needed": OrchestratorActionType.START_DRIFT_CHECKER,
+        "run_drift_checker": OrchestratorActionType.START_DRIFT_CHECKER,
+        "await_drift_checker": OrchestratorActionType.AWAIT_DRIFT_CHECKER,
+        "wait_for_drift_checker": OrchestratorActionType.AWAIT_DRIFT_CHECKER,
+        "drift_checker_running": OrchestratorActionType.AWAIT_DRIFT_CHECKER,
+        "start_packet_auditor": OrchestratorActionType.START_PACKET_AUDITOR,
+        "launch_packet_auditor": OrchestratorActionType.START_PACKET_AUDITOR,
+        "packet_auditor_needed": OrchestratorActionType.START_PACKET_AUDITOR,
+        "run_packet_auditor": OrchestratorActionType.START_PACKET_AUDITOR,
+        "await_packet_auditor": OrchestratorActionType.AWAIT_PACKET_AUDITOR,
+        "wait_for_packet_auditor": OrchestratorActionType.AWAIT_PACKET_AUDITOR,
+        "packet_auditor_running": OrchestratorActionType.AWAIT_PACKET_AUDITOR,
         "changes_requested": OrchestratorActionType.HANDLE_CHANGES_REQUESTED,
         "handle_changes_requested": OrchestratorActionType.HANDLE_CHANGES_REQUESTED,
         "retry_coder": OrchestratorActionType.HANDLE_CHANGES_REQUESTED,
@@ -1275,6 +1406,12 @@ def _role_for_action(action_type: OrchestratorActionType) -> str | None:
         return "coder"
     if action_type in {OrchestratorActionType.START_REVIEWER, OrchestratorActionType.AWAIT_REVIEWER}:
         return "reviewer"
+    if action_type in {OrchestratorActionType.START_VALIDATOR, OrchestratorActionType.AWAIT_VALIDATOR}:
+        return "validator"
+    if action_type in {OrchestratorActionType.START_DRIFT_CHECKER, OrchestratorActionType.AWAIT_DRIFT_CHECKER}:
+        return "drift_checker"
+    if action_type in {OrchestratorActionType.START_PACKET_AUDITOR, OrchestratorActionType.AWAIT_PACKET_AUDITOR}:
+        return "packet_auditor"
     if action_type is OrchestratorActionType.HANDLE_CHANGES_REQUESTED:
         return "coder"
     return None
@@ -1312,6 +1449,12 @@ def _default_reason(action_type: OrchestratorActionType) -> str:
         OrchestratorActionType.AWAIT_CODER: "Coder worker is still pending completion.",
         OrchestratorActionType.START_REVIEWER: "Coder output is ready for reviewer workflow.",
         OrchestratorActionType.AWAIT_REVIEWER: "Reviewer worker is still pending completion.",
+        OrchestratorActionType.START_VALIDATOR: "Reviewed output is ready for validator workflow.",
+        OrchestratorActionType.AWAIT_VALIDATOR: "Validator worker is still pending completion.",
+        OrchestratorActionType.START_DRIFT_CHECKER: "Reviewed output is ready for drift-checker workflow.",
+        OrchestratorActionType.AWAIT_DRIFT_CHECKER: "Drift-checker worker is still pending completion.",
+        OrchestratorActionType.START_PACKET_AUDITOR: "Reviewed output is ready for packet-auditor workflow.",
+        OrchestratorActionType.AWAIT_PACKET_AUDITOR: "Packet-auditor worker is still pending completion.",
         OrchestratorActionType.HANDLE_CHANGES_REQUESTED: "Review findings require a coder retry path.",
         OrchestratorActionType.DONE: "Workflow is already terminal.",
         OrchestratorActionType.BLOCKED: "Workflow is blocked or needs input.",

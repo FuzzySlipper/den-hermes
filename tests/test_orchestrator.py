@@ -15,6 +15,7 @@ from den_hermes.orchestrator import (
     run_tracked_reviewer_path,
     handle_review_outcome,
     CoderPathResult,
+    _artifact_with_repo_metadata,
 )
 from test_spawned_hermes_worker import FAKE_HEAD, fake_env, init_git_repo, read_fake_calls, write_runtime_registry
 
@@ -78,6 +79,40 @@ def test_coder_needed_state_maps_to_start_coder_action():
     assert action.role == "coder"
     assert action.reason == "no coder completion packet exists"
     assert action.details["task_status"] == "in_progress"
+
+
+def test_nested_den_decision_launch_coder_maps_to_start_coder_action():
+    tools = RecordingWorkflowTools(
+        summary={"task": {"id": 1415, "status": "in_progress"}},
+        next_action={"decision": {"next_action": "launch_coder", "reason": "live Den decision"}},
+    )
+
+    action = decide_next_action(make_adapter(tools), task_id=1415)
+
+    assert action.type is OrchestratorActionType.START_CODER
+    assert action.role == "coder"
+    assert action.reason == "live Den decision"
+
+
+@pytest.mark.parametrize(
+    ("den_action", "expected_type", "expected_role"),
+    [
+        ("launch_validator", OrchestratorActionType.START_VALIDATOR, "validator"),
+        ("launch_drift_checker", OrchestratorActionType.START_DRIFT_CHECKER, "drift_checker"),
+        ("launch_packet_auditor", OrchestratorActionType.START_PACKET_AUDITOR, "packet_auditor"),
+    ],
+)
+def test_gate_launch_actions_map_to_gate_roles(den_action, expected_type, expected_role):
+    tools = RecordingWorkflowTools(
+        summary={"task": {"id": 1415, "status": "review"}},
+        next_action={"next_action": den_action, "reason": f"run {expected_role}"},
+    )
+
+    action = decide_next_action(make_adapter(tools), task_id=1415)
+
+    assert action.type is expected_type
+    assert action.role == expected_role
+    assert action.reason == f"run {expected_role}"
 
 
 def test_completed_coder_and_pending_review_maps_to_start_reviewer_action():
@@ -247,6 +282,32 @@ class RecordingCoderTools:
     def mcp_den_respond_to_review_finding(self, **kwargs):
         self.calls.append(("respond_to_review_finding", kwargs))
         return {"id": kwargs["review_finding_id"], "status": kwargs.get("status")}
+
+    def mcp_den_set_review_finding_status(self, **kwargs):
+        self.calls.append(("set_review_finding_status", kwargs))
+        return {"id": kwargs["review_finding_id"], "status": kwargs.get("status")}
+
+
+def test_artifact_repo_metadata_uses_orchestrator_values_over_worker_claims():
+    artifact = {
+        "branch": "worker/wrong",
+        "head_commit": "0" * 40,
+        "base_commit": "2" * 40,
+        "review_round_id": 999,
+    }
+
+    enriched = _artifact_with_repo_metadata(
+        artifact,
+        branch="task/1415-correct",
+        head_commit="1" * 40,
+        base_commit="3" * 40,
+        review_round_id=321,
+    )
+
+    assert enriched["branch"] == "task/1415-correct"
+    assert enriched["head_commit"] == "1" * 40
+    assert enriched["base_commit"] == "3" * 40
+    assert enriched["review_round_id"] == 321
 
 
 def test_cli_prints_json_action_without_launching_workers(monkeypatch, capsys):
@@ -514,6 +575,62 @@ def test_tracked_reviewer_changes_requested_creates_findings_and_verdict(tmp_pat
     assert tools.calls[7][1]["verdict"] == "changes_requested"
 
 
+def test_tracked_reviewer_completion_includes_review_and_repo_metadata(tmp_path):
+    tools = RecordingCoderTools()
+    adapter = make_adapter(tools)
+
+    result = run_tracked_reviewer_path(
+        adapter,
+        task_id=1397,
+        prompt="Review.",
+        run_id="reviewer-run",
+        coder_artifact=coder_artifact(),
+        cwd=tmp_path,
+        env_overrides=fake_env(tmp_path),
+        runtime_registry_path=write_runtime_registry(tmp_path),
+        base_branch="main",
+        base_commit="1" * 40,
+    )
+
+    assert result.status == "completed"
+    completion = [kwargs for name, kwargs in tools.calls if name == "post_worker_completion_packet"][0]
+    assert completion["branch"] == "task/1368-fake"
+    assert completion["head_commit"] == FAKE_HEAD
+    assert completion["base_commit"] == "1" * 40
+    assert completion["review_round_id"] == 321
+
+
+def test_tracked_reviewer_updates_existing_findings_instead_of_creating_new_ones(tmp_path):
+    env = fake_env(tmp_path)
+    env["FAKE_REVIEW_FINDINGS"] = json.dumps(
+        [{"id": 740, "status": "verified_fixed", "notes": "confirmed fixed by diff"}]
+    )
+    tools = RecordingCoderTools()
+    adapter = make_adapter(tools)
+
+    result = run_tracked_reviewer_path(
+        adapter,
+        task_id=1397,
+        prompt="Review.",
+        run_id="reviewer-run",
+        coder_artifact=coder_artifact(),
+        cwd=tmp_path,
+        env_overrides=env,
+        runtime_registry_path=write_runtime_registry(tmp_path),
+    )
+
+    assert result.status == "completed"
+    assert result.finding_ids == [740]
+    call_names = [name for name, _ in tools.calls]
+    assert "create_review_finding" not in call_names
+    assert "set_review_finding_status" in call_names
+    status_call = [kwargs for name, kwargs in tools.calls if name == "set_review_finding_status"][0]
+    assert status_call["review_finding_id"] == 740
+    assert status_call["status"] == "verified_fixed"
+    completion = [kwargs for name, kwargs in tools.calls if name == "post_worker_completion_packet"][0]
+    assert json.loads(completion["finding_ids"]) == [740]
+
+
 def test_tracked_reviewer_looks_good_sets_verdict_without_findings(tmp_path):
     tools = RecordingCoderTools()
     adapter = make_adapter(tools)
@@ -733,6 +850,8 @@ def test_tracked_gate_role_path_uses_role_context_runtime_and_packet_type(
     assert registration["prompt_packet_message_id"] in {5793, 5794, 5795}
     completion = tools.calls[3][1]
     assert completion["packet_type"] == packet_type
+    assert completion["branch"] == "task/1399-gates"
+    assert completion["head_commit"] == FAKE_HEAD
     if role == "validator":
         assert json.loads(completion["tests_run"]) == result.evidence["tests_run"]
     else:
