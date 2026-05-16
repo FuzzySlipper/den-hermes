@@ -7,3 +7,7 @@ class MemoryConfigError(ValueError):
 
 class DenCoreApiGapError(RuntimeError):
     """Raised when a required Den Core REST endpoint is missing or incompatible."""
+
+
+class DenUnavailableError(RuntimeError):
+    """Raised when Den Core REST is unreachable or returns persistent errors."""
