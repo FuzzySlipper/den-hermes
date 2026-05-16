@@ -45,6 +45,13 @@ MEMORY_CONFIG_PATHS = (
     ("memory", "user_profile_enabled"),
 )
 
+# Config paths that must be absent/blank for worker profiles even when the
+# built-in memory booleans are disabled.
+MEMORY_PROVIDER_PATHS = (
+    ("memory", "provider"),
+    ("den_memory",),
+)
+
 # Config list paths that register memory tools.
 MEMORY_TOOLSET_PATHS = (
     ("platform_toolsets", "cli"),  # list of strings under platform_toolsets.cli
@@ -76,6 +83,16 @@ def _contains_memory(val: Any) -> bool:
     return False
 
 
+def _is_nonempty(val: Any) -> bool:
+    if val is None:
+        return False
+    if isinstance(val, str):
+        return bool(val.strip())
+    if isinstance(val, (dict, list, tuple, set)):
+        return bool(val)
+    return bool(val)
+
+
 def _is_yaml_available() -> bool:
     return yaml is not None
 
@@ -98,6 +115,11 @@ def _redact_config_summary(cfg: dict) -> dict:
         lst = cfg.get(top, {}).get(sub) if isinstance(cfg.get(top), dict) else None
         if isinstance(lst, list):
             summary.setdefault(top, {})[sub] = ["memory" in str(v).lower() for v in lst]
+    provider = cfg.get("memory", {}).get("provider") if isinstance(cfg.get("memory"), dict) else None
+    if provider not in (None, ""):
+        summary.setdefault("memory", {})["provider"] = "<nonempty>"
+    if _is_nonempty(cfg.get("den_memory")):
+        summary["den_memory"] = "<configured>"
     return summary
 
 
@@ -143,6 +165,9 @@ def audit_profile(profile_path: Path) -> dict[str, Any]:
                 for top, sub in MEMORY_TOOLSET_PATHS:
                     if _has_value(cfg, (top, sub), _contains_memory):
                         result["config_findings"].append(f"{top}.{sub} contains 'memory'")
+                for path in MEMORY_PROVIDER_PATHS:
+                    if _has_value(cfg, path, _is_nonempty):
+                        result["config_findings"].append(".".join(path) + " configured")
                 result["config_summary"] = _redact_config_summary(cfg)
         except Exception as exc:
             result["config_findings"].append(f"config.yaml unreadable: {exc}")

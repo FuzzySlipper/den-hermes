@@ -1,6 +1,6 @@
 # Worker profile memory audit policy and findings
 
-Task: `den-hermes-bridge` #1458  
+Task: `den-hermes-bridge` #1458
 Status: policy recorded, gaps enumerated, repeatable audit implemented
 
 ## 1. Policy

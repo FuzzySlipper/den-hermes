@@ -102,6 +102,35 @@ class TestAuditProfile:
         assert result["passed"] is False
         assert any("memory" in f for f in result["config_findings"])
 
+    def test_config_nonempty_memory_provider_fails(self, tmp_path: Path):
+        profile = tmp_path / "spawned-coder"
+        profile.mkdir()
+        config = (
+            "memory:\n"
+            "  memory_enabled: false\n"
+            "  user_profile_enabled: false\n"
+            "  provider: den\n"
+        )
+        (profile / "config.yaml").write_text(config)
+        result = audit_profile(profile)
+        assert result["passed"] is False
+        assert "memory.provider configured" in result["config_findings"]
+
+    def test_den_memory_config_fails(self, tmp_path: Path):
+        profile = tmp_path / "spawned-coder"
+        profile.mkdir()
+        config = (
+            "memory:\n"
+            "  memory_enabled: false\n"
+            "  user_profile_enabled: false\n"
+            "den_memory:\n"
+            "  enabled: true\n"
+        )
+        (profile / "config.yaml").write_text(config)
+        result = audit_profile(profile)
+        assert result["passed"] is False
+        assert "den_memory configured" in result["config_findings"]
+
     def test_config_clean_passes(self, tmp_path: Path):
         profile = tmp_path / "spawned-coder"
         profile.mkdir()
