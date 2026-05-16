@@ -173,6 +173,8 @@ class DenMcpAdapter:
         reviewer = self.reviewer_identity or f"{self.requested_by}-reviewer"
 
         for finding in findings:
+            if not _reviewer_finding_is_den_creatable(finding):
+                continue
             self.tools.mcp_den_create_review_finding(
                 review_round_id=review_round_id,
                 created_by=reviewer,
@@ -241,6 +243,18 @@ class DenMcpAdapter:
             if "tests_run" in artifact:
                 args["tests_run"] = json.dumps(list(artifact.get("tests_run") or []))
         return args
+
+
+DEN_REVIEW_FINDING_CATEGORIES = {
+    "blocking_bug",
+    "acceptance_gap",
+    "test_weakness",
+    "follow_up_candidate",
+}
+
+
+def _reviewer_finding_is_den_creatable(finding: Mapping[str, Any]) -> bool:
+    return str(finding.get("category", "acceptance_gap")) in DEN_REVIEW_FINDING_CATEGORIES
 
 
 def _packet_type_for_role(role: str) -> str:

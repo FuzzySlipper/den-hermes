@@ -1063,6 +1063,8 @@ def _publish_reviewer_finding_entries(
     for finding in findings or []:
         if not isinstance(finding, Mapping):
             continue
+        if not _reviewer_finding_is_den_creatable(finding):
+            continue
         existing_finding_id = _reviewer_existing_finding_id(finding)
         status = finding.get("status")
         if existing_finding_id is not None:
@@ -1083,6 +1085,28 @@ def _publish_reviewer_finding_entries(
             )
         )
     return finding_ids
+
+
+DEN_REVIEW_FINDING_CATEGORIES = {
+    "blocking_bug",
+    "acceptance_gap",
+    "test_weakness",
+    "follow_up_candidate",
+}
+
+
+def _reviewer_finding_is_den_creatable(finding: Mapping[str, Any]) -> bool:
+    """Return true only for entries Den can persist as review findings.
+
+    Spawned reviewer artifacts sometimes include informational observations in
+    the structured ``findings`` array. Den's review finding API is intentionally
+    narrower, so non-actionable/unknown categories must not be sent to
+    create_review_finding. Existing-finding status updates are still valid.
+    """
+
+    if _reviewer_existing_finding_id(finding) is not None:
+        return True
+    return str(finding.get("category", "acceptance_gap")) in DEN_REVIEW_FINDING_CATEGORIES
 
 
 def _packet_type_for_role(role: str) -> str:

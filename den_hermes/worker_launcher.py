@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -43,6 +44,7 @@ def run_hermes_worker(
     task_id: int,
     run_id: str,
     role: str,
+    project_id: str | None = None,
     prompt: str,
     expected_artifact: str | Path,
     provider: str | None = None,
@@ -76,6 +78,8 @@ def run_hermes_worker(
             "DEN_EXPECTED_ARTIFACT": str(artifact_path),
         }
     )
+    if project_id:
+        env["DEN_PROJECT_ID"] = project_id
     if env_overrides:
         env.update(env_overrides)
 
@@ -133,6 +137,7 @@ def run_hermes_worker(
 
     validation_error = _validate_artifact_identity(
         artifact=artifact,
+        project_id=project_id,
         task_id=task_id,
         run_id=run_id,
         role=role,
@@ -265,6 +270,7 @@ def run_den_coder_reviewer_workflow(
 
     run_root_path = Path(run_root)
     cwd_path = str(cwd) if cwd is not None else None
+    project_id = getattr(den_client, "project_id", None)
     try:
         coder_runtime = _resolve_workflow_worker_config(
             role="coder",
@@ -317,6 +323,7 @@ def run_den_coder_reviewer_workflow(
         task_id=task_id,
         run_id=coder_run_id,
         role="coder",
+        project_id=project_id,
         prompt=prompt,
         expected_artifact=coder_artifact_path,
         provider=_optional_str(coder_runtime, "provider"),
@@ -399,6 +406,7 @@ def run_den_coder_reviewer_workflow(
         task_id=task_id,
         run_id=reviewer_run_id,
         role="reviewer",
+        project_id=project_id,
         prompt=reviewer_prompt,
         expected_artifact=reviewer_artifact_path,
         provider=_optional_str(reviewer_runtime, "provider"),
@@ -479,24 +487,35 @@ def _inject_artifact_contract(prompt: str, expected_artifact: Path) -> str:
         f"{prompt.rstrip()}\n\n"
         "EXPECTED COMPLETION ARTIFACT\n"
         f"Write the Den worker completion JSON to: {expected_artifact}\n"
-        "The parent orchestrator will fail closed if this file is missing, "
-        "malformed, or has mismatched task/run/role identity.\n"
+        "The parent orchestrator will fail closed if this file is missing, malformed, "
+        "has mismatched project/task/run/role identity, omits required fields, or uses the wrong JSON types.\n"
+        "Artifact identity fields must be exact values and types: project_id string when provided, "
+        "task_id integer, run_id string, role one of coder/reviewer/validator/drift_checker/packet_auditor. "
+        "Do not use role aliases such as spawned-reviewer. Required common fields include status and summary.\n"
+        "Reviewer rule: if any required check/test/hygiene command reports non-zero exit or failure, "
+        "the verdict must not be looks_good. Put only blocking or actionable findings in the structured findings array.\n"
     )
 
 
 def _validate_artifact_identity(
     *,
     artifact: Mapping[str, Any],
+    project_id: str | None,
     task_id: int,
     run_id: str,
     role: str,
 ) -> str | None:
+    errors: list[str] = []
+    if project_id is not None and artifact.get("project_id") != project_id:
+        errors.append(f"project_id expected {project_id!r}, got {artifact.get('project_id')!r}")
     if artifact.get("task_id") != task_id:
-        return f"Task id mismatch in completion artifact: expected {task_id}, got {artifact.get('task_id')!r}"
+        errors.append(f"task_id expected {task_id} (int), got {artifact.get('task_id')!r}")
     if artifact.get("run_id") != run_id:
-        return f"Run id mismatch in completion artifact: expected {run_id}, got {artifact.get('run_id')!r}"
+        errors.append(f"run_id expected {run_id!r}, got {artifact.get('run_id')!r}")
     if artifact.get("role") != role:
-        return f"Role mismatch in completion artifact: expected {role}, got {artifact.get('role')!r}"
+        errors.append(f"role expected {role!r}, got {artifact.get('role')!r}")
+    if errors:
+        return "Completion artifact identity mismatch: " + "; ".join(errors)
     return None
 
 
@@ -518,6 +537,8 @@ def _validate_artifact_shape(*, artifact: Mapping[str, Any], role: str) -> str |
             return f"Invalid reviewer verdict: {artifact.get('verdict')!r}"
         if not isinstance(artifact.get("findings"), list):
             return "Invalid reviewer completion field: findings must be a list"
+        if artifact.get("verdict") == "looks_good" and _reviewer_required_checks_failed(artifact):
+            return "Invalid reviewer verdict: looks_good is not allowed when tests_run/check evidence reports failure or non-zero exit"
     if role == "validator":
         for field in ("verdict", "summary", "status"):
             if not artifact.get(field):
@@ -548,6 +569,41 @@ def _validate_artifact_shape(*, artifact: Mapping[str, Any], role: str) -> str |
         if not isinstance(artifact.get("audited_packets"), list) or not artifact.get("audited_packets"):
             return "Missing required packet_auditor evidence: audited_packets"
     return None
+
+
+def _reviewer_required_checks_failed(artifact: Mapping[str, Any]) -> bool:
+    tests_run = artifact.get("tests_run")
+    if not isinstance(tests_run, list):
+        return False
+    failure_markers = (
+        "exit 1",
+        "exit 2",
+        "exit_code=1",
+        "exit_code=2",
+        "returncode 1",
+        "returncode 2",
+        "failure",
+        "error:",
+        "traceback",
+        "whitespace errors",
+    )
+    for entry in tests_run:
+        if isinstance(entry, Mapping):
+            exit_code = entry.get("exit_code", entry.get("returncode"))
+            if isinstance(exit_code, int) and exit_code != 0:
+                return True
+            text = json.dumps(entry, sort_keys=True).lower()
+        else:
+            text = str(entry).lower()
+        if re.search(r"\b[1-9]\d*\s+failed\b", text):
+            return True
+        if "failed" in text and not re.search(r"\b0\s+failed\b", text):
+            return True
+        if "whitespace errors" in text and "no whitespace errors" not in text:
+            return True
+        if any(marker in text for marker in failure_markers if marker != "whitespace errors"):
+            return True
+    return False
 
 
 def _resolve_workflow_worker_config(

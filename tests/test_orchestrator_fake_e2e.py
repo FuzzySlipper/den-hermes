@@ -335,6 +335,37 @@ def test_fake_e2e_reviewer_failure_posts_failure_packet(tmp_path):
     assert tools.completions["reviewer-run"]["packet_type"] == "worker_failure_packet"
 
 
+
+
+def test_fake_e2e_reviewer_skips_informational_findings(tmp_path):
+    tools = StatefulFakeDenTools()
+    adapter = make_adapter(tools)
+    env = fake_env(tmp_path)
+    env["FAKE_REVIEW_FINDINGS"] = '[{"category":"style","summary":"informational note"}]'
+
+    result = run_tracked_reviewer_path(
+        adapter,
+        task_id=1400,
+        prompt="Review.",
+        run_id="reviewer-run",
+        coder_artifact={
+            "run_id": "coder-run",
+            "branch": "task/branch",
+            "head_commit": FAKE_HEAD,
+            "tests_run": [{"command": "pytest -q", "result": "passed"}],
+        },
+        cwd=tmp_path,
+        env_overrides=env,
+        runtime_registry_path=write_runtime_registry(tmp_path),
+    )
+
+    assert result.status == "completed"
+    assert result.verdict == "looks_good"
+    assert result.finding_ids == []
+    assert not [call for call in tools.calls if call[0] == "create_review_finding"]
+    assert [call for call in tools.calls if call[0] == "post_review_findings"]
+
+
 def test_fake_e2e_max_attempts_blocks_without_retry():
     tools = StatefulFakeDenTools()
     adapter = make_adapter(tools)

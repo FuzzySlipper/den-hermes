@@ -39,9 +39,12 @@ entry = {
         "DEN_RUN_ID": os.environ.get("DEN_RUN_ID"),
         "DEN_WORKER_ROLE": role,
         "DEN_EXPECTED_ARTIFACT": os.environ.get("DEN_EXPECTED_ARTIFACT"),
+        "DEN_PROJECT_ID": os.environ.get("DEN_PROJECT_ID"),
     },
 }
 with log_path.open("a") as log_file:
+    if entry["env"].get("DEN_PROJECT_ID") is None:
+        entry["env"].pop("DEN_PROJECT_ID", None)
     log_file.write(json.dumps(entry) + "\\n")
 
 mode = os.environ.get(f"FAKE_HERMES_{role.upper()}_MODE", os.environ.get("FAKE_HERMES_MODE", "success"))
@@ -62,13 +65,22 @@ if mode == "nonzero":
 artifact_task_id = int(os.environ["DEN_TASK_ID"])
 artifact_run_id = os.environ["DEN_RUN_ID"]
 artifact_role = role
+artifact_project_id = os.environ.get("DEN_PROJECT_ID")
 if mode == "identity_mismatch":
     artifact_role = "coder" if artifact_role != "coder" else "reviewer"
+if mode == "role_alias":
+    artifact_role = f"spawned-{role}"
+if mode == "string_task_id":
+    artifact_task_id = os.environ["DEN_TASK_ID"]
+if mode == "wrong_project_id":
+    artifact_project_id = "den-hermes"
 
 artifact_path.parent.mkdir(parents=True, exist_ok=True)
 if role == "reviewer":
     findings = json.loads(os.environ.get("FAKE_REVIEW_FINDINGS", "[]"))
     tests_run = json.loads(os.environ.get("FAKE_REVIEW_TESTS_RUN", "[]"))
+    if mode == "failed_review_checks":
+        tests_run = [{"command": "git diff --check", "result": "exit 2: whitespace errors"}]
     artifact = {
         "task_id": artifact_task_id,
         "run_id": artifact_run_id,
@@ -133,6 +145,10 @@ else:
         artifact["response_notes"] = os.environ.get("FAKE_RESPONSE_NOTES", "fake coder claims findings fixed")
 if mode == "missing_head_commit":
     artifact.pop("head_commit", None)
+if mode == "missing_summary":
+    artifact.pop("summary", None)
+if artifact_project_id is not None:
+    artifact["project_id"] = artifact_project_id
 artifact_path.write_text(json.dumps(artifact, indent=2))
 print(f"fake hermes {role} ok")
 raise SystemExit(0)
@@ -231,8 +247,10 @@ class RecordingDenClient:
         launch_log: Path | None = None,
         fail_registration_roles: set[str] | None = None,
         fail_completion_roles: set[str] | None = None,
+        project_id: str = "den-hermes-bridge",
     ):
         self.events = []
+        self.project_id = project_id
         self.launch_log = launch_log
         self.fail_registration_roles = fail_registration_roles or set()
         self.fail_completion_roles = fail_completion_roles or set()
@@ -377,7 +395,113 @@ def test_spawned_hermes_worker_rejects_mismatched_identity_artifact(tmp_path):
 
     assert result.status == "failed"
     assert result.artifact is None
-    assert "role mismatch" in result.error.lower()
+    assert "identity mismatch" in result.error.lower()
+    assert "role" in result.error.lower()
+
+
+def test_spawned_hermes_worker_reports_project_id_mismatch(tmp_path):
+    result = run_hermes_worker(
+        task_id=1368,
+        run_id="run-123",
+        role="coder",
+        project_id="den-hermes-bridge",
+        prompt="Implement task 1368.",
+        expected_artifact=tmp_path / ".den" / "runs" / "run-123" / "completion.json",
+        cwd=tmp_path,
+        env_overrides=fake_env(tmp_path, mode="wrong_project_id"),
+    )
+
+    assert result.status == "failed"
+    assert result.artifact is None
+    assert "project_id" in result.error
+    assert "den-hermes-bridge" in result.error
+    assert "den-hermes" in result.error
+
+
+def test_spawned_hermes_worker_rejects_string_task_id(tmp_path):
+    result = run_hermes_worker(
+        task_id=1368,
+        run_id="run-123",
+        role="coder",
+        prompt="Implement task 1368.",
+        expected_artifact=tmp_path / ".den" / "runs" / "run-123" / "completion.json",
+        cwd=tmp_path,
+        env_overrides=fake_env(tmp_path, mode="string_task_id"),
+    )
+
+    assert result.status == "failed"
+    assert result.artifact is None
+    assert "task_id expected 1368 (int)" in result.error
+    assert "'1368'" in result.error
+
+
+def test_spawned_hermes_worker_rejects_role_alias(tmp_path):
+    result = run_hermes_worker(
+        task_id=1368,
+        run_id="run-123",
+        role="reviewer",
+        prompt="Review task 1368.",
+        expected_artifact=tmp_path / ".den" / "runs" / "run-123" / "completion.json",
+        cwd=tmp_path,
+        env_overrides=fake_env(tmp_path, mode="role_alias"),
+    )
+
+    assert result.status == "failed"
+    assert result.artifact is None
+    assert "role expected 'reviewer'" in result.error
+    assert "spawned-reviewer" in result.error
+
+
+def test_spawned_hermes_worker_reports_missing_summary_before_publication(tmp_path):
+    result = run_hermes_worker(
+        task_id=1368,
+        run_id="run-123",
+        role="coder",
+        prompt="Implement task 1368.",
+        expected_artifact=tmp_path / ".den" / "runs" / "run-123" / "completion.json",
+        cwd=tmp_path,
+        env_overrides=fake_env(tmp_path, mode="missing_summary"),
+    )
+
+    assert result.status == "failed"
+    assert result.artifact is None
+    assert "summary" in result.error
+
+
+def test_reviewer_artifact_cannot_approve_failed_required_checks(tmp_path):
+    result = run_hermes_worker(
+        task_id=1368,
+        run_id="run-123",
+        role="reviewer",
+        prompt="Review task 1368.",
+        expected_artifact=tmp_path / ".den" / "runs" / "run-123" / "completion.json",
+        cwd=tmp_path,
+        env_overrides=fake_env(tmp_path, mode="failed_review_checks"),
+    )
+
+    assert result.status == "failed"
+    assert result.artifact is None
+    assert "looks_good" in (result.error or "")
+    assert "failure" in (result.error or "") or "non-zero" in (result.error or "")
+
+
+def test_reviewer_artifact_cannot_approve_mixed_failed_and_passed_summary(tmp_path):
+    env = fake_env(tmp_path)
+    env["FAKE_REVIEW_TESTS_RUN"] = '[{"command":"pytest -q","result":"1 failed, 2 passed"}]'
+
+    result = run_hermes_worker(
+        task_id=1368,
+        run_id="run-123",
+        role="reviewer",
+        prompt="Review task 1368.",
+        expected_artifact=tmp_path / ".den" / "runs" / "run-123" / "completion.json",
+        cwd=tmp_path,
+        env_overrides=env,
+    )
+
+    assert result.status == "failed"
+    assert result.artifact is None
+    assert "looks_good" in (result.error or "")
 
 
 def test_coder_artifact_requires_branch_head_commit_and_tests(tmp_path):
