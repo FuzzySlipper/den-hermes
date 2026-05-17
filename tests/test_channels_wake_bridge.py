@@ -281,14 +281,23 @@ def test_core_binding_with_json_metadata_resolves_profile():
 
 
 class FakePopen:
-    def __init__(self, command, *, cwd, env, stdout, stderr, text):
+    def __init__(self, command, *, cwd, env, stdout, stderr, text, start_new_session):
         self.command = command
         self.cwd = cwd
         self.env = env
         self.stdout = stdout
         self.stderr = stderr
         self.text = text
+        self.start_new_session = start_new_session
         self.pid = 4242
+        self.wait_calls = []
+
+    def poll(self):
+        return None
+
+    def wait(self, timeout=None):
+        self.wait_calls.append(timeout)
+        return 0
 
 
 def test_spawned_hermes_profile_transport_launches_profile_from_runtime_registry(tmp_path):
@@ -376,10 +385,38 @@ def test_spawned_hermes_profile_transport_launches_profile_from_runtime_registry
     assert "--source" in proc.command
     assert "den-channels-wake" in proc.command
     assert proc.cwd == str(tmp_path)
+    assert proc.start_new_session is True
     assert proc.env["DEN_DELIVERY_REQUEST_ID"] == "123"
     envelope_path = tmp_path / "runs" / "wake-run-1" / "envelope.json"
     assert json.loads(envelope_path.read_text())["delivery_request_id"] == 123
 
+
+def test_spawned_transport_falls_back_to_bound_profile_for_non_worker_runner_roles(tmp_path, monkeypatch):
+    monkeypatch.setenv("DEN_HERMES_BINARY", "/bin/hermes-direct")
+    monkeypatch.setenv("DEN_HERMES_WAKE_RUN_ROOT", str(tmp_path / "direct-runs"))
+    launches = []
+
+    def popen_factory(*args, **kwargs):
+        proc = FakePopen(*args, **kwargs)
+        launches.append(proc)
+        return proc
+
+    transport = SpawnedHermesProfileWakeTransport(
+        runtime_registry_path=tmp_path / "missing-runtime.yaml",
+        popen_factory=popen_factory,
+        run_id_factory=lambda: "direct-wake-1",
+    )
+
+    result = transport.wake_profile(binding=active_binding(role="runner"), envelope={"type": "den_delivery", "delivery_request_id": 321})
+
+    proc = launches[0]
+    assert result["session_id"] == "direct-wake-1"
+    assert result["runtime_id"] == "direct-profile-wake"
+    assert proc.command[:4] == ["/bin/hermes-direct", "--profile", "den-hermes-runner", "chat"]
+    assert "--provider" not in proc.command
+    assert "--model" not in proc.command
+    assert proc.env["DEN_HERMES_PROFILE"] == "den-hermes-runner"
+    assert json.loads((tmp_path / "direct-runs" / "direct-wake-1" / "envelope.json").read_text())["delivery_request_id"] == 321
 
 def test_binding_resolver_enforces_exact_project_agent_role_status_locally():
     tools = RecordingDenTools(

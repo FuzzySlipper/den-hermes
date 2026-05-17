@@ -3,10 +3,14 @@ from __future__ import annotations
 import json
 import os
 import re
+import signal
 import subprocess
+import threading
+import time
 import uuid
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Mapping, Protocol
 
 SECRETISH_PATTERN = re.compile(r"(?i)(bearer\s+\S+|sk-[a-z0-9_.-]{8,}|api[_-]?key|auth[_-]?token|\btoken\b|authorization|password|secret)")
@@ -70,11 +74,14 @@ class SpawnedHermesProfileWakeTransport:
         if not binding_profile:
             raise RuntimeError(f"binding {_binding_instance_id(binding)} has no Hermes profile")
         run_id = str(self.run_id_factory())
-        runtime = resolve_role_runtime(
-            role,
-            registry_path=self.runtime_registry_path or DEFAULT_RUNTIME_REGISTRY_PATH,
-            run_id=run_id,
-        )
+        try:
+            runtime = resolve_role_runtime(
+                role,
+                registry_path=self.runtime_registry_path or DEFAULT_RUNTIME_REGISTRY_PATH,
+                run_id=run_id,
+            )
+        except Exception as exc:  # noqa: BLE001 - live runner wake profiles are not spawned-worker roles.
+            runtime = _fallback_profile_runtime(binding=binding, run_id=run_id, reason=str(exc))
         if runtime.profile != binding_profile:
             raise RuntimeError(
                 f"binding profile {binding_profile!r} does not match runtime registry profile {runtime.profile!r} for role {role}"
@@ -120,9 +127,27 @@ class SpawnedHermesProfileWakeTransport:
                 stdout=log_handle,
                 stderr=subprocess.STDOUT,
                 text=True,
+                start_new_session=True,
             )
         finally:
             log_handle.close()
+
+        poll = getattr(process, "poll", None)
+        if callable(poll):
+            time.sleep(0.2)
+            exit_code = poll()
+            if exit_code not in (None, 0):
+                log_tail = _read_log_tail(log_path)
+                raise RuntimeError(f"Hermes wake process exited immediately with code {exit_code}: {log_tail}")
+        wait = getattr(process, "wait", None)
+        if callable(wait):
+            timeout_seconds = int(getattr(runtime, "timeout_seconds", 900) or 900)
+            threading.Thread(
+                target=_reap_or_timeout,
+                kwargs={"process": process, "timeout_seconds": timeout_seconds, "log_path": log_path},
+                name=f"den-wake-reap-{run_id}",
+                daemon=True,
+            ).start()
 
         return {
             "session_id": run_id,
@@ -132,6 +157,83 @@ class SpawnedHermesProfileWakeTransport:
             "prompt_path": str(prompt_path),
             "runtime_id": runtime.runtime_id,
         }
+
+
+def _reap_or_timeout(*, process: Any, timeout_seconds: int, log_path: Path) -> None:
+    try:
+        process.wait(timeout=timeout_seconds)
+        return
+    except subprocess.TimeoutExpired:
+        _append_log(log_path, f"\n[den-hermes] Wake process exceeded {timeout_seconds}s; terminating.\n")
+        _terminate_process_tree(process, signal.SIGTERM)
+        try:
+            process.wait(timeout=10)
+            return
+        except subprocess.TimeoutExpired:
+            _append_log(log_path, "[den-hermes] Wake process ignored SIGTERM; killing.\n")
+            _terminate_process_tree(process, signal.SIGKILL)
+            try:
+                process.wait(timeout=5)
+            except Exception:  # noqa: BLE001 - best-effort background cleanup.
+                return
+    except Exception as exc:  # noqa: BLE001 - best-effort background cleanup.
+        _append_log(log_path, f"\n[den-hermes] Wake process reaper failed: {_redact(str(exc))}\n")
+
+
+def _terminate_process_tree(process: Any, sig: signal.Signals) -> None:
+    pid = getattr(process, "pid", None)
+    if not pid:
+        return
+    try:
+        os.killpg(os.getpgid(pid), sig)
+        return
+    except Exception:  # noqa: BLE001 - fall back to direct process methods.
+        pass
+    method_name = "kill" if sig == signal.SIGKILL else "terminate"
+    method = getattr(process, method_name, None)
+    if callable(method):
+        try:
+            method()
+        except Exception:  # noqa: BLE001 - best-effort termination.
+            return
+
+
+def _append_log(path: Path, text: str) -> None:
+    try:
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(text)
+    except OSError:
+        return
+
+
+def _read_log_tail(path: Path, *, max_chars: int = 800) -> str:
+    try:
+        text = path.read_text(errors="replace")
+    except OSError:
+        return "wake log unavailable"
+    return _redact(text[-max_chars:])
+
+
+def _fallback_profile_runtime(*, binding: Mapping[str, Any], run_id: str, reason: str) -> SimpleNamespace:
+    project_id = str(binding.get("project_id") or "").strip()
+    project_workdir = Path("/home/dev") / project_id if project_id else Path("/home/dev")
+    workdir = str(project_workdir if project_workdir.exists() else Path("/home/dev"))
+    return SimpleNamespace(
+        runtime_id="direct-profile-wake",
+        hermes_binary=os.environ.get("DEN_HERMES_BINARY", "hermes"),
+        profile=_binding_profile(binding),
+        provider=os.environ.get("DEN_HERMES_WAKE_PROVIDER", ""),
+        model=os.environ.get("DEN_HERMES_WAKE_MODEL", ""),
+        toolsets=(),
+        extra_args=(),
+        run_root=os.environ.get("DEN_HERMES_WAKE_RUN_ROOT", "/tmp/den-hermes-wakes"),
+        log_filename="worker.log",
+        log_path=None,
+        timeout_seconds=int(os.environ.get("DEN_HERMES_WAKE_TIMEOUT_SECONDS", "900")),
+        workdir=workdir,
+        source="den-channels-wake",
+        fallback_reason=_redact(reason),
+    )
 
 
 class InMemoryWakeStore:
@@ -628,9 +730,12 @@ def _default_wake_run_id() -> str:
 def _wake_prompt(*, envelope_path: Path, binding: Mapping[str, Any]) -> str:
     return (
         "You were woken by a Den Channels delivery.\n"
+        "This wake is a bounded message-handling run, not a queue-draining or code-editing session.\n"
         f"Read the sanitized Den delivery envelope from: {envelope_path}\n"
-        "Refresh Den state using the source pointers before acting.\n"
-        "Preserve delivery_request_id, dedupe_key, and correlation_id in any Den-visible response.\n"
+        "Refresh only the directly referenced Den state needed to answer the message.\n"
+        "Post exactly one Den Channels reply using envelope.reply, preserving delivery_request_id, dedupe_key, and correlation_id.\n"
+        "Do not modify repository files, start implementation work, run broad test suites, or continue to unrelated queued tasks.\n"
+        "After the channel reply is posted, return a concise final summary and stop.\n"
         f"Target Hermes profile binding: {_binding_instance_id(binding)}.\n"
     )
 
