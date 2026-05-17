@@ -13,6 +13,7 @@ import argparse
 import hashlib
 import http.server
 import json
+import re
 import socket
 import sys
 import threading
@@ -30,6 +31,14 @@ from den_hermes.memory.provider import DenMemoryProvider
 
 PROJECT_ID = "den-hermes-bridge"
 TASK_ID = 1461
+
+
+def core_safe(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]+", "-", value.strip().lower()).strip("-")
+
+
+def core_entry_id(space: str, key: str) -> str:
+    return f"memory-{core_safe(space)}-{core_safe(key)}"
 
 
 @dataclass(frozen=True)
@@ -68,8 +77,12 @@ class MemoryStore:
 
     def upsert(self, payload: dict[str, Any]) -> dict[str, Any]:
         entry = dict(payload)
-        entry.setdefault("summary", "")
+        if "slug" not in entry and "key" in entry:
+            entry["slug"] = entry["key"]
+        entry.setdefault("key", entry.get("slug", ""))
+        entry.setdefault("entryId", core_entry_id(str(entry.get("space", "project")), str(entry["key"])))
         entry.setdefault("metadata", {})
+        entry.setdefault("summary", entry["metadata"].get("summary", ""))
         if "tags" in entry:
             entry.setdefault("metadata", {})["tags"] = entry["tags"]
         entry.setdefault("provenance", payload.get("provenance", {}))
@@ -82,6 +95,10 @@ class MemoryStore:
         return rows[:limit]
 
     def get(self, space: str, slug: str) -> dict[str, Any] | None:
+        if slug.startswith("memory-"):
+            for (_entry_space, _), entry in self.entries.items():
+                if entry.get("entryId") == slug:
+                    return entry
         return self.entries.get((space, slug))
 
     def search(self, query: str, spaces: list[str], limit: int) -> list[dict[str, Any]]:

@@ -127,14 +127,58 @@ class DenMemoryProvider:
         slug = re.sub(r"[\s]+", "-", slug)
         return slug.strip("-")
 
+    @staticmethod
+    def _core_safe(value: str) -> str:
+        """Mirror Den Core's generated memory entry id normalization."""
+        return re.sub(r"[^A-Za-z0-9._-]+", "-", value.strip().lower()).strip("-")
+
+    @classmethod
+    def _core_entry_id(cls, space: str, key: str) -> str:
+        return f"memory-{cls._core_safe(space)}-{cls._core_safe(key)}"
+
+    @classmethod
+    def _core_memory_key(cls, user_space: str, slug: str) -> str:
+        """Namespace a user-facing memory key for the live Core compatibility API.
+
+        Current Den Core memory routes expose a fixed set of storage spaces and
+        parse unknown dynamic spaces as ``project`` on search results. Store
+        Hermes' richer profile/kb space in the key + metadata while using the
+        project storage bucket, then filter/strip the prefix client-side.
+        """
+        return f"{cls._core_safe(user_space)}-{slug}"
+
+    @classmethod
+    def _core_storage_space(cls, _user_space: str) -> str:
+        return "project"
+
+    def _uses_core_compat_storage(self) -> bool:
+        """Whether the configured endpoint is the live Den Core compatibility facade."""
+        return "den-core-api" in self.config.base_url
+
+    def _store_payload_fields(self, space: str, slug: str) -> tuple[str, str]:
+        """Return the storage-space/key pair for the configured Den endpoint."""
+        if self._uses_core_compat_storage():
+            return self._core_storage_space(space), self._core_memory_key(space, slug)
+        return space, slug
+
+    def _entry_id_for_read(self, space: str, slug: str) -> str:
+        """Return the endpoint-specific entry id for a user-facing space/slug."""
+        if self._uses_core_compat_storage():
+            storage_space, key = self._store_payload_fields(space, slug)
+            return self._core_entry_id(storage_space, key)
+        return slug
+
     def _label_result(self, raw: dict[str, Any]) -> dict[str, Any]:
         """Attach source labels so retrieved content is traceable."""
+        metadata = raw.get("metadata") or {}
+        slug = metadata.get("slug") or raw.get("slug") or raw.get("key") or raw.get("entryId") or raw.get("id", "unknown")
         return {
-            "space": raw.get("space", "unknown"),
-            "slug": raw.get("slug") or raw.get("key") or raw.get("id", "unknown"),
-            "summary": raw.get("summary", ""),
+            "space": metadata.get("space") or metadata.get("intended_space") or raw.get("space", "unknown"),
+            "slug": slug,
+            "entry_id": raw.get("entryId") or raw.get("entry_id") or raw.get("id") or slug,
+            "summary": raw.get("summary") or raw.get("snippet") or metadata.get("summary", ""),
             "content": raw.get("content", ""),
-            "metadata": raw.get("metadata", {}),
+            "metadata": metadata,
             "provenance": raw.get("provenance", {}),
         }
 
@@ -149,6 +193,35 @@ class DenMemoryProvider:
             "results": labeled,
             "count": len(labeled),
         }
+
+    def _filter_core_results_for_spaces(
+        self, entries: list[Any], spaces: list[str]
+    ) -> list[dict[str, Any]]:
+        """Filter live Core search results back to Hermes user-facing spaces."""
+        if not self._uses_core_compat_storage():
+            return [entry for entry in entries if isinstance(entry, dict)]
+        prefixes = {
+            self._core_safe(space) + "-": space
+            for space in spaces
+        }
+        filtered: list[dict[str, Any]] = []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            metadata = entry.get("metadata")
+            if isinstance(metadata, dict) and metadata.get("space") in spaces:
+                filtered.append(entry)
+                continue
+            key = str(entry.get("key") or entry.get("slug") or "")
+            for prefix, user_space in prefixes.items():
+                if key.startswith(prefix):
+                    stripped = key[len(prefix):]
+                    patched = dict(entry)
+                    patched["key"] = stripped
+                    patched["space"] = user_space
+                    filtered.append(patched)
+                    break
+        return filtered
 
     def _map_error(self, exc: Exception) -> dict[str, Any]:
         """Convert exceptions into structured tool errors."""
@@ -238,18 +311,23 @@ class DenMemoryProvider:
                     "recovery": "Provide a non-empty slug or a meaningful title.",
                 }
             provenance = self._build_provenance()
+            storage_space, storage_key = self._store_payload_fields(resolved_space, resolved_slug)
             payload: dict[str, Any] = {
+                "key": storage_key,
                 "doc_type": "memory",
                 "slug": resolved_slug,
-                "space": resolved_space,
+                "space": storage_space,
                 "title": title,
                 "content": content,
+                "metadata": {"title": title, "slug": resolved_slug, "space": resolved_space},
                 "provenance": provenance,
             }
             if summary is not None:
                 payload["summary"] = summary
+                payload["metadata"]["summary"] = summary
             if tags is not None:
                 payload["tags"] = tags
+                payload["metadata"]["tags"] = tags
             _status, data = self._client.request(
                 "POST",
                 self._project_path("/entries"),
@@ -260,6 +338,7 @@ class DenMemoryProvider:
                 "slug": resolved_slug,
                 "space": resolved_space,
                 "provenance": provenance,
+                "entry_id": data.get("entryId") if isinstance(data, dict) else self._core_entry_id(storage_space, storage_key),
                 "entry": self._label_result(data) if isinstance(data, dict) else data,
             }
         except Exception as exc:
@@ -278,19 +357,25 @@ class DenMemoryProvider:
         try:
             resolved_space = self._resolve_write_space(space)
             provenance = self._build_provenance()
+            storage_space, storage_key = self._store_payload_fields(resolved_space, slug)
             payload: dict[str, Any] = {
+                "key": storage_key,
                 "doc_type": "memory",
                 "slug": slug,
-                "space": resolved_space,
+                "space": storage_space,
                 "content": content,
+                "metadata": {"slug": slug, "space": resolved_space},
                 "provenance": provenance,
             }
             if title is not None:
                 payload["title"] = title
+                payload["metadata"]["title"] = title
             if summary is not None:
                 payload["summary"] = summary
+                payload["metadata"]["summary"] = summary
             if tags is not None:
                 payload["tags"] = tags
+                payload["metadata"]["tags"] = tags
             _status, data = self._client.request(
                 "POST",
                 self._project_path("/entries"),
@@ -301,6 +386,7 @@ class DenMemoryProvider:
                 "slug": slug,
                 "space": resolved_space,
                 "provenance": provenance,
+                "entry_id": data.get("entryId") if isinstance(data, dict) else self._core_entry_id(storage_space, storage_key),
                 "entry": self._label_result(data) if isinstance(data, dict) else data,
             }
         except Exception as exc:
@@ -320,13 +406,18 @@ class DenMemoryProvider:
                     "error": "No read_spaces configured for this profile.",
                     "recovery": "Add spaces to the memory.read_spaces config.",
                 }
-            payload: dict[str, Any] = {"query": query, "spaces": spaces, "limit": limit}
+            search_spaces = ["project"] if self._uses_core_compat_storage() else spaces
+            request_limit = max(limit * 10, 50) if self._uses_core_compat_storage() else limit
+            payload: dict[str, Any] = {"query": query, "spaces": search_spaces, "limit": request_limit}
             _status, data = self._client.request(
                 "POST",
                 self._project_path("/search"),
                 json_payload=payload,
             )
-            return self._label_results(data)
+            entries = data if isinstance(data, list) else (
+                data.get("entries") or data.get("results") or []
+            )
+            return self._label_results(self._filter_core_results_for_spaces(entries, spaces))
         except Exception as exc:
             return self._map_error(exc)
 
@@ -346,7 +437,9 @@ class DenMemoryProvider:
                     "error": "No read_spaces configured for this profile.",
                     "recovery": "Add spaces to the memory.read_spaces config.",
                 }
-            payload: dict[str, Any] = {"query": query, "spaces": spaces, "limit": limit}
+            search_spaces = ["project"] if self._uses_core_compat_storage() else spaces
+            request_limit = max(limit * 10, 50) if self._uses_core_compat_storage() else limit
+            payload: dict[str, Any] = {"query": query, "spaces": search_spaces, "limit": request_limit}
             if tags:
                 payload["tags"] = tags
             _status, data = self._client.request(
@@ -357,13 +450,30 @@ class DenMemoryProvider:
             entries = data if isinstance(data, list) else (
                 data.get("entries") or data.get("results") or []
             )
+            entries = self._filter_core_results_for_spaces(entries, spaces)
             # Client-side tag filtering when Den Core does not yet support tags.
+            # Some live compatibility search responses return summaries only
+            # (entryId/key/space/snippet) without metadata. In that case keep
+            # the server-filtered result rather than dropping every match.
             if tags:
                 filtered: list[dict[str, Any]] = []
                 for entry in entries:
                     if not isinstance(entry, dict):
                         continue
-                    entry_tags = entry.get("metadata", {}).get("tags", [])
+                    metadata = entry.get("metadata")
+                    if not isinstance(metadata, dict) or "tags" not in metadata:
+                        if self._uses_core_compat_storage():
+                            slug = str(entry.get("slug") or entry.get("key") or "")
+                            entry_space = str(entry.get("space") or (spaces[0] if spaces else ""))
+                            if slug and entry_space:
+                                read_result = self.den_read(slug, space=entry_space)
+                                if read_result.get("status") == "ok":
+                                    full_entry = read_result.get("entry") or {}
+                                    full_tags = (full_entry.get("metadata") or {}).get("tags", [])
+                                    if any(t in full_tags for t in tags):
+                                        filtered.append(full_entry)
+                        continue
+                    entry_tags = metadata.get("tags", [])
                     if any(t in entry_tags for t in tags):
                         filtered.append(entry)
                 entries = filtered
@@ -383,8 +493,9 @@ class DenMemoryProvider:
                 }
             not_found_count = 0
             for s in spaces:
+                entry_id = self._entry_id_for_read(s, slug)
                 path = (
-                    self._project_path(f"/entries/{urllib.parse.quote(slug, safe='')}")
+                    self._project_path(f"/entries/{urllib.parse.quote(entry_id, safe='')}")
                     + f"?space={urllib.parse.quote(s, safe='')}&limit=1"
                 )
                 try:
@@ -427,18 +538,24 @@ class DenMemoryProvider:
             all_entries: list[dict[str, Any]] = []
             errors: list[Exception] = []
             for s in spaces:
-                path = (
-                    self._project_path("/entries")
-                    + f"?space={urllib.parse.quote(s, safe='')}&limit={limit}"
-                )
                 try:
-                    _status, data = self._client.request("GET", path)
-                    if isinstance(data, list):
-                        all_entries.extend(data)
-                    elif isinstance(data, dict):
-                        all_entries.extend(
-                            data.get("entries") or data.get("results") or []
+                    if self._uses_core_compat_storage():
+                        _status, data = self._client.request(
+                            "POST",
+                            self._project_path("/search"),
+                            json_payload={"query": "", "spaces": ["project"], "limit": max(limit * 10, 50)},
                         )
+                    else:
+                        path = (
+                            self._project_path("/entries")
+                            + f"?space={urllib.parse.quote(s, safe='')}&limit={limit}"
+                        )
+                        _status, data = self._client.request("GET", path)
+                    if isinstance(data, list):
+                        all_entries.extend(self._filter_core_results_for_spaces(data, [s]))
+                    elif isinstance(data, dict):
+                        entries = data.get("entries") or data.get("results") or []
+                        all_entries.extend(self._filter_core_results_for_spaces(entries, [s]))
                 except Exception as exc:
                     # If one space query fails but another succeeds, return the
                     # successful scoped entries. If every space fails, surface a
