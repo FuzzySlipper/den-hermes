@@ -12,6 +12,7 @@ import argparse
 import os
 import shutil
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +25,8 @@ PLUGIN_KEY = "platforms/den_channels"
 PLUGIN_MANIFEST_NAME = "den-channels-platform"
 DEFAULT_PROFILE_ROOT = Path("/home/agents/profiles")
 DEFAULT_SHARED_ROOT = Path("/home/agents/runtime/den-hermes-plugins")
+DEFAULT_HERMES_RUNTIME_ROOT = Path("/home/agents/hermes-agent")
+DEFAULT_BACKUP_ROOT = Path("/home/agents/runtime/den-hermes-plugin-backups")
 
 
 def repo_root() -> Path:
@@ -69,6 +72,25 @@ def link_profile_plugin(profile_home: Path, shared_plugin: Path, *, copy: bool =
     else:
         plugin_dir.symlink_to(shared_plugin, target_is_directory=True)
     return plugin_dir
+
+
+def link_bundled_plugin(runtime_root: Path, shared_plugin: Path, backup_root: Path) -> Path:
+    """Replace stale Hermes-runtime bundled den_channels code with a symlink."""
+    bundled = runtime_root / "plugins" / "platforms" / "den_channels"
+    bundled.parent.mkdir(parents=True, exist_ok=True)
+
+    if bundled.is_symlink():
+        if bundled.resolve() == shared_plugin.resolve():
+            return bundled
+        bundled.unlink()
+    elif bundled.exists():
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        backup = backup_root / timestamp / "hermes-agent-plugins-platforms-den_channels"
+        backup.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(bundled), str(backup))
+
+    bundled.symlink_to(shared_plugin, target_is_directory=True)
+    return bundled
 
 
 def load_config(path: Path) -> dict[str, Any]:
@@ -143,8 +165,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--source", type=Path, default=default_source(), help="Den-owned plugin source directory")
     parser.add_argument("--shared-root", type=Path, default=DEFAULT_SHARED_ROOT, help="shared Den-owned plugin install root")
     parser.add_argument("--profile-root", type=Path, default=DEFAULT_PROFILE_ROOT, help="base directory for named Hermes profiles")
+    parser.add_argument("--hermes-runtime-root", type=Path, default=DEFAULT_HERMES_RUNTIME_ROOT, help="Hermes runtime checkout root whose bundled den_channels plugin should link to the shared source")
+    parser.add_argument("--backup-root", type=Path, default=DEFAULT_BACKUP_ROOT, help="where to archive replaced bundled plugin directories")
     parser.add_argument("--profile", action="append", default=[], help="profile name or absolute HERMES_HOME; repeatable")
     parser.add_argument("--copy-profile", action="store_true", help="copy into each profile instead of symlinking to shared root")
+    parser.add_argument("--skip-bundled-link", action="store_true", help="do not replace the Hermes runtime bundled plugin with a symlink")
     parser.add_argument("--verify-only", action="store_true", help="only verify profile plugin/config state")
     return parser.parse_args(argv)
 
@@ -160,6 +185,9 @@ def main(argv: list[str] | None = None) -> int:
     else:
         shared_plugin = copy_plugin_source(args.source, args.shared_root)
         print(f"installed shared plugin: {shared_plugin}")
+        if not args.skip_bundled_link:
+            bundled = link_bundled_plugin(args.hermes_runtime_root, shared_plugin, args.backup_root)
+            print(f"bundled plugin link: {bundled} -> {shared_plugin}")
 
     any_problem = False
     for profile in profiles:

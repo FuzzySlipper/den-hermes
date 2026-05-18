@@ -57,9 +57,12 @@ Default install behavior:
 
 1. Copies this repo's `plugins/platforms/den_channels` source into the shared Den-owned runtime root:
    - `/home/agents/runtime/den-hermes-plugins/platforms/den_channels`
-2. Symlinks each profile's user plugin path to that shared plugin:
+2. Replaces any runtime-checkout bundled copy at `/home/agents/hermes-agent/plugins/platforms/den_channels` with a symlink to that shared Den-owned plugin, archiving a stale real directory under `/home/agents/runtime/den-hermes-plugin-backups/` first.
+3. Symlinks each target profile's user plugin path to that shared plugin:
    - `/home/agents/profiles/<profile>/plugins/platforms/den_channels`
-3. Ensures each profile config includes `plugins.enabled: ["platforms/den_channels"]` (or the equivalent manifest name).
+4. Ensures each target profile config includes `plugins.enabled: ["platforms/den_channels"]` (or the equivalent manifest name).
+
+Use `--skip-bundled-link` only for clean-checkout tests where the Hermes runtime tree must remain completely untouched.
 
 Verification-only mode:
 
@@ -93,7 +96,7 @@ git am /home/agents/runtime/hermes-overlays/1514-preserve-20260518T043228Z/patch
 From a clean or simulated-clean Hermes checkout:
 
 1. Apply required generic overlay patches that are not yet in upstream/current runtime.
-2. Run the Den-owned plugin install script for relevant profiles.
+2. Run the Den-owned plugin install script for relevant profiles. Use the real target profile list only; do not modify profiles you cannot read/write.
 3. Verify plugin discovery:
 
    ```bash

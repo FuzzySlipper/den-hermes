@@ -34,6 +34,10 @@ def test_install_den_channels_plugin_symlinks_and_enables_profile(tmp_path: Path
             str(tmp_path / "shared"),
             "--profile-root",
             str(profile_root),
+            "--hermes-runtime-root",
+            str(tmp_path / "runtime-hermes"),
+            "--backup-root",
+            str(tmp_path / "backups"),
             "--profile",
             "den-channels-runner",
         ]
@@ -64,6 +68,7 @@ def test_install_den_channels_plugin_verify_only_detects_missing_enablement(tmp_
 def test_install_den_channels_plugin_is_idempotent(tmp_path: Path) -> None:
     source = _write_source(tmp_path / "repo")
     profile_root = tmp_path / "profiles"
+    runtime_root = tmp_path / "runtime-hermes"
     args = [
         "--source",
         str(source),
@@ -71,6 +76,10 @@ def test_install_den_channels_plugin_is_idempotent(tmp_path: Path) -> None:
         str(tmp_path / "shared"),
         "--profile-root",
         str(profile_root),
+        "--hermes-runtime-root",
+        str(runtime_root),
+        "--backup-root",
+        str(tmp_path / "backups"),
         "--profile",
         "den-hermes-runner",
     ]
@@ -80,3 +89,51 @@ def test_install_den_channels_plugin_is_idempotent(tmp_path: Path) -> None:
 
     config = yaml.safe_load((profile_root / "den-hermes-runner" / "config.yaml").read_text(encoding="utf-8"))
     assert config["plugins"]["enabled"].count(installer.PLUGIN_KEY) == 1
+
+
+def test_install_den_channels_plugin_replaces_bundled_runtime_copy_with_shared_symlink(tmp_path: Path) -> None:
+    source = _write_source(tmp_path / "repo")
+    shared = installer.copy_plugin_source(source, tmp_path / "shared")
+    runtime_root = tmp_path / "runtime-hermes"
+    bundled = runtime_root / "plugins" / "platforms" / "den_channels"
+    bundled.mkdir(parents=True)
+    (bundled / "adapter.py").write_text("stale bundled source\n", encoding="utf-8")
+
+    link = installer.link_bundled_plugin(runtime_root, shared, tmp_path / "backups")
+
+    assert link.is_symlink()
+    assert link.resolve() == shared.resolve()
+    backups = list((tmp_path / "backups").glob("*/hermes-agent-plugins-platforms-den_channels/adapter.py"))
+    assert len(backups) == 1
+    assert backups[0].read_text(encoding="utf-8") == "stale bundled source\n"
+
+
+def test_install_den_channels_plugin_can_skip_bundled_runtime_link(tmp_path: Path) -> None:
+    source = _write_source(tmp_path / "repo")
+    profile_root = tmp_path / "profiles"
+    runtime_root = tmp_path / "runtime-hermes"
+    bundled = runtime_root / "plugins" / "platforms" / "den_channels"
+    bundled.mkdir(parents=True)
+    (bundled / "adapter.py").write_text("keep me\n", encoding="utf-8")
+
+    rc = installer.main(
+        [
+            "--source",
+            str(source),
+            "--shared-root",
+            str(tmp_path / "shared"),
+            "--profile-root",
+            str(profile_root),
+            "--hermes-runtime-root",
+            str(runtime_root),
+            "--backup-root",
+            str(tmp_path / "backups"),
+            "--profile",
+            "den-hermes-runner",
+            "--skip-bundled-link",
+        ]
+    )
+
+    assert rc == 0
+    assert not bundled.is_symlink()
+    assert (bundled / "adapter.py").read_text(encoding="utf-8") == "keep me\n"
