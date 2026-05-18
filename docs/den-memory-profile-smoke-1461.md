@@ -11,10 +11,11 @@ This smoke is intentionally **opt-in and named-profile only**. It does not enabl
 The Hermes-side provider contract from #1457/#1459/#1460 is present in this branch, but the live Den Core memory REST surface expected by the provider is not reachable from this runner at the documented base URL during this smoke:
 
 - expected provider paths: `/api/v1/projects/{project_id}/memory/...`
-- tested live base URL in the smoke script: `http://192.168.1.10:5299`
-- result at smoke time: provider reports `den_unavailable`
+- original tested live base URL in the smoke script: `http://192.168.1.10:5299`
+- current runner-host live base URL: `http://192.168.1.10:18080/den-core-api`
+- original result at smoke time: provider reported `den_unavailable`
 
-Because of that, the first execution validates the Hermes-side profile/provider behavior with an in-process Den-memory-compatible HTTP server, and records the live endpoint gap explicitly. Do **not** treat the contract smoke as evidence that live Den Core memory entries are available until the live endpoint probe returns `ok`.
+The first execution validated the Hermes-side profile/provider behavior with an in-process Den-memory-compatible HTTP server and recorded the live endpoint gap explicitly. Task #1500 later aligned the provider with the live Den Core facade contract. For rollout, use only the current runner-host facade URL above and rerun the live smoke before treating Den Core memory as available.
 
 ## Explicit guinea-pig profiles
 
@@ -51,7 +52,7 @@ den_memory:
     - knowledge_base:den-memory-smoke
   default_write_space: assistant:<profile-name>
   rest:
-    base_url: http://192.168.1.10:5299
+    base_url: http://192.168.1.10:18080/den-core-api
     timeout_seconds: 10
     retry_attempts: 1
 ```
@@ -63,7 +64,7 @@ For `researcher`, omit the shared KB entries. For `reviewer` and `system-archite
 Run from the bridge checkout that contains the #1457/#1459/#1460 provider code and this #1461 script:
 
 ```bash
-python scripts/smoke_den_memory_profiles_1461.py --json
+python scripts/smoke_den_memory_profiles_1461.py --live-base-url http://192.168.1.10:18080/den-core-api --json
 ```
 
 The script checks:

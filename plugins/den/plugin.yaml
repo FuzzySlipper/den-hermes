@@ -1,0 +1,4 @@
+name: den
+version: 0.1.0
+description: "Den Core-backed explicit long-term memory provider for named Den guinea-pig profiles."
+kind: exclusive

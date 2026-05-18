@@ -308,7 +308,7 @@ def probe_live_endpoint(url: str) -> dict[str, Any]:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--profile-root", default="/home/agents/profiles")
-    parser.add_argument("--live-base-url", default="http://192.168.1.10:5299")
+    parser.add_argument("--live-base-url", default="http://192.168.1.10:18080/den-core-api")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
 
