@@ -117,7 +117,7 @@ async def test_explicit_delivery_metadata_keeps_queued_lane_contexts_distinct() 
     result = await adapter.send(
         first.source.chat_id,
         "first final reply",
-        metadata={"delivery_request_id": 501},
+        metadata={"delivery_request_id": 501, "notify": True},
     )
 
     assert result.success is True
@@ -129,7 +129,7 @@ async def test_explicit_delivery_metadata_keeps_queued_lane_contexts_distinct() 
     result = await adapter.send(
         second.source.chat_id,
         "second final reply",
-        metadata={"delivery_request_id": 502},
+        metadata={"delivery_request_id": 502, "notify": True},
     )
 
     assert result.success is True
@@ -137,6 +137,58 @@ async def test_explicit_delivery_metadata_keeps_queued_lane_contexts_distinct() 
     posted_payload = channels.posts[-1][1]
     assert posted_payload["sourceId"] == "502"
     assert posted_payload["dedupeKey"] == "gateway-delivery:502:final"
+
+
+@pytest.mark.asyncio
+async def test_assistant_content_before_tool_calls_is_interim_until_final_notify_send() -> None:
+    """Assistant text emitted before tool calls must not consume the final delivery.
+
+    Hermes' interim assistant callback can surface model text from an assistant
+    message that also has tool_calls. That send carries the delivery id but not
+    the final-response notification marker used by BasePlatformAdapter's normal
+    post-agent send path. Den Channels must keep it nonterminal so the later
+    completion summary can use the delivery's final dedupe key and mark the
+    Gateway delivery delivered exactly once.
+    """
+    gateway = FakeGatewayClient()
+    channels = FakeChannelsClient()
+    channels.messages = {
+        104: {"id": 104, "channelId": 42, "senderIdentity": "patch", "body": "approved go ahead"},
+    }
+    adapter = _adapter(gateway, channels)
+
+    event = await adapter.delivery_to_event(_delivery(604, 104, attempt_id=804))
+
+    interim = await adapter.send(
+        event.source.chat_id,
+        "Cleanup plan under the approval you just gave: ...",
+        metadata={"delivery_request_id": 604},
+    )
+
+    assert interim.success is True
+    assert gateway.delivered == []
+    assert len(channels.posts) == 1
+    interim_payload = channels.posts[-1][1]
+    assert interim_payload["sourceId"] == "604"
+    assert interim_payload["dedupeKey"] == "gateway-delivery:604:interim:804"
+    interim_metadata = json.loads(interim_payload["metadataJson"])
+    assert interim_metadata["delivery_stage"] == "interim"
+    assert interim_metadata["terminal_delivery"] is False
+
+    final = await adapter.send(
+        event.source.chat_id,
+        "Cleanup complete. Archived stale checkouts and stored the Den cleanup doc.",
+        metadata={"delivery_request_id": 604, "notify": True},
+    )
+
+    assert final.success is True
+    assert [item[0] for item in gateway.delivered] == [604]
+    final_payload = channels.posts[-1][1]
+    assert final_payload["sourceId"] == "604"
+    assert final_payload["dedupeKey"] == "gateway-delivery:604:final"
+    final_metadata = json.loads(final_payload["metadataJson"])
+    assert final_metadata["delivery_stage"] == "final"
+    assert final_metadata["terminal_delivery"] is True
 
 
 @pytest.mark.asyncio

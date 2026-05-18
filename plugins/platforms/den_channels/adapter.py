@@ -292,7 +292,26 @@ class DenChannelsAdapter(BasePlatformAdapter):
         if context is None:
             return SendResult(success=False, error="No Den Channels delivery context for reply")
 
-        delivery_stage = str((metadata or {}).get("delivery_stage") or "final").strip().lower()
+        metadata = metadata or {}
+        raw_delivery_stage = metadata.get("delivery_stage")
+        has_delivery_context = _coerce_int(_first(
+            metadata,
+            "delivery_request_id",
+            "deliveryRequestId",
+            "den_channels_delivery_request_id",
+            "denChannelsDeliveryRequestId",
+        )) is not None
+        if raw_delivery_stage is None and has_delivery_context and metadata.get("notify") is not True:
+            # Hermes can emit assistant text in the same model response as
+            # tool_calls. The gateway surfaces that through the interim
+            # assistant callback with delivery metadata, but without the
+            # final-response notify marker that BasePlatformAdapter adds only
+            # for the true post-agent response. Keep such messages nonterminal
+            # so they cannot consume ``gateway-delivery:<id>:final`` or mark the
+            # Den Gateway delivery delivered before tools finish.
+            delivery_stage = "interim"
+        else:
+            delivery_stage = str(raw_delivery_stage or "final").strip().lower()
         is_terminal_reply = delivery_stage in {"", "final"}
         dedupe_suffix = "final"
         completion_status = "reply_posted"
