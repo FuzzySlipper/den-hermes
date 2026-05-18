@@ -1,0 +1,43 @@
+name: den-channels-platform
+label: Den Channels
+kind: platform
+version: 0.1.0
+description: >
+  Native Den Channels Gateway adapter for durable Hermes sessions. Claims Den
+  Gateway deliveries, routes them through GatewayRunner/SessionStore, and posts
+  visible replies back to Den Channels with sourceKind=gateway_delivery.
+author: Hermes Agent contributors
+requires_env:
+  - name: DEN_GATEWAY_URL
+    description: "Den Gateway base URL used for delivery claims and completion audit"
+    prompt: "Den Gateway URL"
+    password: false
+  - name: DEN_CHANNELS_URL
+    description: "Den Channels service base URL used for visible channel messages"
+    prompt: "Den Channels URL"
+    password: false
+optional_env:
+  - name: DEN_GATEWAY_TOKEN
+    description: "Bearer token for Den Gateway APIs, if required"
+    prompt: "Den Gateway token"
+    password: true
+  - name: DEN_CHANNELS_TOKEN
+    description: "Bearer token for Den Channels APIs, if different from Den Gateway"
+    prompt: "Den Channels token"
+    password: true
+  - name: DEN_CHANNELS_PROJECT_ID
+    description: "Optional project scope for claimed Den Channels deliveries"
+    prompt: "Den Channels project id"
+    password: false
+  - name: DEN_CHANNELS_ADAPTER_INSTANCE_ID
+    description: "Stable adapter instance id; defaults to host:profile:role:gateway"
+    prompt: "Adapter instance id"
+    password: false
+  - name: DEN_CHANNELS_ALLOWED_USERS
+    description: "Comma-separated Den identities allowed for non-internal messages"
+    prompt: "Allowed Den users"
+    password: false
+  - name: DEN_CHANNELS_ALLOW_ALL_USERS
+    description: "Allow all Den users for non-internal messages"
+    prompt: "Allow all Den users? (true/false)"
+    password: false
