@@ -1,10 +1,15 @@
 from __future__ import annotations
 
 import json
+import socket
+import urllib.error
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
 from den_hermes.memory.config import DenMemoryConfig
+from den_hermes.memory.errors import DenUnavailableError
 
 
 @dataclass(frozen=True)
@@ -12,7 +17,7 @@ class DenMemoryRestClient:
     """Thin Den Core REST client for memory endpoints.
 
     Authentication is optional. When a token is resolved by the config both
-    ``Authorization: Bearer <token>`` and ``X-Den-Service-Token: <token>`` are
+    ``Authorization: Bearer *** and ``X-Den-Service-Token: <token>`` are
     injected on every request.  If no token is available the client operates in
     unauthenticated mode (appropriate for loopback / local dev).
     """
@@ -56,6 +61,39 @@ class DenMemoryRestClient:
         headers = self._build_headers()
         body = json.dumps(json_payload, default=str) if json_payload is not None else None
         return method, url, headers, body
+
+    def request(
+        self,
+        method: str,
+        path: str,
+        *,
+        json_payload: Mapping[str, Any] | None = None,
+    ) -> tuple[int, Any]:
+        """Send a request and return ``(status_code, parsed_json)``.
+
+        Raises ``DenUnavailableError`` on network/connection failures.
+        Raises ``urllib.error.HTTPError`` on HTTP 4xx/5xx responses.
+        """
+        method, url, headers, body = self._build_request(method, path, json_payload=json_payload)
+        req = urllib.request.Request(url, method=method, headers=headers)
+        if body is not None:
+            req.data = body.encode("utf-8")
+        try:
+            with urllib.request.urlopen(req, timeout=self.config.timeout_seconds) as resp:
+                raw = resp.read().decode("utf-8")
+                try:
+                    payload = json.loads(raw)
+                except json.JSONDecodeError as exc:
+                    raise DenUnavailableError(
+                        f"Den Core at {url} returned non-JSON: {exc}"
+                    ) from exc
+                return resp.status, payload
+        except urllib.error.HTTPError:
+            raise
+        except (urllib.error.URLError, socket.timeout, ConnectionError, OSError) as exc:
+            raise DenUnavailableError(
+                f"Den Core REST unreachable at {url}: {exc}"
+            ) from exc
 
     def __repr__(self) -> str:
         token_hint = "[REDACTED]" if self._token else "None"

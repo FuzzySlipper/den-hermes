@@ -32,6 +32,7 @@ class DenMemoryConfig:
     requested_by: str = ""
     run_id: str | None = None
     role: str = ""
+    task_id: int | None = None
 
     def resolve_token(self) -> str | None:
         """Return the bearer token, or ``None`` if unauthenticated.
@@ -68,5 +69,6 @@ class DenMemoryConfig:
             f"project_id={self.project_id!r}, "
             f"requested_by={self.requested_by!r}, "
             f"run_id={self.run_id!r}, "
-            f"role={self.role!r})"
+            f"role={self.role!r}, "
+            f"task_id={self.task_id!r})"
         )
