@@ -506,6 +506,17 @@ class DenChannelsAdapter(BasePlatformAdapter):
             "status_events": True,
             "source_kind": "gateway_delivery",
             "platform": _PLATFORM_NAME,
+            # Den Channels deliveries are internal Gateway events backed by
+            # durable delivery state.  The Hermes gateway must queue them while
+            # an agent is busy instead of interrupting or spending the final
+            # delivery reply handle on a visible busy ack.  Advertise that
+            # operator-visible state lives in the gateway status snapshot.
+            "busy_delivery_policy": "force_queue_internal_no_busy_ack",
+            "pending_delivery_observability": [
+                "gateway_status.active_sessions.queued_events",
+                "gateway_status.queued_events",
+            ],
+            "safe_pending_notifications": "status_only_no_mid_generation_injection",
         }
         return {
             "adapter_kind": "hermes_profile",
