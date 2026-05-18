@@ -45,6 +45,7 @@ class FakeChannelsClient:
     def __init__(self) -> None:
         self.messages: dict[int, dict[str, Any]] = {}
         self.posts: list[tuple[str | int, dict[str, Any]]] = []
+        self.reactions: list[tuple[str | int, dict[str, Any]]] = []
         self._next_post_id = 9000
 
     async def get_gateway_message(self, message_id: str | int) -> dict[str, Any]:
@@ -54,6 +55,16 @@ class FakeChannelsClient:
         self.posts.append((channel_id, payload))
         self._next_post_id += 1
         return {"id": self._next_post_id}
+
+    async def add_reaction(self, message_id: str | int, payload: dict[str, Any]) -> dict[str, Any]:
+        self.reactions.append((message_id, payload))
+        return {
+            "id": 77,
+            "channelMessageId": int(message_id),
+            "reactorType": payload["reactorType"],
+            "reactorIdentity": payload["reactorIdentity"],
+            "reactionKey": payload["reactionKey"],
+        }
 
 
 def _adapter(gateway: FakeGatewayClient, channels: FakeChannelsClient) -> DenChannelsAdapter:
@@ -189,6 +200,28 @@ async def test_assistant_content_before_tool_calls_is_interim_until_final_notify
     final_metadata = json.loads(final_payload["metadataJson"])
     assert final_metadata["delivery_stage"] == "final"
     assert final_metadata["terminal_delivery"] is True
+
+
+@pytest.mark.asyncio
+async def test_agent_can_react_without_posting_text_reply() -> None:
+    gateway = FakeGatewayClient()
+    channels = FakeChannelsClient()
+    adapter = _adapter(gateway, channels)
+
+    result = await adapter.react_to_message(1234, "✅")
+
+    assert result["channelMessageId"] == 1234
+    assert result["reactionKey"] == "✅"
+    assert channels.reactions == [(
+        1234,
+        {
+            "reactorType": "agent",
+            "reactorIdentity": "den-mcp-runner",
+            "reactionKey": "✅",
+        },
+    )]
+    assert channels.posts == []
+    assert gateway.delivered == []
 
 
 @pytest.mark.asyncio

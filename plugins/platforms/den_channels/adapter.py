@@ -194,6 +194,9 @@ class DenChannelsClient:
     async def post_channel_message(self, channel_id: str | int, payload: dict[str, Any]) -> dict[str, Any]:
         return await self._request("POST", f"/api/channels/{channel_id}/messages", payload)
 
+    async def add_reaction(self, message_id: str | int, payload: dict[str, Any]) -> dict[str, Any]:
+        return await self._request("POST", f"/api/channel-messages/{message_id}/reactions", payload)
+
 
 class DenChannelsAdapter(BasePlatformAdapter):
     """Den Channels platform adapter for long-running Hermes Gateway sessions."""
@@ -280,6 +283,25 @@ class DenChannelsAdapter(BasePlatformAdapter):
 
     async def get_chat_info(self, chat_id: str) -> dict[str, Any]:
         return {"id": chat_id, "name": chat_id, "type": "channel"}
+
+    async def react_to_message(self, message_id: str | int, reaction_key: str) -> dict[str, Any]:
+        """Add a bounded non-pulsing Den Channels reaction as this agent.
+
+        Reactions require an explicit Den Channels message id and emoji/key. They
+        create channel_reactions rows only; they do not post channel_messages and
+        therefore do not trigger Gateway wake fan-out.
+        """
+        message_int = _coerce_int(message_id)
+        reaction_text = str(reaction_key or "").strip()
+        if message_int is None or message_int <= 0:
+            raise ValueError("message_id must be a positive Den Channels message id")
+        if not reaction_text:
+            raise ValueError("reaction_key is required")
+        return await self.channels_client.add_reaction(message_int, {
+            "reactorType": "agent",
+            "reactorIdentity": self.agent_identity,
+            "reactionKey": reaction_text,
+        })
 
     async def send(
         self,
