@@ -9,11 +9,14 @@ assistant replies back to Den Channels as ``gateway_delivery`` messages.
 from __future__ import annotations
 
 import asyncio
+import contextvars
+import hashlib
 import inspect
 import json
 import logging
 import os
 import socket
+import threading
 from dataclasses import dataclass
 from typing import Any, Optional
 from urllib.parse import urlsplit
@@ -32,6 +35,15 @@ logger = logging.getLogger(__name__)
 
 _PLATFORM_NAME = "den_channels"
 _SECRET_KEY_FRAGMENTS = ("api_key", "apikey", "token", "secret", "password", "credential")
+_ACTIVITY_CONTEXT_ENV = "DEN_CHANNELS_ACTIVITY_CONTEXT"
+_ACTIVITY_CONTEXT_VAR: contextvars.ContextVar[dict[str, Any]] = contextvars.ContextVar(
+    "den_channels_activity_context",
+    default={},
+)
+_ACTIVITY_MAX_TEXT = 700
+_ACTIVITY_MAX_JSON = 1400
+_ACTIVITY_STATES: dict[str, dict[str, Any]] = {}
+_ACTIVITY_LOCK = threading.Lock()
 
 
 def _extra(config: PlatformConfig) -> dict[str, Any]:
@@ -92,9 +104,185 @@ def _redact(value: Any) -> Any:
         return [_redact(item) for item in value]
     if isinstance(value, str):
         text = value.strip()
-        if text == "***" or any(marker in text.lower() for marker in ("bearer ", "api_key", "token=")):
+        lowered = text.lower()
+        if text == "***" or any(marker in lowered for marker in ("bearer ", "api_key", "token=")):
             return "[REDACTED]"
     return value
+
+
+def _truncate_text(value: Any, limit: int = _ACTIVITY_MAX_TEXT) -> str:
+    text = str(value if value is not None else "")
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit - 18]}… [truncated]"
+
+
+def _safe_json_preview(value: Any, limit: int = _ACTIVITY_MAX_JSON) -> str:
+    redacted = _redact(value)
+    try:
+        text = json.dumps(redacted, ensure_ascii=False, sort_keys=True, default=str)
+    except Exception:
+        text = json.dumps(str(redacted), ensure_ascii=False)
+    return _truncate_text(text, limit)
+
+
+def _tool_name_from_kwargs(kwargs: dict[str, Any]) -> str:
+    for key in ("tool_name", "name", "function_name"):
+        value = kwargs.get(key)
+        if value:
+            return str(value)
+    tool_call = kwargs.get("tool_call")
+    if isinstance(tool_call, dict):
+        fn = tool_call.get("function")
+        if isinstance(fn, dict) and fn.get("name"):
+            return str(fn["name"])
+        if tool_call.get("name"):
+            return str(tool_call["name"])
+    return "tool"
+
+
+def _tool_args_from_kwargs(kwargs: dict[str, Any]) -> Any:
+    for key in ("args", "arguments", "tool_args"):
+        if key in kwargs:
+            return kwargs[key]
+    tool_call = kwargs.get("tool_call")
+    if isinstance(tool_call, dict):
+        fn = tool_call.get("function")
+        if isinstance(fn, dict) and "arguments" in fn:
+            raw = fn["arguments"]
+            if isinstance(raw, str):
+                try:
+                    return json.loads(raw)
+                except Exception:
+                    return raw
+            return raw
+    return {}
+
+
+def normalize_tool_activity(tool_name: str, args: Any, *, status: str = "started", count: int = 1, duration_ms: int | None = None) -> dict[str, Any]:
+    """Normalize a Hermes tool call into a bounded Den activity payload."""
+    safe_name = _truncate_text(tool_name or "tool", 120)
+    preview = _safe_json_preview(args)
+    suffix = f" ×{count}" if count > 1 else ""
+    summary = f"{safe_name}{suffix}: {preview}"
+    metadata: dict[str, Any] = {"tool_name": safe_name, "count": count}
+    if duration_ms is not None:
+        metadata["duration_ms"] = duration_ms
+    event_type = {
+        "started": "tool_call_started",
+        "completed": "tool_call_completed",
+        "failed": "tool_call_failed",
+    }.get(status, "tool_call_started")
+    return {
+        "eventType": event_type,
+        "status": status,
+        "title": safe_name,
+        "summary": _truncate_text(summary, 1000),
+        "previewJson": preview,
+        "metadataJson": _safe_json_preview(metadata),
+    }
+
+
+def _activity_context() -> dict[str, Any]:
+    context = _ACTIVITY_CONTEXT_VAR.get({})
+    if context:
+        return dict(context)
+    return _json_obj(os.getenv(_ACTIVITY_CONTEXT_ENV, ""))
+
+
+def _activity_state_key(context: dict[str, Any]) -> str:
+    return str(context.get("deliveryRequestId") or context.get("delivery_request_id") or context.get("sessionKey") or "")
+
+
+def _emit_activity_event(context: dict[str, Any], payload: dict[str, Any]) -> None:
+    gateway_url = str(context.get("gatewayUrl") or context.get("gateway_url") or "").rstrip("/")
+    channel_id = context.get("channelId") or context.get("channel_id")
+    if not gateway_url or not channel_id:
+        return
+    request_payload = {
+        "channelId": str(channel_id),
+        "projectId": context.get("projectId") or context.get("project_id"),
+        "agentIdentity": context.get("agentIdentity") or context.get("agent_identity") or "hermes",
+        "deliveryRequestId": str(context.get("deliveryRequestId") or context.get("delivery_request_id") or "") or None,
+        "hermesSessionKey": context.get("hermesSessionKey") or context.get("sessionKey") or context.get("session_key"),
+        "taskId": _coerce_int(context.get("taskId") or context.get("task_id")),
+        "threadId": _coerce_int(context.get("threadId") or context.get("thread_id")),
+        "anchorMessageId": _coerce_int(context.get("anchorMessageId") or context.get("anchor_message_id")),
+        **payload,
+    }
+    headers = {"Content-Type": "application/json"}
+    token = str(context.get("token") or "").strip()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    try:
+        import httpx
+
+        with httpx.Client(timeout=2.0) as client:
+            response = client.post(f"{gateway_url}/api/channel-activity-events", json=request_payload, headers=headers)
+            response.raise_for_status()
+    except Exception:
+        logger.debug("[DenChannels] activity event emission failed", exc_info=True)
+
+
+def _on_pre_tool_call(**kwargs: Any) -> None:
+    context = _activity_context()
+    key = _activity_state_key(context)
+    if not key:
+        return
+    tool_name = _tool_name_from_kwargs(kwargs)
+    args = _tool_args_from_kwargs(kwargs)
+    preview = _safe_json_preview(args)
+    signature = (tool_name, preview)
+    tool_call_id = str(kwargs.get("tool_call_id") or kwargs.get("call_id") or "")
+    with _ACTIVITY_LOCK:
+        state = _ACTIVITY_STATES.setdefault(key, {"sequence": 0, "last": None, "calls": {}})
+        if state.get("last") and state["last"].get("signature") == signature:
+            item = state["last"]
+            item["count"] += 1
+        else:
+            state["sequence"] += 1
+            sequence = state["sequence"]
+            digest = hashlib.sha1(f"{key}:{sequence}:{tool_name}:{preview}".encode()).hexdigest()[:12]
+            item = {
+                "signature": signature,
+                "count": 1,
+                "sequence": sequence,
+                "dedupeKey": f"activity:{key}:tool:{sequence}:{digest}",
+            }
+            state["last"] = item
+        if tool_call_id:
+            state["calls"][tool_call_id] = item
+        payload = normalize_tool_activity(tool_name, args, status="started", count=item["count"])
+        payload.update({"sequence": item["sequence"], "dedupeKey": item["dedupeKey"]})
+    try:
+        _emit_activity_event(context, payload)
+    except Exception:
+        logger.debug("[DenChannels] pre-tool activity hook failed", exc_info=True)
+
+
+def _on_post_tool_call(**kwargs: Any) -> None:
+    context = _activity_context()
+    key = _activity_state_key(context)
+    if not key:
+        return
+    tool_name = _tool_name_from_kwargs(kwargs)
+    args = _tool_args_from_kwargs(kwargs)
+    tool_call_id = str(kwargs.get("tool_call_id") or kwargs.get("call_id") or "")
+    error = kwargs.get("error") or kwargs.get("exception")
+    status = "failed" if error else "completed"
+    duration_ms = _coerce_int(kwargs.get("duration_ms") or kwargs.get("elapsed_ms"))
+    with _ACTIVITY_LOCK:
+        state = _ACTIVITY_STATES.get(key) or {}
+        item = (state.get("calls") or {}).get(tool_call_id) if tool_call_id else None
+        item = item or state.get("last")
+        if not item:
+            return
+        payload = normalize_tool_activity(tool_name, args, status=status, count=item.get("count", 1), duration_ms=duration_ms)
+        payload.update({"sequence": item["sequence"], "dedupeKey": item["dedupeKey"]})
+    try:
+        _emit_activity_event(context, payload)
+    except Exception:
+        logger.debug("[DenChannels] post-tool activity hook failed", exc_info=True)
 
 
 def _is_private_url(url: str) -> bool:
@@ -520,25 +708,55 @@ class DenChannelsAdapter(BasePlatformAdapter):
 
     async def on_processing_start(self, event: MessageEvent) -> None:
         self.set_delivery_context(event)
+        context = self._context_for_event(event)
+        if context is not None:
+            self._set_activity_environment(context)
 
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
         task = asyncio.current_task()
         context = self._contexts_by_task.get(task) if task is not None else None
-        if getattr(outcome, "value", outcome) == ProcessingOutcome.SUCCESS.value:
-            # A claimed Den delivery needs a terminal Den state.  If the
-            # Gateway handler returned no visible response, BasePlatformAdapter
-            # classifies local processing as success, but there was no
-            # gateway_delivery final message and therefore nothing to mark
-            # delivered.  Fail the claim explicitly so Den can retry/escalate
-            # instead of leaving it claimed forever.
+        try:
+            if getattr(outcome, "value", outcome) == ProcessingOutcome.SUCCESS.value:
+                # A claimed Den delivery needs a terminal Den state.  If the
+                # Gateway handler returned no visible response, BasePlatformAdapter
+                # classifies local processing as success, but there was no
+                # gateway_delivery final message and therefore nothing to mark
+                # delivered.  Fail the claim explicitly so Den can retry/escalate
+                # instead of leaving it claimed forever.
+                if context is not None:
+                    await self._mark_failed(context, "processing_no_response", event.raw_message)
+                    self._clear_context(context)
+                return
+            context = self._build_context(event) or context or self._context_for_event(event)
             if context is not None:
-                await self._mark_failed(context, "processing_no_response", event.raw_message)
+                await self._mark_failed(context, f"processing_{getattr(outcome, 'value', outcome)}", event.raw_message)
                 self._clear_context(context)
-            return
-        context = self._build_context(event) or context or self._context_for_event(event)
+        finally:
+            self._clear_activity_environment(context)
+
+    def _set_activity_environment(self, context: _DeliveryContext) -> None:
+        payload = {
+            "gatewayUrl": self.gateway_url,
+            "token": self.gateway_client.token if isinstance(self.gateway_client, DenGatewayClient) else None,
+            "channelId": context.channel_id,
+            "projectId": context.project_id,
+            "agentIdentity": self.agent_identity,
+            "deliveryRequestId": context.delivery_request_id,
+            "hermesSessionKey": context.session_key,
+            "taskId": _coerce_int(_first(context.raw_delivery, "task_id", "taskId")),
+            "threadId": _coerce_int(_first(context.raw_delivery, "thread_id", "threadId")),
+            "anchorMessageId": context.trigger_message_id,
+        }
+        _ACTIVITY_CONTEXT_VAR.set(payload)
+        with _ACTIVITY_LOCK:
+            _ACTIVITY_STATES.pop(_activity_state_key(payload), None)
+
+    def _clear_activity_environment(self, context: _DeliveryContext | None) -> None:
         if context is not None:
-            await self._mark_failed(context, f"processing_{getattr(outcome, 'value', outcome)}", event.raw_message)
-            self._clear_context(context)
+            with _ACTIVITY_LOCK:
+                _ACTIVITY_STATES.pop(str(context.delivery_request_id), None)
+        _ACTIVITY_CONTEXT_VAR.set({})
+        os.environ.pop(_ACTIVITY_CONTEXT_ENV, None)
 
     def _binding_payload(self) -> dict[str, Any]:
         capabilities = {
@@ -676,6 +894,10 @@ class DenChannelsAdapter(BasePlatformAdapter):
 
     def _clear_context(self, context: _DeliveryContext) -> None:
         """Remove only mappings that still point at this delivery context."""
+        active_activity_context = _activity_context()
+        if active_activity_context:
+            if str(active_activity_context.get("deliveryRequestId") or "") == str(context.delivery_request_id):
+                self._clear_activity_environment(context)
         chat_id = f"project:{context.project_id}:channel:{context.channel_id}"
         if self._contexts_by_session.get(context.session_key) is context:
             self._contexts_by_session.pop(context.session_key, None)
@@ -754,6 +976,8 @@ def validate_config(config: PlatformConfig) -> bool:
 
 def register(ctx: Any) -> None:
     """Plugin entry point: called by the Hermes plugin system."""
+    ctx.register_hook("pre_tool_call", _on_pre_tool_call)
+    ctx.register_hook("post_tool_call", _on_post_tool_call)
     ctx.register_platform(
         name=_PLATFORM_NAME,
         label="Den Channels",

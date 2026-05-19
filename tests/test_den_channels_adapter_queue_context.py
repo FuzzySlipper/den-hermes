@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -17,6 +19,12 @@ _adapter_module = importlib.util.module_from_spec(_SPEC)
 sys.modules[_SPEC.name] = _adapter_module
 _SPEC.loader.exec_module(_adapter_module)
 DenChannelsAdapter = _adapter_module.DenChannelsAdapter
+normalize_tool_activity = _adapter_module.normalize_tool_activity
+_on_pre_tool_call = _adapter_module._on_pre_tool_call
+_on_post_tool_call = _adapter_module._on_post_tool_call
+_ACTIVITY_CONTEXT_ENV = _adapter_module._ACTIVITY_CONTEXT_ENV
+_ACTIVITY_CONTEXT_VAR = _adapter_module._ACTIVITY_CONTEXT_VAR
+_ACTIVITY_STATES = _adapter_module._ACTIVITY_STATES
 
 
 class FakeGatewayClient:
@@ -222,6 +230,173 @@ async def test_agent_can_react_without_posting_text_reply() -> None:
     )]
     assert channels.posts == []
     assert gateway.delivered == []
+
+
+@pytest.mark.asyncio
+async def test_activity_environment_is_bound_to_delivery_context(monkeypatch: pytest.MonkeyPatch) -> None:
+    gateway = FakeGatewayClient()
+    channels = FakeChannelsClient()
+    channels.messages = {
+        110: {"id": 110, "channelId": 42, "senderIdentity": "patch", "body": "please work"},
+    }
+    adapter = _adapter(gateway, channels)
+    event = await adapter.delivery_to_event({
+        **_delivery(701, 110, attempt_id=901),
+        "task_id": 1528,
+        "thread_id": 6448,
+    })
+
+    assert _ACTIVITY_CONTEXT_ENV not in os.environ
+    await adapter.on_processing_start(event)
+    assert _ACTIVITY_CONTEXT_ENV not in os.environ
+    context = _adapter_module._activity_context()
+    assert context["channelId"] == 42
+    assert context["deliveryRequestId"] == 701
+    assert context["agentIdentity"] == "den-mcp-runner"
+    assert context["taskId"] == 1528
+    assert context["hermesSessionKey"] == "agent:main:den_channels:channel:project:den-hermes-bridge:channel:42"
+
+    await adapter.on_processing_complete(event, _adapter_module.ProcessingOutcome.FAILURE)
+    assert _ACTIVITY_CONTEXT_ENV not in os.environ
+    assert _adapter_module._activity_context() == {}
+
+
+def test_activity_emitter_preserves_hermes_session_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    posted: list[dict[str, Any]] = []
+
+    class FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+    class FakeClient:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        def __enter__(self) -> "FakeClient":
+            return self
+
+        def __exit__(self, *args: Any) -> None:
+            return None
+
+        def post(self, url: str, *, json: dict[str, Any], headers: dict[str, str]) -> FakeResponse:
+            posted.append(json)
+            return FakeResponse()
+
+    class FakeHttpx:
+        Client = FakeClient
+
+    monkeypatch.setitem(sys.modules, "httpx", FakeHttpx)
+
+    _adapter_module._emit_activity_event(
+        {
+            "gatewayUrl": "http://gateway.test",
+            "channelId": 42,
+            "projectId": "den-hermes-bridge",
+            "agentIdentity": "den-mcp-runner",
+            "deliveryRequestId": 701,
+            "hermesSessionKey": "project:den-hermes-bridge:channel:42",
+        },
+        normalize_tool_activity("terminal", {"command": "date"}),
+    )
+
+    assert posted[0]["hermesSessionKey"] == "project:den-hermes-bridge:channel:42"
+
+
+@pytest.mark.asyncio
+async def test_tool_activity_context_is_isolated_between_concurrent_deliveries(monkeypatch: pytest.MonkeyPatch) -> None:
+    emitted: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    monkeypatch.setattr(
+        _adapter_module,
+        "_emit_activity_event",
+        lambda context, payload: emitted.append((dict(context), dict(payload))),
+    )
+    _ACTIVITY_STATES.clear()
+    _ACTIVITY_CONTEXT_VAR.set({})
+
+    async def run_delivery(delivery_id: int, session_key: str, tool_name: str) -> None:
+        _ACTIVITY_CONTEXT_VAR.set({
+            "gatewayUrl": "http://gateway.test",
+            "channelId": 42,
+            "projectId": "den-hermes-bridge",
+            "agentIdentity": "den-mcp-runner",
+            "deliveryRequestId": delivery_id,
+            "hermesSessionKey": session_key,
+        })
+        await asyncio.sleep(0)
+        _on_pre_tool_call(tool_name=tool_name, args={"name": tool_name}, tool_call_id=f"call-{delivery_id}")
+        await asyncio.sleep(0)
+        _on_post_tool_call(tool_name=tool_name, args={"name": tool_name}, tool_call_id=f"call-{delivery_id}")
+
+    await asyncio.gather(
+        run_delivery(701, "session-a", "terminal"),
+        run_delivery(702, "session-b", "skill_view"),
+    )
+
+    contexts_by_delivery = {
+        context["deliveryRequestId"]: context["hermesSessionKey"]
+        for context, _payload in emitted
+    }
+    assert contexts_by_delivery == {701: "session-a", 702: "session-b"}
+
+
+def test_tool_activity_normalization_redacts_truncates_and_counts() -> None:
+    activity = normalize_tool_activity(
+        "terminal",
+        {"command": "python - <<'PY'\n" + "x" * 3000, "api_token": "super-secret"},
+        status="started",
+        count=2,
+    )
+
+    assert activity["eventType"] == "tool_call_started"
+    assert activity["status"] == "started"
+    assert activity["title"] == "terminal"
+    assert "×2" in activity["summary"]
+    assert "[REDACTED]" in activity["previewJson"]
+    assert "super-secret" not in activity["previewJson"]
+    assert len(activity["previewJson"]) <= 1400
+
+
+def test_tool_activity_hooks_coalesce_adjacent_duplicate_calls(monkeypatch: pytest.MonkeyPatch) -> None:
+    emitted: list[dict[str, Any]] = []
+    monkeypatch.setenv(_ACTIVITY_CONTEXT_ENV, json.dumps({
+        "gatewayUrl": "http://gateway.test",
+        "channelId": 42,
+        "projectId": "den-hermes-bridge",
+        "agentIdentity": "den-mcp-runner",
+        "deliveryRequestId": 1528,
+        "sessionKey": "session-1528",
+    }))
+    monkeypatch.setattr(_adapter_module, "_emit_activity_event", lambda context, payload: emitted.append(payload))
+    _ACTIVITY_STATES.clear()
+
+    _on_pre_tool_call(tool_name="skill_view", args={"name": "den-mcp"}, tool_call_id="call-1")
+    _on_pre_tool_call(tool_name="skill_view", args={"name": "den-mcp"}, tool_call_id="call-2")
+    _on_post_tool_call(tool_name="skill_view", args={"name": "den-mcp"}, tool_call_id="call-2", duration_ms=12)
+
+    assert len(emitted) == 3
+    assert emitted[0]["sequence"] == emitted[1]["sequence"] == emitted[2]["sequence"]
+    assert emitted[0]["dedupeKey"] == emitted[1]["dedupeKey"] == emitted[2]["dedupeKey"]
+    assert "×2" in emitted[1]["summary"]
+    assert emitted[-1]["status"] == "completed"
+    assert "duration_ms" in emitted[-1]["metadataJson"]
+
+
+def test_tool_activity_hook_failures_are_isolated(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(_ACTIVITY_CONTEXT_ENV, json.dumps({
+        "gatewayUrl": "http://gateway.test",
+        "channelId": 42,
+        "deliveryRequestId": 1528,
+        "sessionKey": "session-1528",
+    }))
+
+    def boom(context: dict[str, Any], payload: dict[str, Any]) -> None:
+        raise RuntimeError("activity sink down")
+
+    monkeypatch.setattr(_adapter_module, "_emit_activity_event", boom)
+    _ACTIVITY_STATES.clear()
+
+    # Hook errors must not bubble into Hermes tool execution.
+    _on_pre_tool_call(tool_name="terminal", args={"command": "date"}, tool_call_id="call-3")
 
 
 @pytest.mark.asyncio
