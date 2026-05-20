@@ -389,6 +389,16 @@ class DenChannelsClient:
 class DenChannelsAdapter(BasePlatformAdapter):
     """Den Channels platform adapter for long-running Hermes Gateway sessions."""
 
+    # Den Channels is append-only from the Hermes gateway's point of view: the
+    # durable transcript should receive one terminal gateway_delivery message at
+    # the end of a delivery, while tool/status/interim text is represented as
+    # nonterminal activity/progress.  Do not let Hermes' generic token-streaming
+    # consumer create/edit normal channel messages, because its first pre-tool
+    # assistant chunk can otherwise be mistaken for the terminal reply and make
+    # the real post-tool answer get suppressed by the gateway duplicate-send
+    # guard.
+    SUPPORTS_MESSAGE_EDITING = False
+
     def __init__(
         self,
         config: PlatformConfig,
@@ -504,21 +514,16 @@ class DenChannelsAdapter(BasePlatformAdapter):
 
         metadata = metadata or {}
         raw_delivery_stage = metadata.get("delivery_stage")
-        has_delivery_context = _coerce_int(_first(
-            metadata,
-            "delivery_request_id",
-            "deliveryRequestId",
-            "den_channels_delivery_request_id",
-            "denChannelsDeliveryRequestId",
-        )) is not None
-        if raw_delivery_stage is None and has_delivery_context and metadata.get("notify") is not True:
+        if raw_delivery_stage is None and context is not None and metadata.get("notify") is not True:
             # Hermes can emit assistant text in the same model response as
             # tool_calls. The gateway surfaces that through the interim
-            # assistant callback with delivery metadata, but without the
-            # final-response notify marker that BasePlatformAdapter adds only
-            # for the true post-agent response. Keep such messages nonterminal
-            # so they cannot consume ``gateway-delivery:<id>:final`` or mark the
-            # Den Gateway delivery delivered before tools finish.
+            # assistant callback with either explicit delivery metadata or only
+            # lane/thread metadata.  _context_for_send() resolves both shapes to
+            # a Den delivery context, but only the true post-agent response gets
+            # the final-response notify marker from BasePlatformAdapter.  Keep
+            # unmarked sends nonterminal so they cannot consume
+            # ``gateway-delivery:<id>:final`` or mark the Den Gateway delivery
+            # delivered before tools finish.
             delivery_stage = "interim"
         else:
             delivery_stage = str(raw_delivery_stage or "final").strip().lower()

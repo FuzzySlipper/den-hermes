@@ -11,6 +11,7 @@ from typing import Any
 import pytest
 
 from gateway.config import PlatformConfig
+from gateway.platform_registry import PlatformEntry, platform_registry
 
 _ADAPTER_PATH = Path(__file__).resolve().parents[1] / "plugins" / "platforms" / "den_channels" / "adapter.py"
 _SPEC = importlib.util.spec_from_file_location("den_channels_adapter_under_test", _ADAPTER_PATH)
@@ -25,6 +26,13 @@ _on_post_tool_call = _adapter_module._on_post_tool_call
 _ACTIVITY_CONTEXT_ENV = _adapter_module._ACTIVITY_CONTEXT_ENV
 _ACTIVITY_CONTEXT_VAR = _adapter_module._ACTIVITY_CONTEXT_VAR
 _ACTIVITY_STATES = _adapter_module._ACTIVITY_STATES
+
+platform_registry.register(PlatformEntry(
+    name="den_channels",
+    label="Den Channels",
+    adapter_factory=lambda cfg: None,
+    check_fn=lambda: True,
+))
 
 
 class FakeGatewayClient:
@@ -208,6 +216,65 @@ async def test_assistant_content_before_tool_calls_is_interim_until_final_notify
     final_metadata = json.loads(final_payload["metadataJson"])
     assert final_metadata["delivery_stage"] == "final"
     assert final_metadata["terminal_delivery"] is True
+
+
+@pytest.mark.asyncio
+async def test_lane_context_without_explicit_delivery_metadata_is_interim_until_notify_send() -> None:
+    """Thread-only gateway metadata must not make pre-tool text terminal.
+
+    The live Gateway stream/interim paths often call adapter.send() with only
+    the lane metadata returned by _thread_metadata_for_source() rather than a
+    delivery_request_id. The adapter can still resolve the active Den delivery
+    from its lane context, so lack of explicit delivery metadata must not fall
+    back to gateway-delivery:<id>:final unless BasePlatformAdapter marked the
+    true final send with notify=True.
+    """
+    gateway = FakeGatewayClient()
+    channels = FakeChannelsClient()
+    channels.messages = {
+        105: {
+            "id": 105,
+            "channelId": 42,
+            "senderIdentity": "patch",
+            "body": "please check the task",
+            "threadRootMessageId": 5005,
+        },
+    }
+    adapter = _adapter(gateway, channels)
+
+    event = await adapter.delivery_to_event(_delivery(605, 105, attempt_id=805))
+
+    interim = await adapter.send(
+        event.source.chat_id,
+        "I’ll check Den and then report back.",
+        metadata={"thread_id": event.source.thread_id},
+    )
+
+    assert interim.success is True
+    assert gateway.delivered == []
+    interim_payload = channels.posts[-1][1]
+    assert interim_payload["dedupeKey"] == "gateway-delivery:605:interim:805"
+    interim_metadata = json.loads(interim_payload["metadataJson"])
+    assert interim_metadata["delivery_stage"] == "interim"
+    assert interim_metadata["terminal_delivery"] is False
+
+    final = await adapter.send(
+        event.source.chat_id,
+        "Done: the task is open and assigned to runner.",
+        metadata={"thread_id": event.source.thread_id, "notify": True},
+    )
+
+    assert final.success is True
+    assert [item[0] for item in gateway.delivered] == [605]
+    final_payload = channels.posts[-1][1]
+    assert final_payload["dedupeKey"] == "gateway-delivery:605:final"
+    final_metadata = json.loads(final_payload["metadataJson"])
+    assert final_metadata["delivery_stage"] == "final"
+    assert final_metadata["terminal_delivery"] is True
+
+
+def test_den_channels_disables_generic_message_edit_streaming() -> None:
+    assert DenChannelsAdapter.SUPPORTS_MESSAGE_EDITING is False
 
 
 @pytest.mark.asyncio
