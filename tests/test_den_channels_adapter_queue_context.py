@@ -369,6 +369,100 @@ def test_activity_emitter_preserves_hermes_session_key(monkeypatch: pytest.Monke
     assert posted[0]["hermesSessionKey"] == "project:den-hermes-bridge:channel:42"
 
 
+def test_activity_emitter_forwards_spawned_worker_context(monkeypatch: pytest.MonkeyPatch) -> None:
+    posted: list[dict[str, Any]] = []
+
+    class FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+    class FakeClient:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        def __enter__(self) -> "FakeClient":
+            return self
+
+        def __exit__(self, *args: Any) -> None:
+            return None
+
+        def post(self, url: str, *, json: dict[str, Any], headers: dict[str, str]) -> FakeResponse:
+            posted.append(json)
+            assert headers["Authorization"] == "Bearer parent-token"
+            return FakeResponse()
+
+    class FakeHttpx:
+        Client = FakeClient
+
+    monkeypatch.setitem(sys.modules, "httpx", FakeHttpx)
+
+    _adapter_module._emit_activity_event(
+        {
+            "gatewayUrl": "http://gateway.test",
+            "channelId": 42,
+            "projectId": "den-hermes-bridge",
+            "taskId": 1565,
+            "threadId": 9001,
+            "agentIdentity": "den-coder-profile",
+            "deliveryRequestId": 701,
+            "displayBlockId": "block-701",
+            "parentHermesSessionKey": "parent-session",
+            "parentAgentIdentity": "den-mcp-runner",
+            "workerRunId": "coder-run-1",
+            "workerRole": "coder",
+            "token": "parent-token",
+        },
+        normalize_tool_activity("terminal", {"command": "date"}),
+    )
+
+    event = posted[0]
+    assert event["displayBlockId"] == "block-701"
+    assert event["parentHermesSessionKey"] == "parent-session"
+    assert event["parentAgentIdentity"] == "den-mcp-runner"
+    assert event["workerRunId"] == "coder-run-1"
+    assert event["workerRole"] == "coder"
+    metadata = json.loads(event["metadataJson"])
+    assert metadata["workerRunId"] == "coder-run-1"
+    assert metadata["workerRole"] == "coder"
+
+
+def test_spawned_worker_activity_streams_and_dedupe_are_worker_scoped(monkeypatch: pytest.MonkeyPatch) -> None:
+    emitted: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    monkeypatch.setattr(
+        _adapter_module,
+        "_emit_activity_event",
+        lambda context, payload: emitted.append((dict(context), dict(payload))),
+    )
+    _ACTIVITY_STATES.clear()
+    _ACTIVITY_CONTEXT_VAR.set({})
+
+    base = {
+        "gatewayUrl": "http://gateway.test",
+        "channelId": 42,
+        "displayBlockId": "block-701",
+        "workerRole": "coder",
+    }
+    first = {**base, "workerRunId": "worker-a"}
+    second = {**base, "workerRunId": "worker-b"}
+
+    _ACTIVITY_CONTEXT_VAR.set(first)
+    _on_pre_tool_call(tool_name="terminal", args={"command": "date"}, tool_call_id="a-1")
+    _ACTIVITY_CONTEXT_VAR.set(second)
+    _on_pre_tool_call(tool_name="terminal", args={"command": "date"}, tool_call_id="b-1")
+    _ACTIVITY_CONTEXT_VAR.set(first)
+    _on_pre_tool_call(tool_name="read_file", args={"path": "README.md"}, tool_call_id="a-2")
+
+    payloads_by_worker = {}
+    for context, payload in emitted:
+        payloads_by_worker.setdefault(context["workerRunId"], []).append(payload)
+
+    assert [payload["sequence"] for payload in payloads_by_worker["worker-a"]] == [1, 2]
+    assert [payload["sequence"] for payload in payloads_by_worker["worker-b"]] == [1]
+    assert payloads_by_worker["worker-a"][0]["dedupeKey"] == "activity:block-701:worker-a:coder:tool:1"
+    assert payloads_by_worker["worker-b"][0]["dedupeKey"] == "activity:block-701:worker-b:coder:tool:1"
+    assert payloads_by_worker["worker-a"][1]["dedupeKey"] == "activity:block-701:worker-a:coder:tool:2"
+
+
 @pytest.mark.asyncio
 async def test_tool_activity_context_is_isolated_between_concurrent_deliveries(monkeypatch: pytest.MonkeyPatch) -> None:
     emitted: list[tuple[dict[str, Any], dict[str, Any]]] = []

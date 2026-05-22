@@ -191,7 +191,35 @@ def _activity_context() -> dict[str, Any]:
 
 
 def _activity_state_key(context: dict[str, Any]) -> str:
+    display_block_id = context.get("displayBlockId") or context.get("display_block_id")
+    worker_run_id = context.get("workerRunId") or context.get("worker_run_id")
+    worker_role = context.get("workerRole") or context.get("worker_role")
+    if display_block_id and worker_run_id and worker_role:
+        return f"display:{display_block_id}:worker:{worker_run_id}:role:{worker_role}"
     return str(context.get("deliveryRequestId") or context.get("delivery_request_id") or context.get("sessionKey") or "")
+
+
+def _activity_dedupe_key(context: dict[str, Any], *, state_key: str, sequence: int, tool_name: str, preview: str) -> str:
+    display_block_id = context.get("displayBlockId") or context.get("display_block_id")
+    worker_run_id = context.get("workerRunId") or context.get("worker_run_id")
+    worker_role = context.get("workerRole") or context.get("worker_role")
+    if display_block_id and worker_run_id and worker_role:
+        return f"activity:{display_block_id}:{worker_run_id}:{worker_role}:tool:{sequence}"
+    digest = hashlib.sha1(f"{state_key}:{sequence}:{tool_name}:{preview}".encode()).hexdigest()[:12]
+    return f"activity:{state_key}:tool:{sequence}:{digest}"
+
+
+def _json_dict_from_payload(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return dict(value)
+    if isinstance(value, str) and value.strip():
+        try:
+            loaded = json.loads(value)
+        except Exception:
+            return {}
+        if isinstance(loaded, dict):
+            return loaded
+    return {}
 
 
 def _emit_activity_event(context: dict[str, Any], payload: dict[str, Any]) -> None:
@@ -210,6 +238,21 @@ def _emit_activity_event(context: dict[str, Any], payload: dict[str, Any]) -> No
         "anchorMessageId": _coerce_int(context.get("anchorMessageId") or context.get("anchor_message_id")),
         **payload,
     }
+    forwarded = {
+        "displayBlockId": context.get("displayBlockId") or context.get("display_block_id"),
+        "parentHermesSessionKey": context.get("parentHermesSessionKey") or context.get("parent_hermes_session_key"),
+        "parentAgentIdentity": context.get("parentAgentIdentity") or context.get("parent_agent_identity"),
+        "workerRunId": context.get("workerRunId") or context.get("worker_run_id"),
+        "workerRole": context.get("workerRole") or context.get("worker_role"),
+    }
+    request_payload.update({key: value for key, value in forwarded.items() if value not in {None, ""}})
+    metadata = _json_dict_from_payload(request_payload.get("metadataJson"))
+    if forwarded["workerRunId"] not in {None, ""}:
+        metadata["workerRunId"] = forwarded["workerRunId"]
+    if forwarded["workerRole"] not in {None, ""}:
+        metadata["workerRole"] = forwarded["workerRole"]
+    if metadata:
+        request_payload["metadataJson"] = _safe_json_preview(metadata)
     headers = {"Content-Type": "application/json"}
     token = str(context.get("token") or "").strip()
     if token:
@@ -242,12 +285,17 @@ def _on_pre_tool_call(**kwargs: Any) -> None:
         else:
             state["sequence"] += 1
             sequence = state["sequence"]
-            digest = hashlib.sha1(f"{key}:{sequence}:{tool_name}:{preview}".encode()).hexdigest()[:12]
             item = {
                 "signature": signature,
                 "count": 1,
                 "sequence": sequence,
-                "dedupeKey": f"activity:{key}:tool:{sequence}:{digest}",
+                "dedupeKey": _activity_dedupe_key(
+                    context,
+                    state_key=key,
+                    sequence=sequence,
+                    tool_name=tool_name,
+                    preview=preview,
+                ),
             }
             state["last"] = item
         if tool_call_id:

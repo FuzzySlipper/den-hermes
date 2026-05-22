@@ -53,6 +53,7 @@ def run_hermes_worker(
     toolsets: Sequence[str] | None = None,
     cwd: str | Path | None = None,
     env_overrides: Mapping[str, str] | None = None,
+    activity_context: Mapping[str, Any] | None = None,
     timeout_seconds: int = 300,
 ) -> HermesWorkerResult:
     """Run a Hermes worker process and verify its completion artifact.
@@ -70,6 +71,8 @@ def run_hermes_worker(
         toolsets=toolsets,
     )
     env = os.environ.copy()
+    if env_overrides:
+        env.update(env_overrides)
     env.update(
         {
             "DEN_TASK_ID": str(task_id),
@@ -80,8 +83,11 @@ def run_hermes_worker(
     )
     if project_id:
         env["DEN_PROJECT_ID"] = project_id
-    if env_overrides:
-        env.update(env_overrides)
+    if activity_context:
+        child_context = dict(activity_context)
+        child_context["workerRunId"] = run_id
+        child_context["workerRole"] = role
+        env["DEN_CHANNELS_ACTIVITY_CONTEXT"] = json.dumps(child_context, sort_keys=True, default=str)
 
     try:
         completed = subprocess.run(

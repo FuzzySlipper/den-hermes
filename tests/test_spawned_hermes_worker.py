@@ -40,11 +40,14 @@ entry = {
         "DEN_WORKER_ROLE": role,
         "DEN_EXPECTED_ARTIFACT": os.environ.get("DEN_EXPECTED_ARTIFACT"),
         "DEN_PROJECT_ID": os.environ.get("DEN_PROJECT_ID"),
+        "DEN_CHANNELS_ACTIVITY_CONTEXT": os.environ.get("DEN_CHANNELS_ACTIVITY_CONTEXT"),
     },
 }
 with log_path.open("a") as log_file:
     if entry["env"].get("DEN_PROJECT_ID") is None:
         entry["env"].pop("DEN_PROJECT_ID", None)
+    if entry["env"].get("DEN_CHANNELS_ACTIVITY_CONTEXT") is None:
+        entry["env"].pop("DEN_CHANNELS_ACTIVITY_CONTEXT", None)
     log_file.write(json.dumps(entry) + "\\n")
 
 mode = os.environ.get(f"FAKE_HERMES_{role.upper()}_MODE", os.environ.get("FAKE_HERMES_MODE", "success"))
@@ -329,6 +332,61 @@ def test_spawned_hermes_worker_success_captures_command_and_artifact(tmp_path):
     assert "den-worker" in call["argv"]
     assert "-q" in call["argv"]
     assert "EXPECTED COMPLETION ARTIFACT" in call["argv"][call["argv"].index("-q") + 1]
+
+
+def test_spawned_hermes_worker_injects_activity_context_and_preserves_identity(tmp_path):
+    artifact_path = tmp_path / ".den" / "runs" / "run-activity" / "completion.json"
+    env = fake_env(tmp_path)
+    env.update({
+        "DEN_RUN_ID": "wrong-run",
+        "DEN_WORKER_ROLE": "wrong-role",
+        "DEN_CHANNELS_ACTIVITY_CONTEXT": "",
+    })
+
+    result = run_hermes_worker(
+        task_id=1565,
+        run_id="run-activity",
+        role="coder",
+        prompt="Implement task 1565.",
+        expected_artifact=artifact_path,
+        cwd=tmp_path,
+        env_overrides=env,
+        activity_context={
+            "gatewayUrl": "http://gateway.test",
+            "channelId": 42,
+            "projectId": "den-hermes-bridge",
+            "displayBlockId": "block-701",
+            "parentHermesSessionKey": "parent-session",
+            "parentAgentIdentity": "den-mcp-runner",
+            "agentIdentity": "den-coder-profile",
+            "token": "secret-token",
+        },
+    )
+
+    assert result.status == "completed"
+    call = read_fake_calls(tmp_path)[0]
+    assert call["env"]["DEN_RUN_ID"] == "run-activity"
+    assert call["env"]["DEN_WORKER_ROLE"] == "coder"
+    activity_context = json.loads(call["env"]["DEN_CHANNELS_ACTIVITY_CONTEXT"])
+    assert activity_context["displayBlockId"] == "block-701"
+    assert activity_context["workerRunId"] == "run-activity"
+    assert activity_context["workerRole"] == "coder"
+    assert activity_context["token"] == "secret-token"
+
+
+def test_spawned_hermes_worker_without_activity_context_does_not_inject_env(tmp_path):
+    result = run_hermes_worker(
+        task_id=1565,
+        run_id="run-no-activity",
+        role="coder",
+        prompt="Implement task 1565.",
+        expected_artifact=tmp_path / ".den" / "runs" / "run-no-activity" / "completion.json",
+        cwd=tmp_path,
+        env_overrides=fake_env(tmp_path),
+    )
+
+    assert result.status == "completed"
+    assert "DEN_CHANNELS_ACTIVITY_CONTEXT" not in read_fake_calls(tmp_path)[0]["env"]
 
 
 def test_spawned_hermes_worker_missing_artifact_is_incomplete(tmp_path):

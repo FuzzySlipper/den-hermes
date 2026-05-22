@@ -542,6 +542,7 @@ def run_tracked_coder_path(
     base_branch: str | None = None,
     base_commit: str | None = None,
     allowed_scope: str | None = None,
+    activity_context: Mapping[str, Any] | None = None,
 ) -> CoderPathResult:
     """Run the tracked spawned-Hermes coder path for a START_CODER action.
 
@@ -609,6 +610,13 @@ def run_tracked_coder_path(
         toolsets=list(runtime.toolsets),
         cwd=cwd if cwd is not None else runtime.workdir,
         env_overrides=env_overrides,
+        activity_context=_child_activity_context(
+            role="coder",
+            run_id=run_id,
+            agent_identity=runtime.profile or "coder",
+            explicit_context=activity_context,
+            env_overrides=env_overrides,
+        ),
         timeout_seconds=runtime.timeout_seconds,
     )
     if worker.status != "completed" or worker.artifact is None:
@@ -668,6 +676,7 @@ def run_tracked_reviewer_path(
     review_request: Mapping[str, Any] | None = None,
     base_branch: str | None = None,
     base_commit: str | None = None,
+    activity_context: Mapping[str, Any] | None = None,
 ) -> ReviewerPathResult:
     """Run the tracked spawned-Hermes reviewer path after coder completion."""
 
@@ -756,6 +765,13 @@ def run_tracked_reviewer_path(
         toolsets=list(runtime.toolsets),
         cwd=cwd if cwd is not None else runtime.workdir,
         env_overrides=env_overrides,
+        activity_context=_child_activity_context(
+            role="reviewer",
+            run_id=run_id,
+            agent_identity=runtime.profile or "reviewer",
+            explicit_context=activity_context,
+            env_overrides=env_overrides,
+        ),
         timeout_seconds=runtime.timeout_seconds,
     )
     if worker.status != "completed" or worker.artifact is None:
@@ -819,6 +835,7 @@ def run_tracked_gate_role_path(
     base_branch: str | None = None,
     base_commit: str | None = None,
     allowed_scope: str | None = None,
+    activity_context: Mapping[str, Any] | None = None,
 ) -> GateRolePathResult:
     """Run an optional post-review gate role through tracked spawned-Hermes."""
 
@@ -889,6 +906,13 @@ def run_tracked_gate_role_path(
         toolsets=list(runtime.toolsets),
         cwd=cwd if cwd is not None else runtime.workdir,
         env_overrides=env_overrides,
+        activity_context=_child_activity_context(
+            role=role,
+            run_id=run_id,
+            agent_identity=runtime.profile or role,
+            explicit_context=activity_context,
+            env_overrides=env_overrides,
+        ),
         timeout_seconds=runtime.timeout_seconds,
     )
     if worker.status != "completed" or worker.artifact is None:
@@ -1164,8 +1188,78 @@ def _review_thread_id(review_request: Mapping[str, Any]) -> int | None:
     return int(value) if value is not None else None
 
 
-def _selected_runtime_registry_path(runtime_registry_path: str | Path | None) -> str | Path:
-    return runtime_registry_path or os.environ.get("DEN_HERMES_RUNTIME_REGISTRY") or DEFAULT_RUNTIME_REGISTRY_PATH
+def _selected_runtime_registry_path(runtime_registry_path: str | Path | None) -> str | Path | None:
+    return runtime_registry_path or os.getenv("DEN_HERMES_RUNTIME_REGISTRY") or DEFAULT_RUNTIME_REGISTRY_PATH
+
+
+_ACTIVITY_CONTEXT_ENV = "DEN_CHANNELS_ACTIVITY_CONTEXT"
+
+
+def _json_obj(value: Any) -> dict[str, Any]:
+    if isinstance(value, Mapping):
+        return dict(value)
+    if isinstance(value, str) and value.strip():
+        try:
+            loaded = json.loads(value)
+        except Exception:
+            return {}
+        if isinstance(loaded, dict):
+            return loaded
+    return {}
+
+
+def _source_activity_context(
+    *,
+    explicit_context: Mapping[str, Any] | None = None,
+    env_overrides: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    if explicit_context:
+        return dict(explicit_context)
+    process_context = _json_obj(os.getenv(_ACTIVITY_CONTEXT_ENV, ""))
+    if process_context:
+        return process_context
+    if env_overrides:
+        return _json_obj(env_overrides.get(_ACTIVITY_CONTEXT_ENV, ""))
+    return {}
+
+
+def _child_activity_context(
+    *,
+    role: str,
+    run_id: str,
+    agent_identity: str | None,
+    explicit_context: Mapping[str, Any] | None = None,
+    env_overrides: Mapping[str, str] | None = None,
+) -> dict[str, Any] | None:
+    parent = _source_activity_context(explicit_context=explicit_context, env_overrides=env_overrides)
+    gateway_url = parent.get("gatewayUrl") or parent.get("gateway_url")
+    channel_id = parent.get("channelId") or parent.get("channel_id")
+    delivery_request_id = parent.get("deliveryRequestId") or parent.get("delivery_request_id")
+    display_block_id = parent.get("displayBlockId") or parent.get("display_block_id") or delivery_request_id
+    if not (gateway_url and channel_id and display_block_id):
+        return None
+    context: dict[str, Any] = {
+        "gatewayUrl": gateway_url,
+        "channelId": channel_id,
+        "displayBlockId": display_block_id,
+        "parentHermesSessionKey": parent.get("hermesSessionKey") or parent.get("sessionKey") or parent.get("session_key"),
+        "parentAgentIdentity": parent.get("agentIdentity") or parent.get("agent_identity"),
+        "agentIdentity": agent_identity or role,
+        "workerRunId": run_id,
+        "workerRole": role,
+    }
+    for child_key, *source_keys in (
+        ("projectId", "projectId", "project_id"),
+        ("taskId", "taskId", "task_id"),
+        ("threadId", "threadId", "thread_id"),
+        ("token", "token"),
+        ("deliveryRequestId", "deliveryRequestId", "delivery_request_id"),
+    ):
+        for source_key in source_keys:
+            if parent.get(source_key) not in {None, ""}:
+                context[child_key] = parent[source_key]
+                break
+    return {key: value for key, value in context.items() if value not in {None, ""}}
 
 
 def _packet_message_id(packet: Mapping[str, Any]) -> int:
