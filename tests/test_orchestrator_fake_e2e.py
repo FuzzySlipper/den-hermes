@@ -215,18 +215,19 @@ def test_fake_e2e_happy_path_coder_reviewer_gates_and_done_ready(tmp_path):
 
 def test_fake_e2e_env_parent_activity_context_flows_to_coder_and_reviewer(tmp_path):
     head = init_git_repo(tmp_path)
-    subprocess.run(["git", "checkout", "-b", "task/1565-activity"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    subprocess.run(["git", "checkout", "-b", "task/1567-activity"], cwd=tmp_path, check=True, capture_output=True, text=True)
     env = fake_env(tmp_path)
-    env["FAKE_BRANCH"] = "task/1565-activity"
+    env["FAKE_BRANCH"] = "task/1567-activity"
     env["FAKE_HEAD"] = head
     parent_context = {
         "gatewayUrl": "http://gateway.test",
         "channelId": 42,
         "projectId": "den-hermes-bridge",
-        "taskId": 1565,
+        "taskId": 1567,
         "threadId": 9001,
-        "displayBlockId": "block-parent",
-        "hermesSessionKey": "parent-session",
+        "deliveryRequestId": 701,
+        "displayBlockId": "parent-1567",
+        "hermesSessionKey": "parent-session-1567",
         "agentIdentity": "den-mcp-runner",
         "token": "secret-token",
     }
@@ -237,9 +238,9 @@ def test_fake_e2e_env_parent_activity_context_flows_to_coder_and_reviewer(tmp_pa
 
     coder = run_tracked_coder_path(
         adapter,
-        task_id=1565,
+        task_id=1567,
         prompt="Implement fake task.",
-        run_id="coder-run",
+        run_id="coder-1567",
         cwd=tmp_path,
         env_overrides=env,
         runtime_registry_path=registry,
@@ -247,9 +248,9 @@ def test_fake_e2e_env_parent_activity_context_flows_to_coder_and_reviewer(tmp_pa
     )
     reviewer = run_tracked_reviewer_path(
         adapter,
-        task_id=1565,
+        task_id=1567,
         prompt="Review fake task.",
-        run_id="reviewer-run",
+        run_id="reviewer-1567",
         coder_artifact=coder_artifact_from_result(coder),
         cwd=tmp_path,
         env_overrides=env,
@@ -260,15 +261,19 @@ def test_fake_e2e_env_parent_activity_context_flows_to_coder_and_reviewer(tmp_pa
     calls = read_fake_calls(tmp_path)
     coder_context = json.loads(calls[0]["env"]["DEN_CHANNELS_ACTIVITY_CONTEXT"])
     reviewer_context = json.loads(calls[1]["env"]["DEN_CHANNELS_ACTIVITY_CONTEXT"])
-    assert coder_context["displayBlockId"] == reviewer_context["displayBlockId"] == "block-parent"
-    assert coder_context["parentHermesSessionKey"] == reviewer_context["parentHermesSessionKey"] == "parent-session"
-    assert coder_context["parentAgentIdentity"] == reviewer_context["parentAgentIdentity"] == "den-mcp-runner"
-    assert coder_context["workerRunId"] == "coder-run"
-    assert coder_context["workerRole"] == "coder"
-    assert coder_context["agentIdentity"] == "den-coder-profile"
-    assert reviewer_context["workerRunId"] == "reviewer-run"
-    assert reviewer_context["workerRole"] == "reviewer"
-    assert reviewer_context["agentIdentity"] == "den-reviewer-profile"
+    for context, run_id, role, identity in [
+        (coder_context, "coder-1567", "coder", "den-coder-profile"),
+        (reviewer_context, "reviewer-1567", "reviewer", "den-reviewer-profile"),
+    ]:
+        assert context["displayBlockId"] == "parent-1567"
+        assert "displayDeliveryRequestId" not in context
+        assert context["parentHermesSessionKey"] == "parent-session-1567"
+        assert context["parentAgentIdentity"] == "den-mcp-runner"
+        assert context["workerRunId"] == run_id
+        assert context["workerRole"] == role
+        assert context["agentIdentity"] == identity
+        assert context["deliveryRequestId"] == 701
+        assert context["taskId"] == 1567
 
 
 @pytest.mark.parametrize("role", ["coder", "reviewer", "validator", "drift_checker", "packet_auditor"])

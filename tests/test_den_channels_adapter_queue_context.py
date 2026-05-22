@@ -426,6 +426,74 @@ def test_activity_emitter_forwards_spawned_worker_context(monkeypatch: pytest.Mo
     assert metadata["workerRole"] == "coder"
 
 
+def test_canonical_spawned_worker_activity_payload_shape_1567(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Cross-repo invariant for spawned-worker activity grouping payloads.
+
+    Gateway/Channels tests assert the same camelCase shape: child profile
+    identities emit tool activity into the parent display block, with worker
+    identity repeated in metadataJson for consumers that only inspect metadata.
+    """
+    posted: list[dict[str, Any]] = []
+
+    class FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+    class FakeClient:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        def __enter__(self) -> "FakeClient":
+            return self
+
+        def __exit__(self, *args: Any) -> None:
+            return None
+
+        def post(self, url: str, *, json: dict[str, Any], headers: dict[str, str]) -> FakeResponse:
+            posted.append(json)
+            return FakeResponse()
+
+    class FakeHttpx:
+        Client = FakeClient
+
+    monkeypatch.setitem(sys.modules, "httpx", FakeHttpx)
+
+    _adapter_module._emit_activity_event(
+        {
+            "gatewayUrl": "http://gateway.test",
+            "channelId": 42,
+            "projectId": "den-hermes-bridge",
+            "taskId": 1567,
+            "threadId": 9001,
+            "agentIdentity": "den-coder-profile",
+            "deliveryRequestId": 701,
+            "displayBlockId": "parent-1567",
+            "parentHermesSessionKey": "parent-session-1567",
+            "parentAgentIdentity": "den-mcp-runner",
+            "workerRunId": "coder-1567",
+            "workerRole": "coder",
+        },
+        normalize_tool_activity("terminal", {"command": "git status --short"}),
+    )
+
+    event = posted[0]
+    expected_shape = {
+        "agentIdentity": "den-coder-profile",
+        "deliveryRequestId": "701",
+        "displayBlockId": "parent-1567",
+        "parentHermesSessionKey": "parent-session-1567",
+        "parentAgentIdentity": "den-mcp-runner",
+        "workerRunId": "coder-1567",
+        "workerRole": "coder",
+    }
+    for key, expected in expected_shape.items():
+        assert event[key] == expected
+    assert "displayDeliveryRequestId" not in event
+    metadata = json.loads(event["metadataJson"])
+    assert metadata["workerRunId"] == "coder-1567"
+    assert metadata["workerRole"] == "coder"
+
+
 def test_spawned_worker_activity_streams_and_dedupe_are_worker_scoped(monkeypatch: pytest.MonkeyPatch) -> None:
     emitted: list[tuple[dict[str, Any], dict[str, Any]]] = []
     monkeypatch.setattr(
@@ -439,11 +507,14 @@ def test_spawned_worker_activity_streams_and_dedupe_are_worker_scoped(monkeypatc
     base = {
         "gatewayUrl": "http://gateway.test",
         "channelId": 42,
-        "displayBlockId": "block-701",
+        "displayBlockId": "parent-1567",
+        "parentHermesSessionKey": "parent-session-1567",
+        "parentAgentIdentity": "den-mcp-runner",
+        "agentIdentity": "den-coder-profile",
         "workerRole": "coder",
     }
-    first = {**base, "workerRunId": "worker-a"}
-    second = {**base, "workerRunId": "worker-b"}
+    first = {**base, "workerRunId": "coder-1567"}
+    second = {**base, "workerRunId": "reviewer-1567", "workerRole": "reviewer", "agentIdentity": "den-reviewer-profile"}
 
     _ACTIVITY_CONTEXT_VAR.set(first)
     _on_pre_tool_call(tool_name="terminal", args={"command": "date"}, tool_call_id="a-1")
@@ -456,11 +527,18 @@ def test_spawned_worker_activity_streams_and_dedupe_are_worker_scoped(monkeypatc
     for context, payload in emitted:
         payloads_by_worker.setdefault(context["workerRunId"], []).append(payload)
 
-    assert [payload["sequence"] for payload in payloads_by_worker["worker-a"]] == [1, 2]
-    assert [payload["sequence"] for payload in payloads_by_worker["worker-b"]] == [1]
-    assert payloads_by_worker["worker-a"][0]["dedupeKey"] == "activity:block-701:worker-a:coder:tool:1"
-    assert payloads_by_worker["worker-b"][0]["dedupeKey"] == "activity:block-701:worker-b:coder:tool:1"
-    assert payloads_by_worker["worker-a"][1]["dedupeKey"] == "activity:block-701:worker-a:coder:tool:2"
+    assert [payload["sequence"] for payload in payloads_by_worker["coder-1567"]] == [1, 2]
+    assert [payload["sequence"] for payload in payloads_by_worker["reviewer-1567"]] == [1]
+    assert payloads_by_worker["coder-1567"][0]["dedupeKey"] == "activity:parent-1567:coder-1567:coder:tool:1"
+    assert payloads_by_worker["reviewer-1567"][0]["dedupeKey"] == "activity:parent-1567:reviewer-1567:reviewer:tool:1"
+    assert payloads_by_worker["coder-1567"][1]["dedupeKey"] == "activity:parent-1567:coder-1567:coder:tool:2"
+    contexts_by_worker = {context["workerRunId"]: context for context, _payload in emitted}
+    assert contexts_by_worker["coder-1567"]["agentIdentity"] == "den-coder-profile"
+    assert contexts_by_worker["reviewer-1567"]["agentIdentity"] == "den-reviewer-profile"
+    assert contexts_by_worker["coder-1567"]["displayBlockId"] == "parent-1567"
+    assert contexts_by_worker["reviewer-1567"]["displayBlockId"] == "parent-1567"
+    assert contexts_by_worker["coder-1567"]["parentHermesSessionKey"] == "parent-session-1567"
+    assert contexts_by_worker["reviewer-1567"]["parentAgentIdentity"] == "den-mcp-runner"
 
 
 @pytest.mark.asyncio
