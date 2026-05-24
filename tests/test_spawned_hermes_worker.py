@@ -562,6 +562,53 @@ def test_reviewer_artifact_cannot_approve_mixed_failed_and_passed_summary(tmp_pa
     assert "looks_good" in (result.error or "")
 
 
+def test_reviewer_artifact_allows_dotnet_success_summaries(tmp_path):
+    """Regression: .NET '0 Error(s)' and 'Failed: 0' should not block looks_good."""
+    env = fake_env(tmp_path)
+    env["FAKE_REVIEW_TESTS_RUN"] = json.dumps([
+        "dotnet build: Build succeeded. 0 Warning(s), 0 Error(s)",
+        "Passed: 12, Failed: 0",
+    ])
+
+    result = run_hermes_worker(
+        task_id=1368,
+        run_id="run-net-success",
+        role="reviewer",
+        prompt="Review .NET build output.",
+        expected_artifact=tmp_path / ".den" / "runs" / "run-net-success" / "completion.json",
+        cwd=tmp_path,
+        env_overrides=env,
+    )
+
+    assert result.status == "completed", (
+        f"Expected completed, got status={result.status} error={result.error}"
+    )
+    assert result.artifact is not None
+    assert result.artifact.get("verdict") == "looks_good"
+
+
+def test_reviewer_artifact_rejects_word_first_failure(tmp_path):
+    """Word-first 'Failed: 2' should still be rejected as real failure."""
+    env = fake_env(tmp_path)
+    env["FAKE_REVIEW_TESTS_RUN"] = json.dumps([
+        "Passed: 5, Failed: 2",
+    ])
+
+    result = run_hermes_worker(
+        task_id=1368,
+        run_id="run-fail-word-first",
+        role="reviewer",
+        prompt="Review with failures.",
+        expected_artifact=tmp_path / ".den" / "runs" / "run-fail-word-first" / "completion.json",
+        cwd=tmp_path,
+        env_overrides=env,
+    )
+
+    assert result.status == "failed"
+    assert result.artifact is None
+    assert "looks_good" in (result.error or "")
+
+
 def test_coder_artifact_requires_branch_head_commit_and_tests(tmp_path):
     result = run_hermes_worker(
         task_id=1368,

@@ -603,11 +603,17 @@ def _reviewer_required_checks_failed(artifact: Mapping[str, Any]) -> bool:
             text = str(entry).lower()
         if re.search(r"\b[1-9]\d*\s+failed\b", text):
             return True
-        if "failed" in text and not re.search(r"\b0\s+failed\b", text):
+        if "failed" in text and not re.search(r"\b0\s+failed\b", text) and not re.search(r"failed:\s*0\b", text):
             return True
         if "whitespace errors" in text and "no whitespace errors" not in text:
             return True
-        if any(marker in text for marker in failure_markers if marker != "whitespace errors"):
+        # Skip known zero-count success markers before scanning for
+        # failure markers.  Tools like MSBuild and pytest embed success
+        # counters containing words like "error" and "failure" even when
+        # nothing failed (e.g. "0 Error(s)", "0 failure(s)").
+        _zeroed = re.sub(r"\b0\s+(\w+)\b", "", text)  # remove "0 Error(s)", "0 failure(s)", etc.
+        _zeroed = re.sub(r"\b\w+:\s*0\b", "", _zeroed)  # remove "failed: 0", "Failure: 0", etc.
+        if any(marker in _zeroed for marker in failure_markers if marker != "whitespace errors"):
             return True
     return False
 

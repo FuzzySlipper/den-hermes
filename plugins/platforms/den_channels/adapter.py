@@ -1029,6 +1029,11 @@ def validate_config(config: PlatformConfig) -> bool:
 
 def register(ctx: Any) -> None:
     """Plugin entry point: called by the Hermes plugin system."""
+    # Suppress the generic home-channel onboarding notice for Den Channels.
+    # Den Channels delivery lanes are already the delivery context; /sethome
+    # has no useful meaning inside a project lane.
+    import os as _os
+    _os.environ.setdefault("DEN_CHANNELS_HOME_CHANNEL", "suppressed")
     ctx.register_hook("pre_tool_call", _on_pre_tool_call)
     ctx.register_hook("post_tool_call", _on_post_tool_call)
     ctx.register_platform(
