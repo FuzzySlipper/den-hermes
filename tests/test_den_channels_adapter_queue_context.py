@@ -883,6 +883,65 @@ def test_direct_agent_message_handler_uses_adapter_config_and_defaults_sender(mo
     assert "secret-token" not in result
 
 
+def test_direct_agent_message_handler_accepts_registry_args_dict(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Hermes registry dispatch passes the tool argument dict positionally."""
+    monkeypatch.delenv("DEN_CHANNELS_URL", raising=False)
+    monkeypatch.delenv("DEN_GATEWAY_URL", raising=False)
+    monkeypatch.delenv("DEN_GATEWAY_TOKEN", raising=False)
+    monkeypatch.delenv("DEN_CHANNELS_TOKEN", raising=False)
+    _adapter_module._DIRECT_AGENT_CONFIG_DEFAULTS.clear()
+    _adapter_module._remember_direct_agent_config(
+        channels_url="http://channels.test",
+        agent_identity="profile-runner",
+    )
+
+    captured: dict[str, Any] = {}
+
+    class FakeResponse:
+        content = b"{}"
+
+        def raise_for_status(self) -> None:
+            pass
+
+        def json(self) -> dict[str, Any]:
+            return {"status": "recorded", "messageId": 456}
+
+    class FakeAsyncClient:
+        def __init__(self, *, timeout: float) -> None:
+            pass
+
+        async def __aenter__(self) -> "FakeAsyncClient":
+            return self
+
+        async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+            return None
+
+        async def post(self, url: str, *, json: dict[str, Any], headers: dict[str, str]) -> FakeResponse:
+            captured["url"] = url
+            captured["json"] = json
+            return FakeResponse()
+
+    import httpx
+
+    monkeypatch.setattr(httpx, "AsyncClient", FakeAsyncClient)
+
+    result = asyncio.run(_adapter_module._handle_direct_agent_message({
+        "channel_id": 569,
+        "member_identity": "reviewer",
+        "body": "please reply",
+    }))
+    parsed = json.loads(result)
+
+    assert parsed["status"] == "ok"
+    assert captured["url"] == "http://channels.test/api/gateway/direct-agent-messages"
+    assert captured["json"] == {
+        "channelId": 569,
+        "memberIdentity": "reviewer",
+        "senderIdentity": "profile-runner",
+        "body": "please reply",
+    }
+
+
 def test_direct_agent_message_tool_schema_has_no_sourceKind_gateway_delivery() -> None:
     """The direct-agent message schema must not reference sourceKind=gateway_delivery
     to avoid misuse as a post_message replacement."""
@@ -890,4 +949,6 @@ def test_direct_agent_message_tool_schema_has_no_sourceKind_gateway_delivery() -
     schema_text = json.dumps(schema)
     assert "gateway_delivery" not in schema_text
     assert "sourceKind" not in schema_text
-    assert "member_identity" in schema.get("required", [])
+    assert schema["parameters"]["properties"]["member_identity"]["type"] == "string"
+    assert "member_identity" in schema["parameters"].get("required", [])
+    assert "parameters" in schema

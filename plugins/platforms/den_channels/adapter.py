@@ -1070,7 +1070,7 @@ def validate_config(config: PlatformConfig) -> bool:
     return bool(gateway_url and channels_url and agent_identity and (token or _is_private_url(str(gateway_url))))
 
 
-_DIRECT_AGENT_MESSAGE_SCHEMA = {
+_DIRECT_AGENT_MESSAGE_PARAMETERS = {
     "type": "object",
     "properties": {
         "channel_id": {
@@ -1095,7 +1095,11 @@ _DIRECT_AGENT_MESSAGE_SCHEMA = {
         },
     },
     "required": ["member_identity", "body"],
+}
+
+_DIRECT_AGENT_MESSAGE_SCHEMA = {
     "description": "Send a direct agent message via Den Channels Gateway. Requires member_identity — broadcast is not supported.",
+    "parameters": _DIRECT_AGENT_MESSAGE_PARAMETERS,
 }
 
 
@@ -1109,17 +1113,23 @@ def _check_direct_agent_message_available() -> bool:
     )
 
 
-async def _handle_direct_agent_message(**kwargs: Any) -> str:
+async def _handle_direct_agent_message(args: dict[str, Any] | None = None, **kwargs: Any) -> str:
     """Handler for the den_channels_send_direct_agent_message tool.
 
     Posts a direct-agent message to the Den Gateway
     ``/api/gateway/direct-agent-messages`` endpoint.
     """
-    channel_id = kwargs.get("channel_id")
-    project_id = kwargs.get("project_id")
-    member_identity = kwargs.get("member_identity")
-    body = kwargs.get("body")
-    sender_identity = kwargs.get("sender_identity")
+    if isinstance(args, dict):
+        merged_args = dict(args)
+        merged_args.update(kwargs)
+    else:
+        merged_args = dict(kwargs)
+
+    channel_id = merged_args.get("channel_id")
+    project_id = merged_args.get("project_id")
+    member_identity = merged_args.get("member_identity")
+    body = merged_args.get("body")
+    sender_identity = merged_args.get("sender_identity")
 
     if not member_identity:
         return json.dumps({"status": "error", "error": "member_identity is required"})
