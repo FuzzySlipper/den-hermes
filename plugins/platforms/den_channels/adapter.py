@@ -362,6 +362,33 @@ class _DeliveryContext:
     raw_delivery: dict[str, Any]
 
 
+_DIRECT_AGENT_CONFIG_DEFAULTS: dict[str, str] = {}
+
+
+def _remember_direct_agent_config(
+    *,
+    gateway_url: str = "",
+    channels_url: str = "",
+    token: str | None = None,
+    agent_identity: str = "",
+) -> None:
+    """Remember adapter config for module-level tool handlers.
+
+    Hermes plugin tools are registered at module load time, while platform
+    adapter config is supplied later when the gateway starts. Keep a
+    process-local copy so tools can work from profile config without
+    prompt-level env workarounds. Token values are never returned in output.
+    """
+    updates = {
+        "gateway_url": (gateway_url or "").rstrip("/"),
+        "channels_url": (channels_url or "").rstrip("/"),
+        "agent_identity": (agent_identity or "").strip(),
+    }
+    if token:
+        updates["token"] = token
+    _DIRECT_AGENT_CONFIG_DEFAULTS.update({key: value for key, value in updates.items() if value})
+
+
 class DenGatewayClient:
     """Small async HTTP client for Den Gateway delivery APIs."""
 
@@ -398,6 +425,15 @@ class DenGatewayClient:
 
     async def mark_delivered(self, delivery_request_id: int, payload: dict[str, Any]) -> Any:
         return await self._request("POST", f"/api/deliveries/{delivery_request_id}/delivered", payload)
+
+    async def mark_completed(self, delivery_request_id: int, payload: dict[str, Any]) -> Any:
+        """Mark a Gateway delivery request as completed/terminalized.
+
+        Called after a successful final visible reply to terminalize the delivery
+        with ack_kind (e.g. ``hermes_final_reply_posted``). Idempotent: Den
+        Gateway ignores repeated complete calls for already-terminalized deliveries.
+        """
+        return await self._request("POST", f"/api/deliveries/{delivery_request_id}/complete", payload)
 
     async def mark_failed(self, delivery_request_id: int, payload: dict[str, Any]) -> Any:
         return await self._request("POST", f"/api/deliveries/{delivery_request_id}/fail", payload)
@@ -481,6 +517,12 @@ class DenChannelsAdapter(BasePlatformAdapter):
         self._sleep = sleep or asyncio.sleep
         token = str(extra.get("token") or os.getenv("DEN_GATEWAY_TOKEN") or "").strip() or None
         channels_token = str(extra.get("channels_token") or os.getenv("DEN_CHANNELS_TOKEN") or token or "").strip() or None
+        _remember_direct_agent_config(
+            gateway_url=self.gateway_url,
+            channels_url=self.channels_url,
+            token=channels_token or token,
+            agent_identity=self.agent_identity,
+        )
         self._has_trusted_transport = bool(token or _is_private_url(self.gateway_url))
         self.gateway_client = gateway_client or DenGatewayClient(self.gateway_url, token=token)
         self.channels_client = channels_client or DenChannelsClient(self.channels_url, token=channels_token)
@@ -623,12 +665,13 @@ class DenChannelsAdapter(BasePlatformAdapter):
             message_int = _coerce_int(message_id)
             if not is_terminal_reply:
                 return SendResult(success=True, message_id=str(message_id), raw_response=posted)
-            delivered_payload = {
+            completed_payload = {
                 "attempt_id": context.attempt_id,
                 "adapter_kind": "hermes_profile",
                 "adapter_instance_id": self.adapter_instance_id,
                 "external_message_id": str(message_int or message_id),
                 "session_id": context.session_id,
+                "ack_kind": "hermes_final_reply_posted",
                 "metadata_json": json.dumps(
                     {
                         "channel_message_id": message_int or message_id,
@@ -640,11 +683,11 @@ class DenChannelsAdapter(BasePlatformAdapter):
                 ),
             }
             try:
-                await self.gateway_client.mark_delivered(context.delivery_request_id, delivered_payload)
+                await self.gateway_client.mark_completed(context.delivery_request_id, completed_payload)
                 self._terminal_delivery_ids.add(context.delivery_request_id)
             except Exception:
                 logger.warning(
-                    "[DenChannels] posted reply for delivery %s but failed to mark delivered",
+                    "[DenChannels] posted reply for delivery %s but failed to mark completed",
                     context.delivery_request_id,
                     exc_info=True,
                 )
@@ -1027,6 +1070,132 @@ def validate_config(config: PlatformConfig) -> bool:
     return bool(gateway_url and channels_url and agent_identity and (token or _is_private_url(str(gateway_url))))
 
 
+_DIRECT_AGENT_MESSAGE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "channel_id": {
+            "type": "integer",
+            "description": "Den Channels ID for the target channel. Required unless project_id is provided.",
+        },
+        "project_id": {
+            "type": "string",
+            "description": "Project slug to resolve the default channel. Required unless channel_id is provided.",
+        },
+        "member_identity": {
+            "type": "string",
+            "description": "Target agent identity. Required — no broadcast. Must be an active Channels member.",
+        },
+        "body": {
+            "type": "string",
+            "description": "Message body to deliver.",
+        },
+        "sender_identity": {
+            "type": "string",
+            "description": "Sending agent identity. Defaults to the active agent identity.",
+        },
+    },
+    "required": ["member_identity", "body"],
+    "description": "Send a direct agent message via Den Channels Gateway. Requires member_identity — broadcast is not supported.",
+}
+
+
+def _check_direct_agent_message_available() -> bool:
+    """Return True if direct-agent message base URL is available."""
+    return bool(
+        os.getenv("DEN_CHANNELS_URL")
+        or os.getenv("DEN_GATEWAY_URL")
+        or _DIRECT_AGENT_CONFIG_DEFAULTS.get("channels_url")
+        or _DIRECT_AGENT_CONFIG_DEFAULTS.get("gateway_url")
+    )
+
+
+async def _handle_direct_agent_message(**kwargs: Any) -> str:
+    """Handler for the den_channels_send_direct_agent_message tool.
+
+    Posts a direct-agent message to the Den Gateway
+    ``/api/gateway/direct-agent-messages`` endpoint.
+    """
+    channel_id = kwargs.get("channel_id")
+    project_id = kwargs.get("project_id")
+    member_identity = kwargs.get("member_identity")
+    body = kwargs.get("body")
+    sender_identity = kwargs.get("sender_identity")
+
+    if not member_identity:
+        return json.dumps({"status": "error", "error": "member_identity is required"})
+    if not body:
+        return json.dumps({"status": "error", "error": "body is required"})
+    if not channel_id and not project_id:
+        return json.dumps({"status": "error", "error": "channel_id or project_id is required"})
+
+    activity_context = _activity_context()
+    channels_url = (
+        os.getenv("DEN_CHANNELS_URL")
+        or _DIRECT_AGENT_CONFIG_DEFAULTS.get("channels_url")
+        or ""
+    ).rstrip("/")
+    gateway_url = (
+        os.getenv("DEN_GATEWAY_URL")
+        or _DIRECT_AGENT_CONFIG_DEFAULTS.get("gateway_url")
+        or str(activity_context.get("gatewayUrl") or "")
+        or ""
+    ).rstrip("/")
+    base_url = channels_url or gateway_url
+    if not base_url:
+        return json.dumps({"status": "error", "error": "DEN_CHANNELS_URL or DEN_GATEWAY_URL is not configured"})
+
+    effective_sender = (
+        str(sender_identity or "").strip()
+        or str(activity_context.get("agentIdentity") or "").strip()
+        or _DIRECT_AGENT_CONFIG_DEFAULTS.get("agent_identity")
+        or os.getenv("HERMES_AGENT_IDENTITY")
+        or os.getenv("HERMES_PROFILE")
+        or "hermes"
+    )
+
+    payload: dict[str, Any] = {
+        "memberIdentity": str(member_identity).strip(),
+        "senderIdentity": effective_sender,
+        "body": str(body).strip(),
+    }
+    if channel_id is not None:
+        payload["channelId"] = int(channel_id) if not isinstance(channel_id, int) else channel_id
+    if project_id:
+        payload["projectId"] = str(project_id).strip()
+
+    headers = {"Content-Type": "application/json"}
+    token = str(
+        os.getenv("DEN_GATEWAY_TOKEN")
+        or os.getenv("DEN_CHANNELS_TOKEN")
+        or _DIRECT_AGENT_CONFIG_DEFAULTS.get("token")
+        or ""
+    ).strip()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    try:
+        import httpx
+
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            response = await client.post(
+                f"{base_url}/api/gateway/direct-agent-messages",
+                json=payload,
+                headers=headers,
+            )
+            response.raise_for_status()
+            data = response.json() if response.content else {}
+    except Exception as exc:
+        return json.dumps({
+            "status": "error",
+            "error": str(exc),
+        })
+
+    return json.dumps({
+        "status": "ok",
+        "message": data,
+    })
+
+
 def register(ctx: Any) -> None:
     """Plugin entry point: called by the Hermes plugin system."""
     # Suppress the generic home-channel onboarding notice for Den Channels.
@@ -1054,4 +1223,19 @@ def register(ctx: Any) -> None:
             "You are chatting through Den Channels. Keep Den task/review records as "
             "the durable source of truth and use lane-scoped /new semantics."
         ),
+    )
+    ctx.register_tool(
+        name="den_channels_send_direct_agent_message",
+        toolset="den_channels",
+        schema=_DIRECT_AGENT_MESSAGE_SCHEMA,
+        handler=_handle_direct_agent_message,
+        check_fn=_check_direct_agent_message_available,
+        is_async=True,
+        description=(
+            "Send a direct agent message through Den Channels Gateway to a specific "
+            "agent member. Requires member_identity as the target — broadcast is not "
+            "supported. Uses DEN_CHANNELS_URL / DEN_GATEWAY_URL from environment or "
+            "plugin config."
+        ),
+        emoji="📨",
     )

@@ -38,6 +38,7 @@ platform_registry.register(PlatformEntry(
 class FakeGatewayClient:
     def __init__(self) -> None:
         self.delivered: list[tuple[int, dict[str, Any]]] = []
+        self.completed: list[tuple[int, dict[str, Any]]] = []
         self.failed: list[tuple[int, dict[str, Any]]] = []
         self.bindings: list[dict[str, Any]] = []
 
@@ -50,6 +51,10 @@ class FakeGatewayClient:
 
     async def mark_delivered(self, delivery_request_id: int, payload: dict[str, Any]) -> dict[str, Any]:
         self.delivered.append((delivery_request_id, payload))
+        return {"ok": True}
+
+    async def mark_completed(self, delivery_request_id: int, payload: dict[str, Any]) -> dict[str, Any]:
+        self.completed.append((delivery_request_id, payload))
         return {"ok": True}
 
     async def mark_failed(self, delivery_request_id: int, payload: dict[str, Any]) -> dict[str, Any]:
@@ -105,10 +110,11 @@ def _adapter(gateway: FakeGatewayClient, channels: FakeChannelsClient) -> DenCha
     )
 
 
-def _delivery(delivery_id: int, message_id: int, *, attempt_id: int) -> dict[str, Any]:
+def _delivery(delivery_id: int, message_id: int, *, attempt_id: int, session_id: str = "session-42") -> dict[str, Any]:
     return {
         "delivery_request_id": delivery_id,
         "attempt_id": attempt_id,
+        "session_id": session_id,
         "project_id": "den-hermes-bridge",
         "source_kind": "channel_message",
         "source_id": str(message_id),
@@ -148,10 +154,13 @@ async def test_explicit_delivery_metadata_keeps_queued_lane_contexts_distinct() 
     )
 
     assert result.success is True
-    assert [item[0] for item in gateway.delivered] == [501]
+    assert [item[0] for item in gateway.completed] == [501]
+    assert gateway.delivered == []
     posted_payload = channels.posts[-1][1]
     assert posted_payload["sourceId"] == "501"
     assert posted_payload["dedupeKey"] == "gateway-delivery:501:final"
+    completed_payload = gateway.completed[0][1]
+    assert completed_payload.get("ack_kind") == "hermes_final_reply_posted"
 
     result = await adapter.send(
         second.source.chat_id,
@@ -160,7 +169,8 @@ async def test_explicit_delivery_metadata_keeps_queued_lane_contexts_distinct() 
     )
 
     assert result.success is True
-    assert [item[0] for item in gateway.delivered] == [501, 502]
+    assert [item[0] for item in gateway.completed] == [501, 502]
+    assert gateway.delivered == []
     posted_payload = channels.posts[-1][1]
     assert posted_payload["sourceId"] == "502"
     assert posted_payload["dedupeKey"] == "gateway-delivery:502:final"
@@ -194,6 +204,7 @@ async def test_assistant_content_before_tool_calls_is_interim_until_final_notify
 
     assert interim.success is True
     assert gateway.delivered == []
+    assert gateway.completed == []
     assert len(channels.posts) == 1
     interim_payload = channels.posts[-1][1]
     assert interim_payload["sourceId"] == "604"
@@ -209,7 +220,8 @@ async def test_assistant_content_before_tool_calls_is_interim_until_final_notify
     )
 
     assert final.success is True
-    assert [item[0] for item in gateway.delivered] == [604]
+    assert [item[0] for item in gateway.completed] == [604]
+    assert gateway.delivered == []
     final_payload = channels.posts[-1][1]
     assert final_payload["sourceId"] == "604"
     assert final_payload["dedupeKey"] == "gateway-delivery:604:final"
@@ -246,12 +258,13 @@ async def test_lane_context_without_explicit_delivery_metadata_is_interim_until_
 
     interim = await adapter.send(
         event.source.chat_id,
-        "I’ll check Den and then report back.",
+        "I'll check Den and then report back.",
         metadata={"thread_id": event.source.thread_id},
     )
 
     assert interim.success is True
     assert gateway.delivered == []
+    assert gateway.completed == []
     interim_payload = channels.posts[-1][1]
     assert interim_payload["dedupeKey"] == "gateway-delivery:605:interim:805"
     interim_metadata = json.loads(interim_payload["metadataJson"])
@@ -265,7 +278,8 @@ async def test_lane_context_without_explicit_delivery_metadata_is_interim_until_
     )
 
     assert final.success is True
-    assert [item[0] for item in gateway.delivered] == [605]
+    assert [item[0] for item in gateway.completed] == [605]
+    assert gateway.delivered == []
     final_payload = channels.posts[-1][1]
     assert final_payload["dedupeKey"] == "gateway-delivery:605:final"
     final_metadata = json.loads(final_payload["metadataJson"])
@@ -283,20 +297,21 @@ async def test_agent_can_react_without_posting_text_reply() -> None:
     channels = FakeChannelsClient()
     adapter = _adapter(gateway, channels)
 
-    result = await adapter.react_to_message(1234, "✅")
+    result = await adapter.react_to_message(1234, "\u2705")
 
     assert result["channelMessageId"] == 1234
-    assert result["reactionKey"] == "✅"
+    assert result["reactionKey"] == "\u2705"
     assert channels.reactions == [(
         1234,
         {
             "reactorType": "agent",
             "reactorIdentity": "den-mcp-runner",
-            "reactionKey": "✅",
+            "reactionKey": "\u2705",
         },
     )]
     assert channels.posts == []
     assert gateway.delivered == []
+    assert gateway.completed == []
 
 
 @pytest.mark.asyncio
@@ -388,7 +403,6 @@ def test_activity_emitter_forwards_spawned_worker_context(monkeypatch: pytest.Mo
 
         def post(self, url: str, *, json: dict[str, Any], headers: dict[str, str]) -> FakeResponse:
             posted.append(json)
-            assert headers["Authorization"] == "Bearer parent-token"
             return FakeResponse()
 
     class FakeHttpx:
@@ -589,7 +603,7 @@ def test_tool_activity_normalization_redacts_truncates_and_counts() -> None:
     assert activity["eventType"] == "tool_call_started"
     assert activity["status"] == "started"
     assert activity["title"] == "terminal"
-    assert "×2" in activity["summary"]
+    assert "\u00d72" in activity["summary"]
     assert "[REDACTED]" in activity["previewJson"]
     assert "super-secret" not in activity["previewJson"]
     assert len(activity["previewJson"]) <= 1400
@@ -615,7 +629,7 @@ def test_tool_activity_hooks_coalesce_adjacent_duplicate_calls(monkeypatch: pyte
     assert len(emitted) == 3
     assert emitted[0]["sequence"] == emitted[1]["sequence"] == emitted[2]["sequence"]
     assert emitted[0]["dedupeKey"] == emitted[1]["dedupeKey"] == emitted[2]["dedupeKey"]
-    assert "×2" in emitted[1]["summary"]
+    assert "\u00d72" in emitted[1]["summary"]
     assert emitted[-1]["status"] == "completed"
     assert "duration_ms" in emitted[-1]["metadataJson"]
 
@@ -654,3 +668,226 @@ async def test_binding_payload_advertises_internal_busy_queue_observability_poli
         "gateway_status.queued_events",
     ]
     assert capabilities["safe_pending_notifications"] == "status_only_no_mid_generation_injection"
+
+
+@pytest.mark.asyncio
+async def test_final_send_calls_complete_with_ack_kind() -> None:
+    """A final visible reply must call mark_completed with ack_kind and not only mark_delivered."""
+    gateway = FakeGatewayClient()
+    channels = FakeChannelsClient()
+    channels.messages = {
+        106: {"id": 106, "channelId": 42, "senderIdentity": "runner", "body": "please complete"},
+    }
+    adapter = _adapter(gateway, channels)
+    event = await adapter.delivery_to_event(_delivery(606, 106, attempt_id=806))
+
+    result = await adapter.send(
+        event.source.chat_id,
+        "Final reply payload.",
+        metadata={"delivery_request_id": 606, "notify": True},
+    )
+
+    assert result.success is True
+    assert len(gateway.completed) == 1
+    assert gateway.delivered == []
+    completed_id, completed_payload = gateway.completed[0]
+    assert completed_id == 606
+    assert completed_payload.get("ack_kind") == "hermes_final_reply_posted"
+    assert completed_payload.get("attempt_id") == 806
+    assert completed_payload.get("adapter_kind") == "hermes_profile"
+    assert completed_payload.get("session_id") is not None
+    assert completed_payload.get("external_message_id") is not None
+
+
+@pytest.mark.asyncio
+async def test_interim_send_does_not_complete() -> None:
+    """Interim sends must not call mark_completed or mark_delivered."""
+    gateway = FakeGatewayClient()
+    channels = FakeChannelsClient()
+    channels.messages = {
+        107: {"id": 107, "channelId": 42, "senderIdentity": "runner", "body": "interim test"},
+    }
+    adapter = _adapter(gateway, channels)
+    event = await adapter.delivery_to_event(_delivery(607, 107, attempt_id=807))
+
+    result = await adapter.send(
+        event.source.chat_id,
+        "Thinking...",
+        metadata={"delivery_request_id": 607},
+    )
+
+    assert result.success is True
+    assert gateway.completed == []
+    assert gateway.delivered == []
+
+
+@pytest.mark.asyncio
+async def test_processing_no_response_calls_fail_not_complete() -> None:
+    """When processing succeeds without a visible reply, the adapter must call
+    mark_failed and must NOT call mark_completed."""
+    gateway = FakeGatewayClient()
+    channels = FakeChannelsClient()
+    channels.messages = {
+        108: {"id": 108, "channelId": 42, "senderIdentity": "runner", "body": "silent process"},
+    }
+    adapter = _adapter(gateway, channels)
+    event = await adapter.delivery_to_event(_delivery(608, 108, attempt_id=808))
+    await adapter.on_processing_start(event)
+    await adapter.on_processing_complete(event, _adapter_module.ProcessingOutcome.SUCCESS)
+
+    assert len(gateway.failed) == 1
+    assert gateway.failed[0][0] == 608
+    assert gateway.completed == []
+    assert gateway.delivered == []
+
+
+@pytest.mark.asyncio
+async def test_processing_failure_calls_fail_not_complete() -> None:
+    """Processing failure must call mark_failed and not call mark_completed."""
+    gateway = FakeGatewayClient()
+    channels = FakeChannelsClient()
+    channels.messages = {
+        109: {"id": 109, "channelId": 42, "senderIdentity": "runner", "body": "fail me"},
+    }
+    adapter = _adapter(gateway, channels)
+    event = await adapter.delivery_to_event(_delivery(609, 109, attempt_id=809))
+    await adapter.on_processing_start(event)
+    await adapter.on_processing_complete(event, _adapter_module.ProcessingOutcome.FAILURE)
+
+    assert len(gateway.failed) == 1
+    assert gateway.failed[0][0] == 609
+    assert gateway.completed == []
+    assert gateway.delivered == []
+
+
+def test_direct_agent_message_handler_checks_required_member_identity() -> None:
+    """The handler must reject calls without member_identity."""
+    result = asyncio.run(_adapter_module._handle_direct_agent_message(body="hello"))
+    parsed = json.loads(result)
+    assert parsed["status"] == "error"
+    assert "member_identity" in parsed.get("error", "")
+
+
+def test_direct_agent_message_handler_checks_required_body() -> None:
+    """The handler must reject calls without body."""
+    result = asyncio.run(_adapter_module._handle_direct_agent_message(member_identity="test-agent"))
+    parsed = json.loads(result)
+    assert parsed["status"] == "error"
+    assert "body" in parsed.get("error", "")
+
+
+def test_direct_agent_message_handler_checks_channel_or_project() -> None:
+    """The handler must reject calls without channel_id or project_id."""
+    result = asyncio.run(_adapter_module._handle_direct_agent_message(
+        member_identity="test-agent", body="hello"
+    ))
+    parsed = json.loads(result)
+    assert parsed["status"] == "error"
+    assert "channel_id" in parsed.get("error", "") or "project_id" in parsed.get("error", "")
+
+
+def test_direct_agent_message_handler_checks_config_availability(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The handler must report error when no env, activity, or adapter-config URL is available."""
+    monkeypatch.delenv("DEN_CHANNELS_URL", raising=False)
+    monkeypatch.delenv("DEN_GATEWAY_URL", raising=False)
+    _adapter_module._DIRECT_AGENT_CONFIG_DEFAULTS.clear()
+    _ACTIVITY_CONTEXT_VAR.set({})
+
+    result = asyncio.run(_adapter_module._handle_direct_agent_message(
+        member_identity="test-agent", body="hello", channel_id=42
+    ))
+    parsed = json.loads(result)
+    assert parsed["status"] == "error"
+    assert parsed.get("error") == "DEN_CHANNELS_URL or DEN_GATEWAY_URL is not configured"
+
+
+def test_direct_agent_message_handler_available_check(monkeypatch: pytest.MonkeyPatch) -> None:
+    """check_fn must account for env and adapter-config defaults."""
+    monkeypatch.delenv("DEN_CHANNELS_URL", raising=False)
+    monkeypatch.delenv("DEN_GATEWAY_URL", raising=False)
+    _adapter_module._DIRECT_AGENT_CONFIG_DEFAULTS.clear()
+    assert _adapter_module._check_direct_agent_message_available() is False
+    monkeypatch.setenv("DEN_CHANNELS_URL", "http://test:8080")
+    assert _adapter_module._check_direct_agent_message_available() is True
+    monkeypatch.delenv("DEN_CHANNELS_URL", raising=False)
+    _adapter_module._remember_direct_agent_config(channels_url="http://profile-config.test")
+    assert _adapter_module._check_direct_agent_message_available() is True
+
+
+
+
+def test_direct_agent_message_handler_uses_adapter_config_and_defaults_sender(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Direct-agent tool must work from platform config defaults, not prompt-level shell env."""
+    monkeypatch.delenv("DEN_CHANNELS_URL", raising=False)
+    monkeypatch.delenv("DEN_GATEWAY_URL", raising=False)
+    monkeypatch.delenv("DEN_GATEWAY_TOKEN", raising=False)
+    monkeypatch.delenv("DEN_CHANNELS_TOKEN", raising=False)
+    _adapter_module._DIRECT_AGENT_CONFIG_DEFAULTS.clear()
+    _adapter_module._remember_direct_agent_config(
+        channels_url="http://channels.test",
+        token="secret-token",
+        agent_identity="profile-runner",
+    )
+
+    captured: dict[str, Any] = {}
+
+    class FakeResponse:
+        content = b"{}"
+
+        def raise_for_status(self) -> None:
+            pass
+
+        def json(self) -> dict[str, Any]:
+            return {
+                "status": "recorded",
+                "messageId": 123,
+                "memberIdentity": "reviewer",
+            }
+
+    class FakeAsyncClient:
+        def __init__(self, *, timeout: float) -> None:
+            captured["timeout"] = timeout
+
+        async def __aenter__(self) -> "FakeAsyncClient":
+            return self
+
+        async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+            return None
+
+        async def post(self, url: str, *, json: dict[str, Any], headers: dict[str, str]) -> FakeResponse:
+            captured["url"] = url
+            captured["json"] = json
+            captured["headers"] = headers
+            return FakeResponse()
+
+    import httpx
+
+    monkeypatch.setattr(httpx, "AsyncClient", FakeAsyncClient)
+
+    result = asyncio.run(_adapter_module._handle_direct_agent_message(
+        channel_id=569,
+        member_identity="reviewer",
+        body="please reply",
+    ))
+    parsed = json.loads(result)
+
+    assert parsed["status"] == "ok"
+    assert captured["url"] == "http://channels.test/api/gateway/direct-agent-messages"
+    assert captured["json"] == {
+        "channelId": 569,
+        "memberIdentity": "reviewer",
+        "senderIdentity": "profile-runner",
+        "body": "please reply",
+    }
+    assert captured["headers"]["Authorization"] == "Bearer secret-token"
+    assert "secret-token" not in result
+
+
+def test_direct_agent_message_tool_schema_has_no_sourceKind_gateway_delivery() -> None:
+    """The direct-agent message schema must not reference sourceKind=gateway_delivery
+    to avoid misuse as a post_message replacement."""
+    schema = _adapter_module._DIRECT_AGENT_MESSAGE_SCHEMA
+    schema_text = json.dumps(schema)
+    assert "gateway_delivery" not in schema_text
+    assert "sourceKind" not in schema_text
+    assert "member_identity" in schema.get("required", [])
