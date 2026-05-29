@@ -22,10 +22,8 @@ Coverage includes:
 
 from __future__ import annotations
 
-import copy
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from typing import Any, Mapping, Sequence
+from typing import Any
 
 import pytest
 
@@ -348,7 +346,7 @@ class WorkerPoolMVPSimulator:
         """Step 3: Channels sends a wake to the worker via direct-agent
         message."""
         if fail_wake:
-            mid = self._add_message(
+            self._add_message(
                 "wake_failed",
                 f"Wake for assignment {self.assignment_ptr.assignment_id} failed: channel unreachable",
             )
@@ -356,12 +354,20 @@ class WorkerPoolMVPSimulator:
             self._record_timeline("channels_wake_failed")
             return
 
-        mid = self._add_message(
+        self._add_message(
             "wake",
             f"Assignment {self.assignment_ptr.assignment_id} delivered. "
             f"Task #{self.assignment_ptr.task_id} role={self.assignment_ptr.role}",
         )
         self._record_timeline("channels_wake_sent")
+
+    def simulate_gateway_callback(self, *, status: str | None = None) -> None:
+        """Record the worker callback/final evidence on the Gateway projection."""
+        if self.gateway is None:
+            return
+        self.gateway.callback_received = True
+        self.gateway.callback_status = status or self.core.completion_status or self.core.status
+        self._record_timeline("gateway_callback_received")
 
     def simulate_worker_acknowledge(self) -> None:
         """Step 4: Worker acknowledges the assignment."""
@@ -681,6 +687,7 @@ def _run_simulate_full_happy_path() -> FakeE2EEvidence:
     sim.simulate_worker_plan_checkpoint()
     sim.simulate_runner_checkpoint_response(verdict="approved")
     sim.simulate_worker_implementation()
+    sim.simulate_gateway_callback(status="completed")
     sim.simulate_cleanup(complete_evidence=True)
     sim.simulate_release()
     return sim.get_evidence()
@@ -723,7 +730,8 @@ class TestWorkerPoolMVPHappyPath:
         assert handle["delivery_id"] == "del-t1728-assign-001"
         assert handle["status"] == "delivered"
         assert handle["attempt_count"] == 1
-        assert handle["callback_received"] is False
+        assert handle["callback_received"] is True
+        assert handle["callback_status"] == "completed"
 
     def test_happy_path_channels_messages(self):
         evidence = _run_simulate_full_happy_path()
@@ -755,6 +763,7 @@ class TestWorkerPoolMVPHappyPath:
             "runner_response_approved",
             "implementation_started",
             "worker_completed",
+            "gateway_callback_received",
             "cleanup_complete",
             "released",
         ]
@@ -869,6 +878,7 @@ class TestWorkerPoolMVPCleanupFailure:
         sim.simulate_worker_plan_checkpoint()
         sim.simulate_runner_checkpoint_response(verdict="approved")
         sim.simulate_worker_implementation()
+        sim.simulate_gateway_callback(status="completed")
         # Then incomplete cleanup
         sim.simulate_cleanup(complete_evidence=False)
         return sim.get_evidence()
@@ -920,6 +930,36 @@ class TestWorkerPoolMVPGatewayDeliveryFailure:
         assert evidence.core.status == "delivery_failed"
         assert evidence.web_trace.state_label == "delivery_failed"
         assert evidence.final_worker_state is None
+
+
+class TestWorkerPoolMVPChannelsWakeFailure:
+    """Channels wake failure remains observable and can proceed by polling."""
+
+    def simulate_wake_failure_path(self) -> FakeE2EEvidence:
+        sim = WorkerPoolMVPSimulator(scenario="channels_wake_failure")
+        sim.simulate_assignment_create()
+        sim.simulate_gateway_delivery()
+        sim.simulate_channels_wake(fail_wake=True)
+        # Gateway delivery already instantiated the worker; this models the
+        # AMBER runbook path where the worker still polls Core and continues.
+        sim.simulate_worker_acknowledge()
+        return sim.get_evidence()
+
+    def test_channels_wake_failure_is_visible_in_transcript_handles(self):
+        evidence = self.simulate_wake_failure_path()
+        assert "channels_wake_failed" in evidence.timeline_states
+        failed_wakes = [m for m in evidence.channels_messages if m.message_type == "wake_failed"]
+        assert len(failed_wakes) == 1
+        assert failed_wakes[0].status == "failed"
+        assert failed_wakes[0].assignment_id == "t1728-assign-001"
+
+    def test_channels_wake_failure_can_continue_by_polling_after_gateway_delivery(self):
+        evidence = self.simulate_wake_failure_path()
+        assert evidence.gateway is not None
+        assert evidence.gateway.status == "delivered"
+        assert evidence.final_worker_state == PoolRuntimeState.ACKNOWLEDGED.value
+        assert evidence.web_trace is not None
+        assert evidence.web_trace.state_label == "acknowledged"
 
 
 class TestWorkerPoolMVPEvidenceShape:
@@ -1004,6 +1044,7 @@ class TestWorkerPoolMVPTimelineCompleteness:
         "plan_checkpoint_posted",
         "implementation_started",
         "worker_completed",
+        "gateway_callback_received",
         "cleanup_complete",
         "released",
     ]
@@ -1070,26 +1111,24 @@ class TestWorkerPoolMVPTimelineCompleteness:
 
 
 class TestWorkerPoolMVPQuickScenarios:
-    """Quick smoke tests for each scenario — validates that the
-    simulation runs without errors and produces deterministic
-    evidence shapes."""
+    """Quick smoke tests for each scenario — validates that every named
+    scenario helper drives its scenario-specific branch and produces
+    deterministic evidence.
+    """
 
-    @pytest.mark.parametrize("scenario_name,simulator_fn", [
-        ("happy_path", lambda: WorkerPoolMVPSimulator(scenario="happy_path")),
-        ("blocked_path", lambda: WorkerPoolMVPSimulator(scenario="blocked_path")),
-        ("stale_lease", lambda: WorkerPoolMVPSimulator(scenario="stale_lease")),
-        ("malformed_packet", lambda: WorkerPoolMVPSimulator(scenario="malformed_packet")),
-        ("cleanup_failure", lambda: WorkerPoolMVPSimulator(scenario="cleanup_failure")),
-        ("delivery_mismatch", lambda: WorkerPoolMVPSimulator(scenario="delivery_mismatch")),
-        ("delivery_failure", lambda: WorkerPoolMVPSimulator(scenario="delivery_failure")),
+    @pytest.mark.parametrize("scenario_name,runner,expected", [
+        ("happy_path", _run_simulate_full_happy_path, {"final_state": PoolRuntimeState.RELEASED.value, "timeline": "released"}),
+        ("blocked_path", TestWorkerPoolMVPBlockedPath().simulate_blocked_path, {"final_state": PoolRuntimeState.RELEASED.value, "timeline": "runner_response_blocked"}),
+        ("stale_lease", TestWorkerPoolMVPStaleLease().simulate_stale_lease_path, {"final_state": PoolRuntimeState.QUARANTINED.value, "timeline": "worker_stale_lease"}),
+        ("malformed_packet", TestWorkerPoolMVPMalformedPacket().simulate_malformed_packet_path, {"final_state": PoolRuntimeState.RELEASED.value, "timeline": "worker_malformed_packet"}),
+        ("cleanup_failure", TestWorkerPoolMVPCleanupFailure().simulate_cleanup_failure_path, {"final_state": PoolRuntimeState.QUARANTINED.value, "timeline": "cleanup_failed_quarantine"}),
+        ("delivery_mismatch", TestWorkerPoolMVPGatewayDeliveryMismatch().simulate_delivery_mismatch_path, {"final_state": None, "timeline": "gateway_delivery_mismatch"}),
+        ("delivery_failure", TestWorkerPoolMVPGatewayDeliveryFailure().simulate_delivery_failure_path, {"final_state": None, "timeline": "gateway_delivery_failed"}),
+        ("channels_wake_failure", TestWorkerPoolMVPChannelsWakeFailure().simulate_wake_failure_path, {"final_state": PoolRuntimeState.ACKNOWLEDGED.value, "timeline": "channels_wake_failed"}),
     ])
-    def test_scenario_runs_without_exception(self, scenario_name: str, simulator_fn):
-        sim = simulator_fn()
-        # Run initial setup steps that are safe for all scenarios
-        sim.simulate_assignment_create()
-        sim.simulate_gateway_delivery()
-        # Not all scenarios have a Channels wake that makes sense,
-        # but run these in order
-        evidence = sim.get_evidence()
+    def test_scenario_runs_expected_branch(self, scenario_name: str, runner, expected: dict[str, Any]):
+        evidence = runner()
         assert evidence.scenario == scenario_name
+        assert evidence.final_worker_state == expected["final_state"]
+        assert expected["timeline"] in evidence.timeline_states
         assert isinstance(evidence.to_handle_dict(), dict)
