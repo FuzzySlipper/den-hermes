@@ -1,0 +1,50 @@
+{
+  "receipt_version": "1.0",
+  "status": "completed",
+  "summary": "Verified task #1726 state, observed interpretation checkpoint, no wake events pending.",
+  "handles": {
+    "tasks": [
+      {
+        "task_id": 1726,
+        "project_id": "den-hermes-bridge",
+        "status": "in_progress",
+        "message_count": 3,
+        "latest_message_id": 8650
+      }
+    ],
+    "messages": [
+      {
+        "message_id": 8648,
+        "type": "coder_context_packet",
+        "summary": "DenOps context-firewall pilot launch packet",
+        "timestamp": "2026-05-29T13:00:00Z"
+      },
+      {
+        "message_id": 8650,
+        "type": "denops_checkpoint",
+        "summary": "DenOps bookkeeping checkpoint posted",
+        "timestamp": "2026-05-29T13:01:00Z"
+      }
+    ],
+    "wake_events": [],
+    "delivery_requests": []
+  },
+  "blockers": [],
+  "assumptions": [
+    {
+      "assumption": "Den task #1726 exists and is in 'in_progress' state",
+      "verified": true
+    },
+    {
+      "assumption": "No concurrent modifications to task thread during bookkeeping",
+      "verified": false
+    }
+  ],
+  "next_required_action": "Runner reviews receipt and proceeds with checkpoint protocol if approved.",
+  "verification": {
+    "readback_messages_checked": true,
+    "task_thread_readback": true,
+    "handle_integrity": true,
+    "verification_method": "den_mcp_read_task + den_mcp_read_messages"
+  }
+}

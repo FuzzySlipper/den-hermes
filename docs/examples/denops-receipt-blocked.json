@@ -1,0 +1,24 @@
+{
+  "receipt_version": "1.0",
+  "status": "blocked",
+  "summary": "Cannot verify task #1726 state: task not found or access denied.",
+  "handles": {
+    "tasks": [],
+    "messages": []
+  },
+  "blockers": [
+    {
+      "blocker_summary": "Den task #1726 is not accessible or does not exist",
+      "blocker_category": "unexpected_state",
+      "evidence_handles": ["Den returned empty/null for task 1726 query"],
+      "recovery_guidance": "Runner to verify task ID and project permissions, then relaunch DenOps."
+    }
+  ],
+  "assumptions": [],
+  "next_required_action": "Runner verifies task #1726 exists and relaunches DenOps.",
+  "verification": {
+    "readback_messages_checked": false,
+    "task_thread_readback": false,
+    "handle_integrity": false
+  }
+}
