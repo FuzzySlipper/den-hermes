@@ -11,6 +11,7 @@ from typing import Any
 import pytest
 
 from gateway.config import PlatformConfig
+from gateway.session import SessionSource, build_session_key
 from gateway.platform_registry import PlatformEntry, platform_registry
 
 _ADAPTER_PATH = Path(__file__).resolve().parents[1] / "plugins" / "platforms" / "den_channels" / "adapter.py"
@@ -940,6 +941,127 @@ def test_direct_agent_message_handler_accepts_registry_args_dict(monkeypatch: py
         "senderIdentity": "profile-runner",
         "body": "please reply",
     }
+
+
+@pytest.mark.asyncio
+async def test_same_channel_different_senders_share_session_key() -> None:
+    """Different senders in the same Den Channels lane must share a session key.
+
+    Session keys must not include a sender/user suffix so channel lanes do not
+    fork by sender.  All participants in a channel see one continuous session.
+    """
+    gateway = FakeGatewayClient()
+    channels = FakeChannelsClient()
+    channels.messages = {
+        200: {"id": 200, "channelId": 42, "senderIdentity": "patch", "body": "hello from patch"},
+        201: {"id": 201, "channelId": 42, "senderIdentity": "planner", "body": "hello from planner"},
+    }
+    adapter = _adapter(gateway, channels)
+
+    event_from_patch = await adapter.delivery_to_event(_delivery(801, 200, attempt_id=901))
+    event_from_planner = await adapter.delivery_to_event(_delivery(802, 201, attempt_id=902))
+
+    # Same channel -> same session key regardless of sender
+    assert event_from_patch.source.chat_id == event_from_planner.source.chat_id
+    assert event_from_patch.source.chat_type == "channel"
+    assert event_from_planner.source.chat_type == "channel"
+
+    # Build session keys the same way the adapter does internally
+    session_key_patch = build_session_key(event_from_patch.source, group_sessions_per_user=False)
+    session_key_planner = build_session_key(event_from_planner.source, group_sessions_per_user=False)
+    assert session_key_patch == session_key_planner, \
+        f"Session keys must match for same channel: {session_key_patch!r} != {session_key_planner!r}"
+
+    # The key should not reference either sender
+    assert "patch" not in session_key_patch
+    assert "planner" not in session_key_patch
+
+    # source.user_id should be None (our scoping fix)
+    assert event_from_patch.source.user_id is None
+    assert event_from_planner.source.user_id is None
+
+    # source.user_name is still set for display purposes
+    assert event_from_patch.source.user_name == "patch"
+    assert event_from_planner.source.user_name == "planner"
+
+
+@pytest.mark.asyncio
+async def test_different_channels_produce_different_session_keys() -> None:
+    """Different Den Channels must produce different session keys."""
+    gateway = FakeGatewayClient()
+    channels = FakeChannelsClient()
+    channels.messages = {
+        300: {"id": 300, "channelId": 42, "senderIdentity": "user", "body": "in channel 42"},
+        400: {"id": 400, "channelId": 99, "senderIdentity": "user", "body": "in channel 99"},
+    }
+    adapter = _adapter(gateway, channels)
+
+    # Override channel_id in delivery metadata
+    event_a = await adapter.delivery_to_event({
+        **_delivery(901, 300, attempt_id=1001),
+        "metadata_json": json.dumps({"channel_id": 42, "channel_slug": "team-a"}),
+    })
+    event_b = await adapter.delivery_to_event({
+        **_delivery(902, 400, attempt_id=1002),
+        "metadata_json": json.dumps({"channel_id": 99, "channel_slug": "team-b"}),
+    })
+
+    assert event_a.source.chat_id != event_b.source.chat_id
+
+    session_key_a = build_session_key(event_a.source, group_sessions_per_user=False)
+    session_key_b = build_session_key(event_b.source, group_sessions_per_user=False)
+    assert session_key_a != session_key_b, \
+        f"Session keys must differ for different channels: {session_key_a!r} == {session_key_b!r}"
+
+
+@pytest.mark.asyncio
+async def test_thread_lane_produces_distinct_session_key() -> None:
+    """Thread/task lanes in Den Channels must produce thread-qualified session keys
+    distinct from the parent channel lane."""
+    gateway = FakeGatewayClient()
+    channels = FakeChannelsClient()
+    channels.messages = {
+        500: {"id": 500, "channelId": 42, "senderIdentity": "user", "body": "root channel msg"},
+        501: {
+            "id": 501,
+            "channelId": 42,
+            "senderIdentity": "user",
+            "body": "thread reply",
+            "threadRootMessageId": 5005,
+        },
+    }
+    adapter = _adapter(gateway, channels)
+
+    root_event = await adapter.delivery_to_event(_delivery(1001, 500, attempt_id=1101))
+    thread_event = await adapter.delivery_to_event({
+        **_delivery(1002, 501, attempt_id=1102),
+        "metadata_json": json.dumps({
+            "channel_id": 42,
+            "channel_slug": "team-a",
+            "thread_root_message_id": 5005,
+        }),
+    })
+
+    assert root_event.source.chat_type == "channel"
+    assert thread_event.source.chat_type == "thread"
+    assert root_event.source.thread_id is None
+    assert thread_event.source.thread_id is not None
+
+    root_key = build_session_key(root_event.source, group_sessions_per_user=False)
+    thread_key = build_session_key(thread_event.source, group_sessions_per_user=False)
+    assert root_key != thread_key, \
+        "Thread session key must differ from channel session key"
+    assert "5005" in thread_key, \
+        "Thread session key should reference the thread root"
+
+    # Channel-only key must NOT contain thread reference
+    assert "5005" not in root_key
+
+
+def test_den_channels_session_scoping_note_exists() -> None:
+    """The developer/operator note about Den Channels session scoping should exist."""
+    note_path = Path(__file__).resolve().parents[1] / "docs" / "den-channels-session-scoping-1719.md"
+    assert note_path.exists(), "Session scoping doc is missing"
 
 
 def test_direct_agent_message_tool_schema_has_no_sourceKind_gateway_delivery() -> None:

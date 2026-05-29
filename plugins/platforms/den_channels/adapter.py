@@ -738,7 +738,6 @@ class DenChannelsAdapter(BasePlatformAdapter):
             chat_id=chat_id,
             chat_name=str(chat_name) if chat_name else None,
             chat_type=chat_type,
-            user_id=sender,
             user_name=sender,
             thread_id=thread_id,
             message_id=str(trigger_message_id or source_id),
