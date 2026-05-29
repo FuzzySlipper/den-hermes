@@ -23,6 +23,7 @@ Coverage includes:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any
 
 import pytest
@@ -44,6 +45,26 @@ from den_hermes.pool_runtime import (
 # ---------------------------------------------------------------------------
 # These are deterministic record/projection types, not database models.
 # They hold enough structure to verify the workflow trace after simulation.
+
+
+def _parse_utc_instant(value: str) -> datetime:
+    """Parse the fake Core ISO instant strings as timezone-aware UTC."""
+    normalized = value.replace("Z", "+00:00")
+    parsed = datetime.fromisoformat(normalized)
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def lease_is_expired(*, lease_expires_at: str | None, current_time: str) -> bool:
+    """Return True when the simulated clock is at/past lease_expires_at.
+
+    The stale-lease fake path uses this helper so timeout behavior is derived
+    from Core lease timestamps rather than a direct operator failure.
+    """
+    if not lease_expires_at:
+        return False
+    return _parse_utc_instant(current_time) >= _parse_utc_instant(lease_expires_at)
 
 
 @dataclass
@@ -504,10 +525,21 @@ class WorkerPoolMVPSimulator:
         self.web_trace.completion_status = "blocked"
         self._record_timeline("worker_blocked")
 
-    def simulate_worker_stale_lease(self) -> None:
-        """Step 8C: Worker lease expires (timeout/stale lease scenario)."""
+    def simulate_worker_stale_lease(self, *, current_time: str = "2026-05-29T14:05:00Z") -> bool:
+        """Step 8C: Worker lease expires (timeout/stale lease scenario).
+
+        Returns True only when the simulated clock is at/past the Core
+        lease expiry. If the lease is still valid, no failure transition occurs.
+        """
         if self.worker is None:
-            return
+            return False
+        expired = lease_is_expired(
+            lease_expires_at=self.core.lease_expires_at,
+            current_time=current_time,
+        )
+        if not expired:
+            self._record_timeline("worker_stale_lease_checked_not_expired")
+            return False
         self.worker = self.worker.fail(reason="Stale lease: Core lease expired before completion")
         self.core.status = "failed_stale_lease"
         self.core.completion_status = "failed"
@@ -515,6 +547,7 @@ class WorkerPoolMVPSimulator:
         self.web_trace.state_label = "failed_stale_lease"
         self.web_trace.completion_status = "failed"
         self._record_timeline("worker_stale_lease")
+        return True
 
     def simulate_worker_malformed_packet(self) -> None:
         """Step 8D: Worker attempts invalid checkpoint (malformed packet
@@ -821,8 +854,9 @@ class TestWorkerPoolMVPStaleLease:
         sim.simulate_gateway_delivery()
         sim.simulate_channels_wake()
         sim.simulate_worker_acknowledge()
-        # Before interpretation checkpoint, lease expires
-        sim.simulate_worker_stale_lease()
+        # Before interpretation checkpoint, the simulated clock reaches the
+        # Core lease expiry, so stale-lease detection triggers failure.
+        assert sim.simulate_worker_stale_lease(current_time="2026-05-29T14:00:00Z") is True
         # Cleanup failure leads to quarantine
         sim.simulate_cleanup(complete_evidence=False)
         return sim.get_evidence()
@@ -837,6 +871,35 @@ class TestWorkerPoolMVPStaleLease:
         assert evidence.web_trace.state_label == "quarantined"
         assert evidence.web_trace.quarantine_status == "quarantined"
         assert evidence.web_trace.completion_status == "failed"
+
+    def test_stale_lease_helper_uses_simulated_clock(self):
+        assert lease_is_expired(
+            lease_expires_at="2026-05-29T14:00:00Z",
+            current_time="2026-05-29T13:59:59Z",
+        ) is False
+        assert lease_is_expired(
+            lease_expires_at="2026-05-29T14:00:00Z",
+            current_time="2026-05-29T14:00:00Z",
+        ) is True
+        assert lease_is_expired(
+            lease_expires_at="2026-05-29T14:00:00Z",
+            current_time="2026-05-29T14:00:01Z",
+        ) is True
+
+    def test_unexpired_lease_does_not_fail_worker(self):
+        sim = WorkerPoolMVPSimulator(scenario="stale_lease_clock_guard")
+        sim.simulate_assignment_create()
+        sim.simulate_gateway_delivery()
+        sim.simulate_channels_wake()
+        sim.simulate_worker_acknowledge()
+
+        expired = sim.simulate_worker_stale_lease(current_time="2026-05-29T13:59:59Z")
+
+        assert expired is False
+        assert sim.worker is not None
+        assert sim.worker.state == PoolRuntimeState.ACKNOWLEDGED
+        assert sim.core.status == "acknowledged"
+        assert "worker_stale_lease_checked_not_expired" in sim.timeline_states
 
 
 class TestWorkerPoolMVPMalformedPacket:
