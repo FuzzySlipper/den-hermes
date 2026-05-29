@@ -201,3 +201,23 @@ Before launching a real worker:
 - [ ] completion packet is posted only after artifact verification;
 - [ ] Den status/latest-completion observes the expected packet;
 - [ ] logs/artifacts are retained or cleanup policy is explicit.
+
+## Mandatory checkpoint protocol
+
+For tasks touching architecture, schema, wake, memory, or worker
+orchestration, the coder context packet must instruct the worker to
+post `interpretation_checkpoint` and `plan_checkpoint` to the Den
+task-thread before editing source files. See
+`docs/checkpoint-protocol-pilot.md` for the complete template set and
+mandatory/optional rules.
+
+Key rules for the operator:
+
+- Workers **must stop** after posting a mandatory checkpoint and wait
+  for a `checkpoint_response` before proceeding.
+- The operator (Runner) **must respond** to mandatory checkpoints
+  promptly; if unable, post `checkpoint_response` with
+  `verdict: blocked` so the worker does not hang indefinitely.
+- Checkpoint content lives in the Den task-thread metadata, not in
+  Den Channels direct-agent message bodies. Direct-agent messages
+  are wake-only surface.

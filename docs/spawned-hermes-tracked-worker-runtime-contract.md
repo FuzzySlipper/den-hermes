@@ -282,6 +282,24 @@ Rerun should:
 
 The remaining child tasks should use RED/GREEN checkpoint tests in this order.
 
+### 10.1 Runner-supervised checkpoint protocol
+
+For architecture/schema/wake/memory/worker-orchestration tasks, the
+`docs/checkpoint-protocol-pilot.md` document defines a mandatory
+checkpoint protocol. Workers on mandatory-gated tasks must stop after
+posting `interpretation_checkpoint` and `plan_checkpoint` to the Den
+task-thread until the Runner posts a `checkpoint_response`.
+
+Key integration rule: checkpoints are Den task-thread messages (not
+worker completion packets) and are coordinated through Den's existing
+messaging substrate. Den Channels direct-agent messages serve only as
+wake notifications for checkpoint-awaiting-review events.
+
+The existing lifecycle states (`registered`, `running`, `completed`,
+`failed`, `blocked`, `needs_input`, etc.) are unaffected. Checkpoints
+add an intermediate coordination layer between launch and completion
+for mandatory-gated work.
+
 ### #1374 — Den registration API
 
 Server/API tests:
