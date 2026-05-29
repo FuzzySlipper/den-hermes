@@ -609,6 +609,79 @@ def test_reviewer_artifact_rejects_word_first_failure(tmp_path):
     assert "looks_good" in (result.error or "")
 
 
+def test_reviewer_artifact_allows_dict_form_zero_failure(tmp_path):
+    """Regression: dict-form '{"failed": 0, "passed": 67}' should not block looks_good."""
+    env = fake_env(tmp_path)
+    env["FAKE_REVIEW_TESTS_RUN"] = json.dumps([
+        {"passed": 67, "failed": 0},
+    ])
+
+    result = run_hermes_worker(
+        task_id=1368,
+        run_id="run-dict-zero",
+        role="reviewer",
+        prompt="Review with dict-form zero failures.",
+        expected_artifact=tmp_path / ".den" / "runs" / "run-dict-zero" / "completion.json",
+        cwd=tmp_path,
+        env_overrides=env,
+    )
+
+    assert result.status == "completed", (
+        f"Expected completed, got status={result.status} error={result.error}"
+    )
+    assert result.artifact is not None
+    assert result.artifact.get("verdict") == "looks_good"
+
+
+def test_reviewer_artifact_rejects_dict_form_nonzero_failure(tmp_path):
+    """Dict-form '{"failed": 1, "passed": 2}' should still block looks_good."""
+    env = fake_env(tmp_path)
+    env["FAKE_REVIEW_TESTS_RUN"] = json.dumps([
+        {"failed": 1, "passed": 2},
+    ])
+
+    result = run_hermes_worker(
+        task_id=1368,
+        run_id="run-dict-nonzero",
+        role="reviewer",
+        prompt="Review with dict-form real failure.",
+        expected_artifact=tmp_path / ".den" / "runs" / "run-dict-nonzero" / "completion.json",
+        cwd=tmp_path,
+        env_overrides=env,
+    )
+
+    assert result.status == "failed"
+    assert result.artifact is None
+    assert "looks_good" in (result.error or "")
+    assert "tests_run" in (result.error or "")
+
+
+def test_reviewer_artifact_allows_shaped_1641_zero_failure(tmp_path):
+    """Synthetic #1641 rereview shape: structured tests_run with dict entries
+    that contain zero-failure counters like '{"failed": 0, "total": 67}'."""
+    env = fake_env(tmp_path)
+    env["FAKE_REVIEW_TESTS_RUN"] = json.dumps([
+        {"command": "git diff --check", "exit_code": 0, "result": "no whitespace errors"},
+        {"command": "python -m pytest -q", "exit_code": 0, "result": {"passed": 67, "failed": 0}},
+    ])
+
+    result = run_hermes_worker(
+        task_id=1368,
+        run_id="run-1641-shape",
+        role="reviewer",
+        prompt="Review #1641 work.",
+        expected_artifact=tmp_path / ".den" / "runs" / "run-1641-shape" / "completion.json",
+        cwd=tmp_path,
+        env_overrides=env,
+    )
+
+    assert result.status == "completed", (
+        f"Expected completed, got status={result.status} error={result.error}"
+    )
+    assert result.artifact is not None
+    assert result.artifact.get("verdict") == "looks_good"
+
+
 def test_coder_artifact_requires_branch_head_commit_and_tests(tmp_path):
     result = run_hermes_worker(
         task_id=1368,
