@@ -352,7 +352,9 @@ def select_action(
     dedupe_key = evidence.dedupe_key
     dedup_record = dedupe_records.get(dedupe_key)
 
-    # Rule 2: Dedupe suppressed
+    # Rule 2: Dedupe suppressed.  ``run_gopher_tick`` normally catches this
+    # during JSON validation before calling the FSM, but keep the FSM guard so
+    # direct ``select_action`` callers cannot bypass same-action suppression.
     if dedup_record and dedup_record.action == proposal.action:
         age = time.time() - dedup_record.timestamp
         if age < 300 and dedup_record.count >= 2:

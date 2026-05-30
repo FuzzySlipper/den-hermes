@@ -324,7 +324,7 @@ class TestStuckIncident:
 
     def test_repeated_stuck_checks_deduped(self, stuck_evidence: DeliveryEvidence, nudge_model_json: dict):
         """Repeated stuck checks should be deduped, not spam repeated nudges.
-        
+
         When dedupe blocks nudge (2+ same actions in 5min), FSM escalates
         to notify_human since evidence is still stuck. Different actions
         are not deduped against each other.
@@ -525,6 +525,24 @@ class TestBudgetAndConstraints:
         )
         assert packet.schema_valid is False
         assert any("budget exhausted" in e for e in packet.validation_errors)
+
+    def test_notify_budget_exhausted_rejected(self, fresh_evidence: DeliveryEvidence):
+        """Human notification should be rejected when budget is exhausted."""
+        notify_json = {
+            "action": "notify_human",
+            "reason": "target_offline",
+            "target_agent": "den-worker-alpha",
+            "channel_id": "wake-channel",
+            "message": "Notify human operator.",
+            "next_check_seconds": 30,
+        }
+        packet = run_gopher_tick(
+            evidence=fresh_evidence,
+            model_raw_json=notify_json,
+            notify_count=MAX_NOTIFICATION_COUNT,
+        )
+        assert packet.schema_valid is False
+        assert any("Notification budget exhausted" in e for e in packet.validation_errors)
 
     def test_next_check_seconds_clamped_low(self, fresh_evidence: DeliveryEvidence):
         """next_check_seconds below minimum should be clamped."""
@@ -728,15 +746,14 @@ class TestNoPostingPrivileges:
         import den_hermes.gopher as gopher_mod
 
         source = inspect.getsource(gopher_mod)
-        # Check no HTTP POST/mutation endpoints are hardcoded
+        # Check no HTTP POST/mutation endpoints are hardcoded in executable code.
         suspicious = ["channels/", "gateway/", ".post(", "requests.post"]
         for s in suspicious:
             if s in source:
                 # Allow http:// references only if they're in docstrings/comments
                 # about configurable endpoints
                 lines = [l for l in source.splitlines() if s in l and not l.strip().startswith("#")]
-                # Actually, let's just check there's no requests.post or urllib calls
-                pass
+                assert lines == []
 
         # Verify no 'requests' or 'httpx' import that would enable posting
         assert "import requests" not in source

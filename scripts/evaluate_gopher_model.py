@@ -306,23 +306,23 @@ def _call_openai(
         msg = data.get("choices", [{}])[0].get("message", {})
         content = (msg.get("content") or "").strip()
         reasoning = (msg.get("reasoning_content") or "").strip()
-        
+
         # Try to find JSON in content first, then reasoning_content
         raw_text = content if content else reasoning
         if not raw_text:
             return None
-        
+
         # Handle markdown code fences
         if raw_text.startswith("```"):
             lines = raw_text.splitlines()
             raw_text = "\n".join(line for line in lines if not line.startswith("```"))
-        
+
         # Try direct JSON parse
         try:
             return json.loads(raw_text)
         except json.JSONDecodeError:
             pass
-        
+
         # Try to find a JSON object via regex (handles JSON embedded in reasoning prose)
         import re
         # Match {...} from first { to matching }
@@ -342,7 +342,7 @@ def _call_openai(
                     except json.JSONDecodeError:
                         pass
                     json_start = -1
-        
+
         return None
     except (json.JSONDecodeError, ConnectionError, TimeoutError, OSError) as e:
         print(f"  [ERROR] API call failed: {e}", file=sys.stderr)
