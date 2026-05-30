@@ -17,8 +17,13 @@ This document covers:
 - How to diagnose stuck leases (Section 3).
 - How release/quarantine works (Section 4).
 - How to observe an assignment in Den Web (Section 5).
-- Constrained live-smoke runbook/checklist (Section 6).
-- Operator troubleshooting (Section 7).
+|- Constrained live-smoke runbook/checklist (Section 6).
+|- Live pool worker provisioning (Section 7).
+|- Pilot and test member lifecycle (Section 8).
+|- Green-path workflow (Section 9).
+|- Ownership boundaries (Section 10).
+|- First-real-task checklist (Section 11).
+|- Operator troubleshooting (Section 12).
 
 ## 2. Substrate selection guide
 
@@ -828,9 +833,9 @@ attempt to launch Scout pool workers until:
 | Validate role catalog | `python scripts/validate_role_catalog.py` | 0 |
 | Git hygiene | `git diff --check` | 0 |
 
-## 8. Operator troubleshooting
+## 12. Operator troubleshooting
 
-### 8.1 "Assignment not delivered" — Gateway shows `failed` or `pending`
+### 12.1 "Assignment not delivered" — Gateway shows `failed` or `pending`
 
 Check:
 - Is the pool worker process running? If not, start it.
@@ -838,7 +843,7 @@ Check:
 - Are delivery retries configured? The fake E2E allows 3 retries
   before failing.
 
-### 8.2 "Worker won't acknowledge" — worker running but no ack
+### 12.2 "Worker won't acknowledge" — worker running but no ack
 
 Check:
 - Is the assignment identity valid? A mismatched `assignment_id` or
@@ -849,7 +854,7 @@ Check:
 - Check `can_accept_assignments()` — only `RELEASED` workers can accept
   new work.
 
-### 8.3 "Checkpoint rejected" — Core says wrong type or mismatched identity
+### 12.3 "Checkpoint rejected" — Core says wrong type or mismatched identity
 
 Check:
 - Does the checkpoint `assignment_id` and `run_id` match the
@@ -858,7 +863,7 @@ Check:
   transitions in `PoolWorkerRuntime._require_state()`.
 - Is the checkpoint `type` in `CANONICAL_CHECKPOINT_TYPES`?
 
-### 8.4 "Cleanup failed" — `PoolCleanupError` raised
+### 12.4 "Cleanup failed" — `PoolCleanupError` raised
 
 Check:
 - Which fields are missing? Run `CleanupEvidence.missing_fields()`.
@@ -869,7 +874,7 @@ Check:
 - In production, ensure your cleanup implementation sets all four
   fields to `True` before calling `cleanup()`.
 
-### 8.5 "Worker stuck in terminal state" — no release or quarantine
+### 12.5 "Worker stuck in terminal state" — no release or quarantine
 
 Check:
 - Is `quarantine_required()` returning `True`? If so, the worker
@@ -877,7 +882,7 @@ Check:
 - Call `cleanup(evidence)` with complete evidence, then either
   `release()` or `quarantine()`.
 
-### 8.6 "Den Web trace shows wrong state" — projection out of sync
+### 12.6 "Den Web trace shows wrong state" — projection out of sync
 
 Check:
 - Did the assignment progress through the correct timeline? The
