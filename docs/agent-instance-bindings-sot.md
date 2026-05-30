@@ -75,18 +75,43 @@ relationships, data flows, and which one to use for each purpose.
               (primary wake path)            (secondary wake path)
 ```
 
-## Current Gap
+## Current Gap — Updated for Pool-Member Identity
 
-| Agent Identity | Channels Member | Core Binding | Gateway Process |
-|---|---|---|---|
-| den-hermes-runner | ✓ | ✓ (canary coder only) | ✓ |
-| den-mcp-runner | ✓ | ✗ | ✓ |
-| den-mcp-planner | ✓ | ✗ | ✓ |
-| den-channels-runner | ✓ | ✗ | ✓ |
-| den-desktop-runner | ✓ | ✗ | ✓ |
-| voxelforge-runner | ✓ | ✗ | ✓ |
-| voxelforge-planner | ✓ | ✗ | ✓ |
-| (all others) | ✓ | ✗ | ✓ |
+### Profile-Identity vs Worker-Identity duality
+
+As of task #1767, shared spawned-Hermes role profiles (spawned-coder,
+spawned-reviewer, spawned-validator, spawned-drift-checker, spawned-packet-auditor)
+use **identity duality**:
+
+- **`profile_identity`** (shared display/capability field): the Hermes profile
+  name (e.g., `spawned-coder`).  This is the `agent_identity` in Den Channels
+  memberships and Core agent_instance_bindings.
+- **`worker_identity`** (concrete): the `pool_member_id` that distinguishes one
+  pool worker from another within the same role (e.g., `pool-coder-01`).
+
+The Bridge (`DenChannelsWakeBridge`) now supports selecting concrete bindings
+from among shared-profile matches when the delivery target carries a
+`pool_member_id`, `concrete_identity`, or `agent_instance_id`.  Without a
+concrete target, multiple shared-profile bindings still fail closed as
+`ambiguous_binding`.
+
+### Agent Binding Matrix
+
+| Agent Identity | Channels Member | Core Binding | Gateway Process | Pool Member ID |
+|---|---|---|---|---|
+| den-hermes-runner | ✓ | ✓ (canary coder only) | ✓ | (control-plane only) |
+| den-mcp-runner | ✓ | ✗ | ✓ | — |
+| den-mcp-planner | ✓ | ✗ | ✓ | — |
+| den-channels-runner | ✓ | ✗ | ✓ | — |
+| den-desktop-runner | ✓ | ✗ | ✓ | — |
+| voxelforge-runner | ✓ | ✗ | ✓ | — |
+| voxelforge-planner | ✓ | ✗ | ✓ | — |
+| spawned-coder | ✓ | ✗ | ✓ | pool-coder-01, pool-coder-02, ... |
+| spawned-reviewer | ✓ | ✗ | ✓ | pool-reviewer-01, ... |
+| spawned-validator | ✓ | ✗ | ✓ | pool-validator-01, ... |
+| spawned-drift-checker | ✓ | ✗ | ✓ | pool-drift-01, ... |
+| spawned-packet-auditor | ✓ | ✗ | ✓ | pool-audit-01, ... |
+| (all others) | ✓ | ✗ | ✓ | — |
 
 Most active gateway profiles have zero Core bindings.  The primary
 Channels wake path works without bindings.  The secondary binding-based

@@ -617,5 +617,41 @@ contains these fields for each durable handle:
 - `state_label` (string)
 - `checkpoints` (string — e.g. "2/0")
 - `completion_status` (string | null)
-- `release_status` (string)
-- `quarantine_status` (string | null)
+
+## Appendix C: Downstream notes for task #1739
+
+### Pool-member identity naming convention
+
+Spanned by task #1767.  Concrete uniqueness for shared spawned-Hermes role
+profiles comes from `pool_member_id` / `agent_instance_id` — never from
+duplicate Hermes profile names.
+
+**Identity fields in Core/Channels/Gateway:**
+
+| Layer | Shared (profile_identity) | Concrete (worker_identity) |
+|---|---|---|
+| Core binding | `agent_identity` (e.g. `spawned-coder`) | `instance_id` + optional `pool_member_id` |
+| Channels lobby | `agent_identity` | `agent_instance_id` / `pool_member_id` |
+| Gateway delivery target | `agent_identity` | `pool_member_id` / `concrete_identity` |
+| Bridge envelope | `profile_identity` | `worker_identity` / `pool_member_id` |
+| Hermes transport env | `DEN_HERMES_PROFILE` | `DEN_HERMES_POOL_MEMBER_ID` |
+
+**Concrete matching in DenChannelsWakeBridge:**
+
+1. When `len(bindings) > 1` and delivery has `pool_member_id`,
+   `concrete_identity`, or `agent_instance_id`, filter bindings to
+   matching `instance_id` or `pool_member_id`.
+2. Exactly one match → proceed.  Zero matches → `concrete_binding_not_found`.
+3. No concrete target with multiple bindings → `ambiguous_binding` (fail closed).
+
+**First pilot role:** `spawned-coder` with pool member IDs like
+`pool-coder-01`, `pool-coder-02`, etc.
+
+**Upcoming work (#1739):**
+- Complete PoolWorkerRuntime integration with concrete identity and
+  pool_member_id propagation through checkpoint lifecycle.
+- Registry-backed pool-worker registration with `pool_member_id` in
+  Core agent_instance_bindings metadata.
+- Gateway consumer heartbeat payload includes `pool_member_id`.
+- Lobby presence for pool members in Channels #worker-pool keyed by
+  `concrete_identity = pool_member_id??agent_instance_id??''`.

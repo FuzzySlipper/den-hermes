@@ -94,6 +94,8 @@ def test_consumer_claims_gateway_deliveries_wakes_profile_and_marks_delivered():
         "role": "runner",
         "profile": "den-channels-runner",
         "adapter_instance_id": "den-k8plus:den-channels-runner:runner:systemd-test",
+        "profile_identity": "den-channels-runner",
+        "worker_identity": "den-k8plus:den-channels-runner:runner:systemd-test",
     }
     assert wake["envelope"]["reply"]["source_kind"] == "external_adapter_message"
     assert wake["envelope"]["reply"]["source_id"] == "44"

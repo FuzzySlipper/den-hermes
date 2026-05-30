@@ -115,6 +115,7 @@ class SpawnedHermesProfileWakeTransport:
                 "DEN_HERMES_BINDING_INSTANCE_ID": _binding_instance_id(binding),
                 "DEN_HERMES_PROFILE": binding_profile,
                 "DEN_HERMES_WAKE_RUN_ID": run_id,
+                "DEN_HERMES_POOL_MEMBER_ID": _binding_pool_member_id(binding) or "",
             }
         )
         log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -469,6 +470,7 @@ class DenChannelsWakeBridge:
         project_id = _required_str(target, "project_id")
         agent_identity = _required_str(target, "agent_identity")
         role = _optional_str(target.get("role"))
+        concrete_identity = _resolve_concrete_target(target)
         if not role:
             diagnostic = f"Delivery target is missing required role for {agent_identity} in {project_id}"
             return self._fail_closed(
@@ -499,14 +501,47 @@ class DenChannelsWakeBridge:
                 adapter_instance_id=adapter_instance_id,
             )
         if len(bindings) > 1:
-            instance_ids = ", ".join(_binding_instance_id(binding) for binding in bindings)
-            diagnostic = f"Ambiguous Hermes profile binding matched {agent_identity}/{role or '*'} in {project_id}: {instance_ids}"
-            return self._fail_closed(
-                delivery=delivery,
-                diagnostic=diagnostic,
-                failure_category="ambiguous_binding",
-                binding_count=len(bindings),
-            )
+            if concrete_identity:
+                narrowed = _filter_bindings_by_concrete_identity(bindings, concrete_identity)
+                if not narrowed:
+                    instance_ids = ", ".join(_binding_instance_id(b) for b in bindings)
+                    diagnostic = (
+                        f"No active binding matched concrete identity {concrete_identity!r} "
+                        f"among {agent_identity}/{role} in {project_id}: {instance_ids}"
+                    )
+                    return self._fail_closed(
+                        delivery=delivery,
+                        diagnostic=diagnostic,
+                        failure_category="concrete_binding_not_found",
+                        binding_count=len(bindings),
+                    )
+                if len(narrowed) > 1:
+                    instance_ids = ", ".join(_binding_instance_id(b) for b in narrowed)
+                    diagnostic = (
+                        f"Concrete identity {concrete_identity!r} matched multiple active bindings "
+                        f"for {agent_identity}/{role} in {project_id}: {instance_ids}"
+                    )
+                    return self._fail_closed(
+                        delivery=delivery,
+                        diagnostic=diagnostic,
+                        failure_category="ambiguous_concrete_binding",
+                        binding_count=len(narrowed),
+                    )
+                bindings = narrowed
+            else:
+                instance_ids = ", ".join(_binding_instance_id(b) for b in bindings)
+                diagnostic = (
+                    f"Ambiguous Hermes profile binding matched {agent_identity}/{role or '*'} "
+                    f"in {project_id}: {instance_ids}. "
+                    "Provide a concrete_identity, pool_member_id, or agent_instance_id "
+                    "in the delivery target to disambiguate."
+                )
+                return self._fail_closed(
+                    delivery=delivery,
+                    diagnostic=diagnostic,
+                    failure_category="ambiguous_binding",
+                    binding_count=len(bindings),
+                )
 
         binding = bindings[0]
         adapter_instance_id = _binding_instance_id(binding)
@@ -619,6 +654,11 @@ def _build_delivery_envelope(delivery: Mapping[str, Any], *, binding: Mapping[st
     target = _sanitize_mapping(_mapping(delivery.get("target"), "target"))
     target["profile"] = _binding_profile(binding)
     target["adapter_instance_id"] = _binding_instance_id(binding)
+    pool_member_id = _binding_pool_member_id(binding)
+    if pool_member_id:
+        target["pool_member_id"] = pool_member_id
+    target["profile_identity"] = _binding_profile(binding)
+    target["worker_identity"] = pool_member_id or _binding_instance_id(binding)
     return {
         "type": "den_delivery",
         "schema_version": 1,
@@ -721,6 +761,62 @@ def _binding_metadata(binding: Mapping[str, Any]) -> Mapping[str, Any]:
             return {}
         return parsed if isinstance(parsed, Mapping) else {}
     return {}
+
+
+def _binding_pool_member_id(binding: Mapping[str, Any]) -> str | None:
+    """Extract the pool_member_id from a binding, if present.
+
+    Pool member identity lives in:
+      1. binding top-level "pool_member_id" field
+      2. binding metadata "pool_member_id" key
+      3. binding top-level "worker_identity" field
+    Returns None if absent.
+    """
+    value = binding.get("pool_member_id")
+    if value:
+        return str(value)
+    metadata = _binding_metadata(binding)
+    value = metadata.get("pool_member_id")
+    if value:
+        return str(value)
+    value = binding.get("worker_identity")
+    if value:
+        return str(value)
+    return None
+
+
+def _resolve_concrete_target(target: Mapping[str, Any]) -> str | None:
+    """Extract a concrete identity from a delivery target.
+
+    Resolution order:
+      1. target.pool_member_id
+      2. target.concrete_identity
+      3. target.agent_instance_id
+    Returns None if no concrete identity is present.
+    """
+    value = target.get("pool_member_id")
+    if value:
+        return str(value)
+    value = target.get("concrete_identity")
+    if value:
+        return str(value)
+    value = target.get("agent_instance_id")
+    if value:
+        return str(value)
+    return None
+
+
+def _filter_bindings_by_concrete_identity(
+    bindings: list[Mapping[str, Any]], concrete_identity: str
+) -> list[Mapping[str, Any]]:
+    """Filter bindings to only those whose instance ID or pool member ID matches the concrete identity."""
+    matches: list[Mapping[str, Any]] = []
+    for binding in bindings:
+        bid = _binding_instance_id(binding)
+        pmid = _binding_pool_member_id(binding)
+        if bid == concrete_identity or (pmid is not None and pmid == concrete_identity):
+            matches.append(binding)
+    return matches
 
 
 def _default_wake_run_id() -> str:

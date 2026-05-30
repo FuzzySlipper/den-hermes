@@ -153,7 +153,8 @@ def test_ambiguous_target_fails_closed_without_wake():
     result = bridge.handle_delivery(delivery())
 
     assert result.status == "failed"
-    assert result.diagnostic == "Ambiguous Hermes profile binding matched den-hermes-runner/runner in den-hermes-bridge: one, two"
+    assert result.diagnostic.startswith("Ambiguous Hermes profile binding matched den-hermes-runner/runner in den-hermes-bridge: one, two")
+    assert "disambiguate" in result.diagnostic
     assert transport.wakes == []
     assert tools.agent_stream_messages[0]["metadata"]["binding_count"] == 2
 
@@ -591,3 +592,265 @@ def test_end_to_end_wake_then_visible_reply_smoke():
     assert reply.status == "posted"
     assert transport.wakes[0]["envelope"]["delivery_request_id"] == 123
     assert tools.project_messages[0]["content"] == "visible reply from Hermes"
+
+
+# ---------------------------------------------------------------------------
+# Spawned role pool-member identity tests
+# ---------------------------------------------------------------------------
+
+
+def spawned_binding(**overrides):
+    """Create a spawned-role binding with pool_member_id."""
+    base = {
+        "id": 100,
+        "project_id": "den-hermes-bridge",
+        "agent_identity": "spawned-coder",
+        "role": "coder",
+        "transport_kind": "hermes_profile",
+        "instance_id": "hermes:den-k8:spawned-coder:wake-abc123",
+        "pool_member_id": "pool-coder-01",
+        "profile": "spawned-coder",
+        "machine": "den-k8",
+        "status": "active",
+        "metadata": {"profile": "spawned-coder", "pool_member_id": "pool-coder-01", "machine": "den-k8"},
+    }
+    base.update(overrides)
+    return base
+
+
+def spawned_delivery(**overrides):
+    """Create a delivery targeting a spawned-coder with concrete identity."""
+    base = {
+        "delivery_request_id": 456,
+        "attempt_id": 789,
+        "delivery_mode": "wake",
+        "dedupe_key": "pool-assign:999:wake:spawned-coder",
+        "correlation_id": "corr-pool-999",
+        "target": {
+            "agent_identity": "spawned-coder",
+            "project_id": "den-hermes-bridge",
+            "role": "coder",
+            "pool_member_id": "pool-coder-01",
+            "concrete_identity": "pool-coder-01",
+        },
+        "source": {"source_kind": "worker_pool", "source_id": "assign-001"},
+        "message": {"summary": "Wake pool coder for assignment", "reason": "pool_assignment"},
+    }
+    base.update(overrides)
+    return base
+
+
+def test_shared_profile_ambiguous_without_concrete_target_fails_closed():
+    """Two spawned-coder bindings and no concrete target → fail closed (ambiguous)."""
+    tools = RecordingDenTools([
+        spawned_binding(instance_id="pool-coder-01", pool_member_id="pool-coder-01"),
+        spawned_binding(instance_id="pool-coder-02", pool_member_id="pool-coder-02"),
+    ])
+    transport = RecordingHermesTransport()
+    bridge = DenChannelsWakeBridge(den_tools=tools, hermes_transport=transport, store=InMemoryWakeStore())
+
+    delivery_no_concrete = spawned_delivery()
+    delivery_no_concrete["target"] = {
+        "agent_identity": "spawned-coder",
+        "project_id": "den-hermes-bridge",
+        "role": "coder",
+    }
+
+    result = bridge.handle_delivery(delivery_no_concrete)
+
+    assert result.status == "failed"
+    assert "ambiguous" in (result.diagnostic or "").lower()
+    assert "disambiguate" in (result.diagnostic or "")
+    assert transport.wakes == []
+    assert tools.agent_stream_messages[0]["metadata"]["failure_category"] == "ambiguous_binding"
+
+
+def test_shared_profile_with_pool_member_id_resolves_concrete_binding():
+    """Two spawned-coder bindings with pool_member_id target → resolves to matching one."""
+    tools = RecordingDenTools([
+        spawned_binding(instance_id="pool-coder-01", pool_member_id="pool-coder-01"),
+        spawned_binding(instance_id="pool-coder-02", pool_member_id="pool-coder-02"),
+    ])
+    transport = RecordingHermesTransport()
+    bridge = DenChannelsWakeBridge(den_tools=tools, hermes_transport=transport, store=InMemoryWakeStore())
+
+    result = bridge.handle_delivery(spawned_delivery())
+
+    assert result.status == "delivered"
+    assert result.adapter_instance_id == "pool-coder-01"
+    assert len(transport.wakes) == 1
+    envelope = transport.wakes[0]["envelope"]
+    assert envelope["target"]["pool_member_id"] == "pool-coder-01"
+    assert envelope["target"]["profile_identity"] == "spawned-coder"
+    assert envelope["target"]["worker_identity"] == "pool-coder-01"
+
+
+def test_shared_profile_with_instance_id_resolves_concrete_binding():
+    """Two spawned-coder bindings with agent_instance_id target → resolves to matching one."""
+    tools = RecordingDenTools([
+        spawned_binding(instance_id="hermes:den-k8:spawned-coder:wake-abc123", pool_member_id="pool-coder-01"),
+        spawned_binding(instance_id="hermes:den-k8:spawned-coder:wake-def456", pool_member_id="pool-coder-02"),
+    ])
+    transport = RecordingHermesTransport()
+    bridge = DenChannelsWakeBridge(den_tools=tools, hermes_transport=transport, store=InMemoryWakeStore())
+
+    result = bridge.handle_delivery(
+        spawned_delivery(
+            target={
+                "agent_identity": "spawned-coder",
+                "project_id": "den-hermes-bridge",
+                "role": "coder",
+                "agent_instance_id": "hermes:den-k8:spawned-coder:wake-def456",
+            },
+        )
+    )
+
+    assert result.status == "delivered"
+    assert result.adapter_instance_id == "hermes:den-k8:spawned-coder:wake-def456"
+    assert len(transport.wakes) == 1
+
+
+def test_shared_profile_concrete_target_no_match_fails_closed():
+    """Concrete target that doesn't match any binding → fail closed with diagnostic."""
+    tools = RecordingDenTools([
+        spawned_binding(instance_id="pool-coder-01", pool_member_id="pool-coder-01"),
+        spawned_binding(instance_id="pool-coder-02", pool_member_id="pool-coder-02"),
+    ])
+    transport = RecordingHermesTransport()
+    bridge = DenChannelsWakeBridge(den_tools=tools, hermes_transport=transport, store=InMemoryWakeStore())
+
+    result = bridge.handle_delivery(
+        spawned_delivery(
+            target={
+                "agent_identity": "spawned-coder",
+                "project_id": "den-hermes-bridge",
+                "role": "coder",
+                "pool_member_id": "pool-coder-99",
+            },
+        )
+    )
+
+    assert result.status == "failed"
+    assert ("concrete identity" in (result.diagnostic or "").lower()
+            or "no active binding" in (result.diagnostic or "").lower())
+    assert "pool-coder-99" in (result.diagnostic or "")
+    assert transport.wakes == []
+    assert tools.agent_stream_messages[0]["metadata"]["failure_category"] == "concrete_binding_not_found"
+
+
+def test_shared_profile_concrete_target_matching_multiple_bindings_fails_closed():
+    """Concrete target must select exactly one active binding, not first-match silently."""
+    tools = RecordingDenTools([
+        spawned_binding(instance_id="pool-coder-01a", pool_member_id="pool-coder-01"),
+        spawned_binding(instance_id="pool-coder-01b", pool_member_id="pool-coder-01"),
+    ])
+    transport = RecordingHermesTransport()
+    bridge = DenChannelsWakeBridge(den_tools=tools, hermes_transport=transport, store=InMemoryWakeStore())
+
+    result = bridge.handle_delivery(spawned_delivery())
+
+    assert result.status == "failed"
+    assert "matched multiple active bindings" in (result.diagnostic or "")
+    assert transport.wakes == []
+    assert tools.agent_stream_messages[0]["metadata"]["failure_category"] == "ambiguous_concrete_binding"
+    assert tools.agent_stream_messages[0]["metadata"]["binding_count"] == 2
+
+
+def test_envelope_includes_pool_member_id_and_identity_fields_when_binding_has_pool_member():
+    """Delivery envelope should include pool_member_id, profile_identity, and worker_identity."""
+    tools = RecordingDenTools([spawned_binding()])
+    transport = RecordingHermesTransport()
+    bridge = DenChannelsWakeBridge(den_tools=tools, hermes_transport=transport, store=InMemoryWakeStore())
+
+    result = bridge.handle_delivery(spawned_delivery())
+
+    assert result.status == "delivered"
+    envelope = transport.wakes[0]["envelope"]
+    target = envelope["target"]
+    assert target["pool_member_id"] == "pool-coder-01"
+    assert target["profile_identity"] == "spawned-coder"
+    assert target["worker_identity"] == "pool-coder-01"
+    assert target["adapter_instance_id"] == "hermes:den-k8:spawned-coder:wake-abc123"
+    assert target["profile"] == "spawned-coder"
+
+
+def test_envelope_omits_pool_member_id_when_binding_lacks_one():
+    """Delivery envelope should not include pool_member_id if binding doesn't have one."""
+    tools = RecordingDenTools([active_binding()])
+    transport = RecordingHermesTransport()
+    bridge = DenChannelsWakeBridge(den_tools=tools, hermes_transport=transport, store=InMemoryWakeStore())
+
+    result = bridge.handle_delivery(delivery())
+
+    assert result.status == "delivered"
+    envelope = transport.wakes[0]["envelope"]
+    target = envelope["target"]
+    assert "pool_member_id" not in target
+    assert target["profile_identity"] == "den-hermes-runner"
+    assert target["worker_identity"] == "hermes:den-k8:den-hermes-runner:gateway-main"
+
+
+def test_delivery_with_concrete_identity_resolves_single_binding_no_ambiguity():
+    """Single binding with concrete identity should behave identically to existing single-binding path."""
+    tools = RecordingDenTools([spawned_binding()])
+    transport = RecordingHermesTransport()
+    bridge = DenChannelsWakeBridge(den_tools=tools, hermes_transport=transport, store=InMemoryWakeStore())
+
+    result = bridge.handle_delivery(spawned_delivery())
+
+    assert result.status == "delivered"
+    assert len(transport.wakes) == 1
+    assert result.adapter_instance_id == "hermes:den-k8:spawned-coder:wake-abc123"
+
+
+def test_transport_env_includes_pool_member_id():
+    """Verify that SpawnedHermesProfileWakeTransport sets DEN_HERMES_POOL_MEMBER_ID."""
+    registry_path = Path(__file__).parent / "test_registry_runtimes.yaml"
+    if not registry_path.exists():
+        registry_path = Path("/home/agents/runtime/spawned-hermes-runtimes.yaml")
+
+    launches = []
+
+    def popen_factory(*args, **kwargs):
+        proc = FakePopen(*args, **kwargs)
+        launches.append(proc)
+        return proc
+
+    transport = SpawnedHermesProfileWakeTransport(
+        runtime_registry_path=registry_path,
+        popen_factory=popen_factory,
+        run_id_factory=lambda: "pool-wake-1",
+    )
+
+    # Use a runner-role binding that bypasses the worker registry fallback path
+    binding = spawned_binding(role="runner", profile="den-hermes-runner", agent_identity="den-hermes-runner")
+    transport.wake_profile(binding=binding, envelope={"type": "den_delivery", "delivery_request_id": 123})
+
+    assert len(launches) == 1
+    env = launches[0].env
+    assert env.get("DEN_HERMES_POOL_MEMBER_ID") == "pool-coder-01"
+
+
+def test_transport_env_pool_member_id_empty_when_binding_lacks_one():
+    """DEN_HERMES_POOL_MEMBER_ID should be empty string when binding has no pool_member_id."""
+    registry_path = Path("/home/agents/runtime/spawned-hermes-runtimes.yaml")
+
+    launches = []
+
+    def popen_factory(*args, **kwargs):
+        proc = FakePopen(*args, **kwargs)
+        launches.append(proc)
+        return proc
+
+    transport = SpawnedHermesProfileWakeTransport(
+        runtime_registry_path=registry_path,
+        popen_factory=popen_factory,
+        run_id_factory=lambda: "plain-wake-1",
+    )
+
+    binding = active_binding()
+    transport.wake_profile(binding=binding, envelope={"type": "den_delivery", "delivery_request_id": 123})
+
+    assert len(launches) == 1
+    env = launches[0].env
+    assert env.get("DEN_HERMES_POOL_MEMBER_ID") == ""

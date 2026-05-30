@@ -143,7 +143,32 @@ def _normalize_binding(raw: Mapping[str, Any]) -> dict[str, Any]:
         "is_stale": bool(raw.get("is_stale") or raw.get("isStale") or False),
         "metadata": metadata,
         "profile": raw.get("profile") or metadata.get("profile"),
+        "pool_member_id": raw.get("pool_member_id") or raw.get("poolMemberId") or metadata.get("pool_member_id"),
+        "worker_identity": raw.get("worker_identity") or raw.get("workerIdentity") or metadata.get("worker_identity"),
     }
+
+
+def _binding_pool_member_id(binding: Mapping[str, Any]) -> str | None:
+    """Extract the pool_member_id from a binding, if present.
+
+    Pool member identity lives in:
+      1. binding top-level "pool_member_id" field
+      2. binding metadata "pool_member_id" key
+      3. binding top-level "worker_identity" field
+    Returns None if absent.
+    """
+    value = binding.get("pool_member_id")
+    if value:
+        return str(value)
+    metadata = binding.get("metadata") or {}
+    if isinstance(metadata, Mapping):
+        value = metadata.get("pool_member_id")
+        if value:
+            return str(value)
+    value = binding.get("worker_identity")
+    if value:
+        return str(value)
+    return None
 
 
 def _metadata(raw: Mapping[str, Any]) -> dict[str, Any]:
@@ -188,13 +213,18 @@ def _binding_heartbeat_payload(binding: Mapping[str, Any]) -> dict[str, Any]:
 
 def _delivery_to_envelope(delivery: Mapping[str, Any], binding: Mapping[str, Any]) -> dict[str, Any]:
     metadata = _parsed_delivery_metadata(delivery)
+    pool_member_id = _binding_pool_member_id(binding)
     target = {
         "project_id": delivery.get("project_id") or delivery.get("projectId") or binding.get("project_id"),
         "agent_identity": binding.get("agent_identity"),
         "role": binding.get("role"),
         "profile": binding.get("profile"),
         "adapter_instance_id": binding.get("adapter_instance_id"),
+        "profile_identity": binding.get("profile"),
+        "worker_identity": pool_member_id or binding.get("adapter_instance_id"),
     }
+    if pool_member_id:
+        target["pool_member_id"] = pool_member_id
     source = {
         "source_kind": delivery.get("source_kind") or delivery.get("sourceKind"),
         "source_id": delivery.get("source_id") or delivery.get("sourceId"),
