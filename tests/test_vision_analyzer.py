@@ -43,6 +43,9 @@ from den_hermes.vision_analyzer import (
     validate_vision_request,
 )
 
+from scripts.serve_vision_analyzer import VisionAnalyzerHandler
+from http.server import HTTPServer
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -850,3 +853,232 @@ class TestCoreEnvelopeCompatibility:
         assert len(output["injection_like_text"]) > 0
         # Verify injection text is reported as data, not obeyed
         assert "ignore" in output["injection_like_text"][0].lower()
+
+
+# ---------------------------------------------------------------------------
+# Tests: HTTP handler integration (server-based)
+# ---------------------------------------------------------------------------
+
+
+class TestHttpHandlerIntegration:
+    """Real HTTP integration tests: starts the server, sends Core camelCase envelopes."""
+
+    @pytest.fixture(autouse=True)
+    def _setup_server(self):
+        """Start the VisionAnalyzerHandler on a random port in a background thread."""
+        import socket
+        import threading
+
+        # Find a free port
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+        sock.close()
+
+        self.server = HTTPServer(("127.0.0.1", port), VisionAnalyzerHandler)
+        self.port = port
+        self.base_url = f"http://127.0.0.1:{port}"
+
+        # Ensure fake analyzer mode
+        VisionAnalyzerHandler.use_fake_analyzer = True
+
+        thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        thread.start()
+
+        # Give server a moment to start
+        import time
+
+        time.sleep(0.05)
+
+        yield
+
+        self.server.shutdown()
+        thread.join(timeout=2)
+
+    def _post(self, path: str, body: bytes | None = None) -> tuple[int, dict[str, Any]]:
+        """Send a POST request and return (status_code, parsed_json)."""
+        import http.client
+
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        try:
+            headers = {"Content-Type": "application/json"}
+            if body is not None:
+                headers["Content-Length"] = str(len(body))
+            conn.request("POST", path, body=body, headers=headers)
+            resp = conn.getresponse()
+            status = resp.status
+            raw = resp.read()
+            data: dict[str, Any] = json.loads(raw)
+            return status, data
+        finally:
+            conn.close()
+
+    def _get(self, path: str) -> tuple[int, dict[str, Any]]:
+        """Send a GET request and return (status_code, parsed_json)."""
+        import http.client
+
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        try:
+            conn.request("GET", path)
+            resp = conn.getresponse()
+            status = resp.status
+            raw = resp.read()
+            data: dict[str, Any] = json.loads(raw)
+            return status, data
+        finally:
+            conn.close()
+
+    def _core_camelcase_envelope(self, image_ref: str = "https://example.com/test.png") -> bytes:
+        """Build a Core camelCase envelope as JSON bytes."""
+        import time as time_module
+
+        deadline = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        body = {
+            "invocationId": str(uuid.uuid4()),
+            "capabilityId": CAPABILITY_ID,
+            "capabilityVersion": CAPABILITY_VERSION,
+            "caller": {"agent": "hermes", "projectId": "den-hermes-bridge", "taskId": 1750},
+            "sideEffectLevel": "read_only",
+            "deadlineUtc": deadline,
+            "request": {
+                "imageRef": image_ref,
+                "mode": "general",
+                "question": "What is in this test image?",
+                "includeOcr": True,
+                "includeRegions": False,
+                "outputDetail": "auto",
+            },
+            "safety": {},
+        }
+        return json.dumps(body).encode("utf-8")
+
+    # R1750-2: Core camelCase integration test
+    def test_core_camelcase_envelope_returns_camelcase_response(self):
+        """Send Core's camelCase envelope, assert camelCase response fields."""
+        body_bytes = self._core_camelcase_envelope()
+        status, data = self._post("/vision/analyze-image", body_bytes)
+        assert status == 200, f"Expected 200, got {status}: {data}"
+
+        # Response fields are Core camelCase
+        assert "outputSummary" in data, f"Missing outputSummary, keys: {list(data.keys())}"
+        assert "output" in data
+        assert "outputArtifactRefs" in data, f"Missing outputArtifactRefs, keys: {list(data.keys())}"
+        assert "timingsMs" in data, f"Missing timingsMs, keys: {list(data.keys())}"
+        assert "model" in data
+        assert "cost" in data
+        assert "metadata" in data
+        assert data["status"] == "completed"
+
+        # output is a JSON string parseable to VisionOutput
+        output_str = data["output"]
+        assert isinstance(output_str, str), f"Expected str for output, got {type(output_str)}"
+        vision_data = json.loads(output_str)
+        assert "summary" in vision_data
+        assert "answer" in vision_data
+        assert "confidence" in vision_data
+
+        # model is an object with provider/name/version
+        model = data["model"]
+        assert isinstance(model, dict)
+        assert "provider" in model
+        assert "name" in model
+        assert "version" in model
+
+        # timingsMs values are integers
+        for key, val in data["timingsMs"].items():
+            assert isinstance(val, int), f"Expected int for timingsMs[{key}], got {type(val)}"
+
+        # cost values are numeric
+        for key, val in data["cost"].items():
+            assert isinstance(val, (int, float)), f"Expected numeric for cost[{key}], got {type(val)}"
+
+    # R1750-2: Snake_case request also works (backward compat)
+    def test_snake_case_request_still_works(self):
+        """Prototype snake_case request envelope still works."""
+        deadline_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        body = {
+            "invocation_id": str(uuid.uuid4()),
+            "capability_id": CAPABILITY_ID,
+            "capability_version": CAPABILITY_VERSION,
+            "caller": "test-runner",
+            "side_effect_level": "read_only",
+            "deadline_utc": deadline_str,
+            "request": {
+                "image_ref": "https://example.com/prototype.png",
+                "mode": "general",
+                "question": "Does snake_case still work?",
+                "include_ocr": True,
+            },
+            "safety": {},
+        }
+        status, data = self._post("/vision/analyze-image", json.dumps(body).encode("utf-8"))
+        assert status == 200, f"Expected 200, got {status}: {data}"
+        # Response is still camelCase
+        assert "outputSummary" in data
+        assert data["status"] == "completed"
+
+    # R1750-2 + R1750-3: Error path — empty body
+    def test_empty_body_returns_400(self):
+        status, data = self._post("/vision/analyze-image", b"")
+        assert status == 400, f"Expected 400, got {status}: {data}"
+        assert data["status"] == "invalid_request"
+        assert "outputSummary" in data
+
+    # R1750-3: Error path — invalid JSON
+    def test_invalid_json_returns_400(self):
+        status, data = self._post("/vision/analyze-image", b"not json")
+        assert status == 400, f"Expected 400, got {status}: {data}"
+        assert data["status"] == "invalid_request"
+
+    # R1750-3: Error path — bad path
+    def test_bad_path_returns_404(self):
+        status, data = self._post("/vision/bad-path", b"{}")
+        assert status == 404, f"Expected 404, got {status}: {data}"
+        assert "error" in data
+
+    # R1750-3: Error path — health check
+    def test_health_check(self):
+        status, data = self._get("/health")
+        assert status == 200, f"Expected 200, got {status}: {data}"
+        assert data["status"] == "ok"
+        assert data["capability_id"] == CAPABILITY_ID
+
+    # R1750-3: Core envelope with wrong capability id
+    def test_wrong_capability_id_via_http(self):
+        body = json.dumps({
+            "invocationId": str(uuid.uuid4()),
+            "capabilityId": "wrong.capability.v1",
+            "capabilityVersion": "1.0.0",
+            "caller": "test",
+            "sideEffectLevel": "read_only",
+            "deadlineUtc": datetime.now(timezone.utc).isoformat(),
+            "request": {
+                "imageRef": "https://example.com/img.png",
+                "question": "Test?",
+            },
+            "safety": {},
+        }).encode("utf-8")
+        status, data = self._post("/vision/analyze-image", body)
+        assert status == 400, f"Expected 400, got {status}: {data}"
+        assert data["status"] == "invalid_request"
+        assert "outputSummary" in data
+
+    # R1750-3: Visible writes allowed rejected via HTTP
+    def test_visible_writes_rejected_via_http(self):
+        deadline = datetime.now(timezone.utc).isoformat()
+        body = json.dumps({
+            "invocationId": str(uuid.uuid4()),
+            "capabilityId": CAPABILITY_ID,
+            "capabilityVersion": CAPABILITY_VERSION,
+            "caller": "test",
+            "sideEffectLevel": "read_only",
+            "deadlineUtc": deadline,
+            "request": {
+                "imageRef": "https://example.com/img.png",
+                "question": "Test?",
+            },
+            "safety": {"visibleWritesAllowed": True},
+        }).encode("utf-8")
+        status, data = self._post("/vision/analyze-image", body)
+        assert status == 400, f"Expected 400, got {status}: {data}"
+        assert data["status"] == "safety_rejected"

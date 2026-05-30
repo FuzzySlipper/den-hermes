@@ -57,6 +57,67 @@ class VisionAnalyzerHandler(BaseHTTPRequestHandler):
     # Class-level override for fake analyzer mode
     use_fake_analyzer: bool = True
 
+    # Mapping: dataclass snake_case field -> Core camelCase response key
+    _RESPONSE_KEY_MAP: dict[str, str] = {
+        "status": "status",
+        "output_summary": "outputSummary",
+        "output": "output",
+        "output_artifact_refs": "outputArtifactRefs",
+        "model": "model",
+        "timings_ms": "timingsMs",
+        "cost": "cost",
+        "metadata": "metadata",
+    }
+
+    # Request fields that Core sends as camelCase (within request body)
+    _REQUEST_CAMEL_MAP: dict[str, str] = {
+        "imageRef": "image_ref",
+        "includeOcr": "include_ocr",
+        "includeRegions": "include_regions",
+        "outputDetail": "output_detail",
+        "localeHint": "locale_hint",
+        "uiContext": "ui_context",
+    }
+
+    # Safety fields that Core sends as camelCase
+    _SAFETY_CAMEL_MAP: dict[str, str] = {
+        "visibleWritesAllowed": "visible_writes_allowed",
+        "allowImageUrls": "allow_image_urls",
+        "allowResourceRefs": "allow_resource_refs",
+    }
+
+    @staticmethod
+    def _snake_to_camel(name: str) -> str:
+        """Convert snake_case identifier to camelCase."""
+        parts = name.split("_")
+        return parts[0] + "".join(p.capitalize() for p in parts[1:])
+
+    @staticmethod
+    def _get_field(body: dict[str, Any], snake_name: str, default: Any = None) -> Any:
+        """Get a field from body, trying both camelCase and snake_case."""
+        camel_name = VisionAnalyzerHandler._snake_to_camel(snake_name)
+        if camel_name in body:
+            return body[camel_name]
+        return body.get(snake_name, default)
+
+    @staticmethod
+    def _normalize_request(req_body: dict[str, Any]) -> dict[str, Any]:
+        """Normalize request fields: remap camelCase to snake_case for internal use."""
+        result: dict[str, Any] = {}
+        for key, val in req_body.items():
+            mapped = VisionAnalyzerHandler._REQUEST_CAMEL_MAP.get(key, key)
+            result[mapped] = val
+        return result
+
+    @staticmethod
+    def _normalize_safety(safety: dict[str, Any]) -> dict[str, Any]:
+        """Normalize safety fields: remap camelCase to snake_case."""
+        result: dict[str, Any] = {}
+        for key, val in safety.items():
+            mapped = VisionAnalyzerHandler._SAFETY_CAMEL_MAP.get(key, key)
+            result[mapped] = val
+        return result
+
     def do_GET(self) -> None:
         """Handle GET requests."""
         if self.path == "/health":
@@ -110,27 +171,35 @@ class VisionAnalyzerHandler(BaseHTTPRequestHandler):
             )
             return
 
-        # Build executor request with Core shape tolerance
+        # Build executor request with dual camelCase / snake_case support
         try:
-            caller = body.get("caller", "")
+            caller = self._get_field(body, "caller", "")
             if isinstance(caller, dict):
                 # Core sends caller as object with agent/project_id/task_id
                 # Preserve the object in ExecutorRequest
                 pass
 
-            deadline_val = body.get("deadline_utc", 0.0)
+            deadline_val = self._get_field(body, "deadline_utc", 0.0)
             # Core sends ISO-8601 string; prototype sends float
             # ExecutorRequest accepts either type
 
+            # Normalize request sub-fields (imageRef -> image_ref, etc.)
+            raw_request: dict[str, Any] = self._get_field(body, "request", {})
+            normalized_request = self._normalize_request(raw_request)
+
+            # Normalize safety sub-fields (visibleWritesAllowed -> visible_writes_allowed)
+            raw_safety: dict[str, Any] = self._get_field(body, "safety", {})
+            normalized_safety = self._normalize_safety(raw_safety)
+
             executor_req = ExecutorRequest(
-                invocation_id=body.get("invocation_id", ""),
-                capability_id=body.get("capability_id", ""),
-                capability_version=body.get("capability_version"),
+                invocation_id=self._get_field(body, "invocation_id", ""),
+                capability_id=self._get_field(body, "capability_id", ""),
+                capability_version=self._get_field(body, "capability_version"),
                 caller=caller,
-                side_effect_level=body.get("side_effect_level", ""),
+                side_effect_level=self._get_field(body, "side_effect_level", ""),
                 deadline_utc=deadline_val,
-                request=body.get("request", {}),
-                safety=body.get("safety", {}),
+                request=normalized_request,
+                safety=normalized_safety,
             )
         except (ValueError, TypeError) as e:
             self._send_json(
@@ -158,16 +227,10 @@ class VisionAnalyzerHandler(BaseHTTPRequestHandler):
     ) -> None:
         """Send a JSON response."""
         if isinstance(payload, ResponseEnvelope):
-            data = {
-                "status": payload.status,
-                "output_summary": payload.output_summary,
-                "output": payload.output,
-                "output_artifact_refs": payload.output_artifact_refs,
-                "model": payload.model,
-                "timings_ms": payload.timings_ms,
-                "cost": payload.cost,
-                "metadata": payload.metadata,
-            }
+            # Serialize with Core camelCase field names
+            data = {}
+            for snake_field, camel_field in self._RESPONSE_KEY_MAP.items():
+                data[camel_field] = getattr(payload, snake_field)
         else:
             data = payload
 

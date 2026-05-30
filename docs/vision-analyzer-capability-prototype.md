@@ -61,9 +61,15 @@ Accepts the external executor request envelope JSON.
 | `capability_version` | string | yes |
 | `caller` | string | yes |
 | `side_effect_level` | string | yes (must be `read_only`) |
-| `deadline_utc` | number (float) | yes |
+| `deadline_utc` | number (float) or ISO-8601 string | yes |
 | `request` | object | yes |
 | `safety` | object | yes |
+
+**Core wire format note:** The Core runtime uses `System.Text.Json.JsonSerializerDefaults.Web`, which serializes
+field names as **camelCase** (e.g. `invocationId`, `capabilityId`, `sideEffectLevel`, `deadlineUtc`).
+The HTTP handler accepts both camelCase (Core) and snake_case (prototype) field names interchangeably.
+The `deadlineUtc` / `deadline_utc` field accepts both an ISO-8601 string (e.g. `"2026-05-29T22:00:00Z"`)
+and a numeric epoch-seconds value for backward compatibility.
 
 **Request fields** (inside `request`):
 
