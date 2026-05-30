@@ -21,9 +21,9 @@ def test_resolver_loads_required_roles_from_sample_config():
 
     assert runtime.role == "coder"
     assert runtime.runtime_id == "coder-primary"
-    assert runtime.profile == "den-hermes-runner"
-    assert runtime.provider == "openai-codex"
-    assert runtime.model == "gpt-5.5"
+    assert runtime.profile == "spawned-coder"
+    assert runtime.provider == "opencode-go"
+    assert runtime.model == "glm-5.1"
     assert runtime.toolsets == ("terminal", "file")
     assert runtime.timeout_seconds == 1800
     assert runtime.registry_id == "den-hermes-runner-defaults"
@@ -32,7 +32,7 @@ def test_resolver_loads_required_roles_from_sample_config():
 
 def test_resolver_uses_central_registry_env_path(monkeypatch, tmp_path):
     registry = tmp_path / "central.yaml"
-    registry.write_text(SAMPLE_REGISTRY.read_text().replace("model: gpt-5.5", "model: gpt-4.1", 1))
+    registry.write_text(SAMPLE_REGISTRY.read_text().replace("model: glm-5.1", "model: gpt-4.1", 1))
     monkeypatch.setenv("DEN_HERMES_RUNTIME_REGISTRY", str(registry))
 
     runtime = resolve_role_runtime("coder")
@@ -46,10 +46,10 @@ def test_changing_central_config_changes_role_resolution(tmp_path):
     registry.write_text(SAMPLE_REGISTRY.read_text())
     before = resolve_role_runtime("reviewer", registry_path=registry)
 
-    registry.write_text(SAMPLE_REGISTRY.read_text().replace("model: gpt-5.5", "model: gpt-4.1", 2))
+    registry.write_text(SAMPLE_REGISTRY.read_text().replace("model: deepseek-v4-flash", "model: gpt-4.1", 1))
     after = resolve_role_runtime("reviewer", registry_path=registry)
 
-    assert before.model == "gpt-5.5"
+    assert before.model == "deepseek-v4-flash"
     assert after.model == "gpt-4.1"
     assert before.registry_fingerprint != after.registry_fingerprint
 
@@ -120,7 +120,7 @@ def test_resolver_rejects_missing_required_role(tmp_path):
 
 def test_resolver_rejects_missing_explicit_profile(tmp_path):
     registry = tmp_path / "registry.yaml"
-    text = SAMPLE_REGISTRY.read_text().replace("    profile: den-hermes-runner\n    provider: openai-codex", "    provider: openai-codex", 1)
+    text = SAMPLE_REGISTRY.read_text().replace("    profile: spawned-coder\n    provider: opencode-go", "    provider: opencode-go", 1)
     registry.write_text(text)
 
     with pytest.raises(RuntimeRegistryError, match="profile"):
@@ -129,7 +129,7 @@ def test_resolver_rejects_missing_explicit_profile(tmp_path):
 
 def test_resolver_rejects_missing_provider_or_model_by_default(tmp_path):
     registry = tmp_path / "registry.yaml"
-    text = SAMPLE_REGISTRY.read_text().replace("    model: gpt-5.5\n    toolsets: [terminal, file]", "    toolsets: [terminal, file]", 1)
+    text = SAMPLE_REGISTRY.read_text().replace("    model: glm-5.1\n    toolsets: [terminal, file]", "    toolsets: [terminal, file]", 1)
     registry.write_text(text)
 
     with pytest.raises(RuntimeRegistryError, match="model"):
@@ -173,7 +173,7 @@ def test_resolver_normalizes_aliases_to_canonical_roles():
 
 def test_resolver_redacts_secret_like_values(tmp_path):
     registry = tmp_path / "registry.yaml"
-    text = SAMPLE_REGISTRY.read_text().replace("    provider: openai-codex", "    provider: sk-this-is-secret-looking", 1)
+    text = SAMPLE_REGISTRY.read_text().replace("    provider: opencode-go", "    provider: sk-abcdefghijklmnop", 1)
     registry.write_text(text)
 
     with pytest.raises(RuntimeRegistryError) as excinfo:
@@ -181,7 +181,7 @@ def test_resolver_redacts_secret_like_values(tmp_path):
 
     message = str(excinfo.value)
     assert "[REDACTED]" in message
-    assert "sk-this-is-secret-looking" not in message
+    assert "sk-abc...mnop" not in message
 
 
 def test_resolved_runtime_serializes_to_den_registration_args(tmp_path):
@@ -189,9 +189,9 @@ def test_resolved_runtime_serializes_to_den_registration_args(tmp_path):
 
     args = runtime.to_den_registration_args(workdir=str(tmp_path), host="den-k8plus")
 
-    assert args["profile"] == "den-hermes-runner"
-    assert args["provider"] == "openai-codex"
-    assert args["model"] == "gpt-5.5"
+    assert args["profile"] == "spawned-coder"
+    assert args["provider"] == "opencode-go"
+    assert args["model"] == "glm-5.1"
     assert args["toolsets"] == "terminal,file"
     assert args["timeout_seconds"] == 1800
     assert args["artifact_path"].endswith("/coder-run/completion.json")
@@ -205,10 +205,10 @@ def test_preflight_command_uses_exact_resolved_profile_provider_model():
 
     command = runtime.preflight_command()
 
-    assert command[:3] == ["hermes", "--profile", "den-hermes-runner"]
+    assert command[:3] == ["hermes", "--profile", "spawned-coder"]
     assert "chat" in command
-    assert command[command.index("--provider") + 1] == "openai-codex"
-    assert command[command.index("--model") + 1] == "gpt-5.5"
+    assert command[command.index("--provider") + 1] == "opencode-go"
+    assert command[command.index("--model") + 1] == "glm-5.1"
     assert command[command.index("--toolsets") + 1] == ""
     assert command[command.index("--source") + 1] == "den-runtime-preflight"
     assert "PROFILE_OK" in command[command.index("-q") + 1]

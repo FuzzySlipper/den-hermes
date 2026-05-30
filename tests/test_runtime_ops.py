@@ -17,9 +17,9 @@ def test_format_runtime_matrix_shows_active_role_picks():
     assert "ROLE" in output
     assert "coder" in output
     assert "reviewer" in output
-    assert "den-hermes-runner" in output
-    assert "openai-codex" in output
-    assert "gpt-5.5" in output
+    assert "spawned-coder" in output
+    assert "opencode-go" in output
+    assert "glm-5.1" in output
     assert "terminal,file" in output
 
 
@@ -42,9 +42,9 @@ def test_preflight_runtime_roles_runs_exact_resolved_commands():
 
     assert [result["role"] for result in results] == ["coder", "reviewer"]
     assert all(result["ok"] for result in results)
-    assert calls[0][0][0:3] == ["hermes", "--profile", "den-hermes-runner"]
-    assert calls[0][0][calls[0][0].index("--provider") + 1] == "openai-codex"
-    assert calls[0][0][calls[0][0].index("--model") + 1] == "gpt-5.5"
+    assert calls[0][0][0:3] == ["hermes", "--profile", "spawned-coder"]
+    assert calls[0][0][calls[0][0].index("--provider") + 1] == "opencode-go"
+    assert calls[0][0][calls[0][0].index("--model") + 1] == "glm-5.1"
     assert calls[0][1] == 300
 
 

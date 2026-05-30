@@ -5,12 +5,15 @@
 
 schema_version: 1
 registry_id: den-hermes-runner-defaults
-updated_at: "2026-05-13T00:00:00Z"
-updated_by: patch
+updated_at: "2026-05-30T00:00:00Z"
+updated_by: task-1784-pool-worker-provisioning
 notes: >-
   Central spawned-Hermes runtime picks for Den orchestrator roles.
   Role catalog: docs/worker-role-catalog.md.
   Scout design: docs/spawned-scout-design-1691.md.
+  All live roles (coder, reviewer, validator, drift_checker, packet_auditor)
+  use shared role profiles (spawned-*) per pool-member identity convention.
+  See docs/spawned-role-pool-member-identity.md.
   NOTE: scout role entry is design-only (present for documentation/reference).
   It will not pass resolve_role_runtime validation until CANONICAL_ROLES
   in runtime_registry.py includes 'scout'. See spawned-scout-design-1691.md §14.
@@ -42,9 +45,9 @@ defaults:
 roles:
   coder:
     runtime_id: coder-primary
-    profile: den-hermes-runner
-    provider: openai-codex
-    model: gpt-5.5
+    profile: spawned-coder
+    provider: opencode-go
+    model: glm-5.1
     toolsets: [terminal, file]
     timeout_seconds: 1800
     reasoning_effort: high
@@ -57,9 +60,9 @@ roles:
 
   reviewer:
     runtime_id: reviewer-primary
-    profile: den-hermes-runner
-    provider: openai-codex
-    model: gpt-5.5
+    profile: spawned-reviewer
+    provider: opencode-go
+    model: deepseek-v4-flash
     toolsets: [terminal, file]
     timeout_seconds: 1500
     reasoning_effort: high
@@ -72,9 +75,9 @@ roles:
 
   validator:
     runtime_id: validator-primary
-    profile: den-hermes-runner
-    provider: openai-codex
-    model: gpt-5.5
+    profile: spawned-validator
+    provider: opencode-go
+    model: kimi-k2.6
     toolsets: [terminal, file]
     timeout_seconds: 1200
     reasoning_effort: medium
@@ -87,9 +90,9 @@ roles:
 
   drift_checker:
     runtime_id: drift-checker-primary
-    profile: den-hermes-runner
-    provider: openai-codex
-    model: gpt-5.5
+    profile: spawned-drift-checker
+    provider: opencode-go
+    model: kimi-k2.6
     toolsets: [terminal, file]
     timeout_seconds: 900
     reasoning_effort: medium
@@ -102,7 +105,7 @@ roles:
 
   packet_auditor:
     runtime_id: packet-auditor-primary
-    profile: den-hermes-runner
+    profile: spawned-packet-auditor
     provider: openai-codex
     model: gpt-5.5
     toolsets: [terminal, file]
@@ -123,9 +126,9 @@ roles:
   # updating runtime_registry.py. See spawned-scout-design-1691.md §14.
   scout:
     runtime_id: scout-primary
-    profile: den-hermes-runner
-    provider: openai-codex
-    model: gpt-5.5
+    profile: spawned-scout
+    provider: opencode-go
+    model: glm-5.1
     toolsets: [terminal, file]
     timeout_seconds: 600
     reasoning_effort: high

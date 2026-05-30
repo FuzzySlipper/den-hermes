@@ -486,9 +486,246 @@ for den-core #1685:
 }
 ```
 
-## 7. Operator troubleshooting
+## 7. Live pool worker provisioning (task #1784)
 
-### 7.1 "Assignment not delivered" — Gateway shows `failed` or `pending`
+The live pool worker provisioning step registers concrete pool members for
+the four roles: **reviewer**, **validator**, **drift_checker**, and
+**packet_auditor**. (Coder is already operational from prior work.)
+
+### 7.1 Role profile matrix
+
+All live roles use **shared spawned-Hermes profiles** (`spawned-*`) — never
+`den-hermes-runner` or other operator-first profiles. Concrete instance
+identity comes from `pool_member_id` / `agent_instance_id`, not from
+duplicate profile names.  See `docs/spawned-role-pool-member-identity.md`.
+
+| Role | Profile identity | Pool member ID | Den core role | Packet type | Runtime ID |
+|---|---|---|---|---|---|
+| Reviewer | `spawned-reviewer` | `pool-reviewer-01` | `reviewer` | `review_findings_packet` | `reviewer-primary` |
+| Validator | `spawned-validator` | `pool-validator-01` | `validator` | `validation_packet` | `validator-primary` |
+| Drift Checker | `spawned-drift-checker` | `pool-drift-checker-01` | `drift_checker` | `drift_check_packet` | `drift-checker-primary` |
+| Packet Auditor | `spawned-packet-auditor` | `pool-packet-auditor-01` | `packet_auditor` | `packet_audit_packet` | `packet-auditor-primary` |
+
+### 7.2 Preconditions
+
+Before running live provisioning:
+
+- [ ] Central registry at `/home/agents/runtime/spawned-hermes-runtimes.yaml`
+  has the four roles configured with `spawned-*` profiles (not
+  `den-hermes-runner`).
+- [ ] Hermes profiles `spawned-reviewer`, `spawned-validator`,
+  `spawned-drift-checker`, and `spawned-packet-auditor` exist and pass
+  preflight.
+- [ ] The provisioning script is committed: `scripts/provision_pool_workers.py`.
+- [ ] Smoke helper is committed: `scripts/smoke_pool_worker_assignment.py`.
+- [ ] Runner has Den MCP/Core access to upsert pool members (if using
+  `--apply` mode).
+
+### 7.3 Provisioning commands
+
+#### Step P1: Validate the runtime registry
+
+```bash
+# Validate all five canonical roles resolve correctly
+python -m den_hermes.runtime_ops validate --registry /home/agents/runtime/spawned-hermes-runtimes.yaml
+
+# Show the full runtime matrix
+python -m den_hermes.runtime_ops matrix --registry /home/agents/runtime/spawned-hermes-runtimes.yaml
+```
+
+Expected output includes all roles with `spawned-*` profiles.  If any
+role shows `den-hermes-runner`, stop and update the registry first.
+
+#### Step P2: Run the provisioning dry-run
+
+```bash
+# Dry-run against the central registry (default path)
+python scripts/provision_pool_workers.py
+
+# Or specify a registry path explicitly
+python scripts/provision_pool_workers.py --registry /home/agents/runtime/spawned-hermes-runtimes.yaml
+
+# Specific roles only
+python scripts/provision_pool_workers.py --roles reviewer,validator
+
+# JSON output for programmatic consumption
+python scripts/provision_pool_workers.py --json
+```
+
+The dry-run validates:
+- Registry schema and required roles.
+- All four live roles use `spawned-*` profiles.
+- No `den-hermes-runner` or other forbidden profiles leak through.
+- No secret-like values (API keys, tokens) are present in the registry.
+
+Expected outcome: `Resolved: 4 roles  Failed: 0 roles`.
+
+#### Step P3: Credential/config guard check
+
+```bash
+# The provisioning script automatically checks for secret patterns.
+# Run with --json to get structured credential_guard_ok field.
+python scripts/provision_pool_workers.py --json | python -c "import sys,json; d=json.load(sys.stdin); print('GUARD:', 'PASS' if d['credential_guard_ok'] else 'FAIL'); [print(f'  SECRET: {s}') for s in d.get('secrets_found',[])]"
+```
+
+If `credential_guard_ok` is `False`, inspect the flagged config entries
+manually.  Redact or remove actual secrets from the registry before
+proceeding.
+
+#### Step P4: Run the assignment smoke helper
+
+```bash
+# Smokes all four live roles (in-memory, no mutations)
+python scripts/smoke_pool_worker_assignment.py
+
+# JSON output with handles
+python scripts/smoke_pool_worker_assignment.py --json
+
+# Specific roles
+python scripts/smoke_pool_worker_assignment.py --roles reviewer,validator
+
+# Custom run-id for tracing
+python scripts/smoke_pool_worker_assignment.py --run-id t1784-provision-smoke-20260530
+```
+
+The smoke helper tests:
+- Assignment pointer validation (all four roles).
+- PoolWorkerRuntime creation from `PENDING` state.
+- `acknowledge()` transition to `ACKNOWLEDGED`.
+- Role-specific packet type expectations.
+- Pool member identity conventions (`pool-{role}-01`).
+
+Expected outcome: `Roles passed: 4  Roles failed: 0`.
+
+#### Step P5: Core readback test
+
+After running the smoke, Runner should verify Core can read back the
+assignment handles.  Use the `run_id` and `assignment_id` from the smoke
+output (or from the `--run-id` override) to check:
+
+```bash
+# Example: Run smoke with a known run-id, then verify via Core
+python scripts/smoke_pool_worker_assignment.py --run-id t1784-provision-validation
+
+# Expected smoke output (abbreviated):
+# POOL MEMBER          | STATE            | PACKET TYPE                   | STATUS    | RUN_ID
+# pool-reviewer-01     | acknowledged     | review_findings_packet        | PASS      | t1784-provision-validation
+# pool-validator-01    | acknowledged     | validation_packet             | PASS      | t1784-provision-validation
+# pool-drift-checker-01| acknowledged     | drift_check_packet            | PASS      | t1784-provision-validation
+# pool-packet-auditor-01| acknowledged    | packet_audit_packet           | PASS      | t1784-provision-validation
+```
+
+#### Step P6: Core upsert (apply mode)
+
+If Runner has Den MCP/Core access, use `--apply` to emit structured JSON
+payloads for upserting pool members:
+
+```bash
+# Dry-run first, then pipe apply payloads to Core
+python scripts/provision_pool_workers.py --apply
+
+# Each payload is tagged with "### DEN_MCP_UPSERT" for easy filtering:
+# ### DEN_MCP_UPSERT {
+#   "action": "upsert_pool_member",
+#   "payload": {
+#     "pool_member_id": "pool-reviewer-01",
+#     "worker_role": "reviewer",
+#     ...
+#   }
+# }
+```
+
+Pipe or feed these payloads to the Den MCP/Core upsert endpoint.  After
+upsert, verify pool-members appear in Core agent-instance bindings.
+
+#### Step P7: #worker-pool readback
+
+Verify that the new pool members appear in the `#worker-pool` lobby
+presence (Channels membership).  Each member should be keyed by
+`concrete_identity` (`pool_member_id`):
+
+```json
+{
+  "channel": "#worker-pool",
+  "presence": [
+    {
+      "pool_member_id": "pool-reviewer-01",
+      "agent_identity": "spawned-reviewer",
+      "status": "available"
+    },
+    {
+      "pool_member_id": "pool-validator-01",
+      "agent_identity": "spawned-validator",
+      "status": "available"
+    },
+    {
+      "pool_member_id": "pool-drift-checker-01",
+      "agent_identity": "spawned-drift-checker",
+      "status": "available"
+    },
+    {
+      "pool_member_id": "pool-packet-auditor-01",
+      "agent_identity": "spawned-packet-auditor",
+      "status": "available"
+    }
+  ]
+}
+```
+
+#### Step P8: Same-profile ambiguity fail-closed check
+
+If multiple bindings exist for the same profile identity (e.g. two
+bindings for `spawned-reviewer`), verify that deliveries without a
+`concrete_identity` or `pool_member_id` fail closed with
+`ambiguous_binding`.
+
+```bash
+# Simulated check (conceptual — no automation script for this yet):
+#
+# 1. Register two bindings for spawned-reviewer:
+#    - instance_id=hermes:den-k8:spawned-reviewer:pool-reviewer-01:wake-aaa
+#      pool_member_id=pool-reviewer-01
+#    - instance_id=hermes:den-k8:spawned-reviewer:pool-reviewer-02:wake-bbb
+#      pool_member_id=pool-reviewer-02
+# 2. Send a delivery target with agent_identity=spawned-reviewer but NO
+#    pool_member_id or concrete_identity.
+# 3. Expected result: Bridge returns ambiguous_binding, NOT silently
+#    picking the first match.
+```
+
+All existing pool-member bindings for the same role must carry a
+`pool_member_id`.  Remove or quarantine stale pilot bindings that lack
+a concrete identity — they will cause ambiguity failures for new
+deliveries.
+
+### 7.4 Non-live roles: Scout
+
+Scout remains **deferred** (design/contract only, task #1691).  It is
+not yet in `CANONICAL_ROLES` in `den_hermes/runtime_registry.py`.  Do not
+attempt to launch Scout pool workers until:
+
+1. `scout` is added to `CANONICAL_ROLES`.
+2. A `spawned-scout` Hermes profile exists with read-only toolset.
+3. The central runtime registry has a live Scout entry (the current sample
+   entry is for documentation/reference only).
+4. The orchestrator has `START_SCOUT` / `AWAIT_SCOUT` action types.
+
+### 7.5 Commands quick reference
+
+| Step | Command | Expected exit |
+|---|---|---|
+| Validate registry | `python -m den_hermes.runtime_ops validate` | 0 |
+| Show matrix | `python -m den_hermes.runtime_ops matrix` | 0 |
+| Preflight roles | `python -m den_hermes.runtime_ops preflight --roles reviewer,validator,drift_checker,packet_auditor` | 0 |
+| Provision dry-run | `python scripts/provision_pool_workers.py` | 0 |
+| Provision apply | `python scripts/provision_pool_workers.py --apply` | 0 |
+| Smoke assignment | `python scripts/smoke_pool_worker_assignment.py` | 0 |
+| Validate role catalog | `python scripts/validate_role_catalog.py` | 0 |
+| Git hygiene | `git diff --check` | 0 |
+
+## 8. Operator troubleshooting
+
+### 8.1 "Assignment not delivered" — Gateway shows `failed` or `pending`
 
 Check:
 - Is the pool worker process running? If not, start it.
@@ -496,7 +733,7 @@ Check:
 - Are delivery retries configured? The fake E2E allows 3 retries
   before failing.
 
-### 7.2 "Worker won't acknowledge" — worker running but no ack
+### 8.2 "Worker won't acknowledge" — worker running but no ack
 
 Check:
 - Is the assignment identity valid? A mismatched `assignment_id` or
@@ -507,7 +744,7 @@ Check:
 - Check `can_accept_assignments()` — only `RELEASED` workers can accept
   new work.
 
-### 7.3 "Checkpoint rejected" — Core says wrong type or mismatched identity
+### 8.3 "Checkpoint rejected" — Core says wrong type or mismatched identity
 
 Check:
 - Does the checkpoint `assignment_id` and `run_id` match the
@@ -516,7 +753,7 @@ Check:
   transitions in `PoolWorkerRuntime._require_state()`.
 - Is the checkpoint `type` in `CANONICAL_CHECKPOINT_TYPES`?
 
-### 7.4 "Cleanup failed" — `PoolCleanupError` raised
+### 8.4 "Cleanup failed" — `PoolCleanupError` raised
 
 Check:
 - Which fields are missing? Run `CleanupEvidence.missing_fields()`.
@@ -527,7 +764,7 @@ Check:
 - In production, ensure your cleanup implementation sets all four
   fields to `True` before calling `cleanup()`.
 
-### 7.5 "Worker stuck in terminal state" — no release or quarantine
+### 8.5 "Worker stuck in terminal state" — no release or quarantine
 
 Check:
 - Is `quarantine_required()` returning `True`? If so, the worker
@@ -535,7 +772,7 @@ Check:
 - Call `cleanup(evidence)` with complete evidence, then either
   `release()` or `quarantine()`.
 
-### 7.6 "Den Web trace shows wrong state" — projection out of sync
+### 8.6 "Den Web trace shows wrong state" — projection out of sync
 
 Check:
 - Did the assignment progress through the correct timeline? The
