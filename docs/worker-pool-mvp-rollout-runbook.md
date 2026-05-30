@@ -1011,6 +1011,153 @@ lobby presence.
   rendering them in an "Archived / Legacy" section with reduced visual weight
   and a quarantine chip — never as candidate workers.
 
+## 9. Green-path worker-pool workflow (exemplar: #1739)
+
+This section documents the canonical end-to-end worker-pool assignment lifecycle
+using exact handles from the successful #1739 pilot. Use this as a template for
+planning future pool assignments.
+
+### 9.1 Role selection
+
+| Field | Exemplar value |
+|---|---|
+| Project | `den-hermes-bridge` |
+| Task | #1739 (first real worker-pool pilot) |
+| Role | `coder` |
+| Profile | `spawned-coder` |
+| Concrete identity | `pool-coder-1739-preflight` |
+
+### 9.2 Assignment lifecycle (checkpoint sequence)
+
+```
+1. Core creates assignment/lease
+   → assignment #2, run pilot-1739-20260530074809-fa245a3e
+
+2. Gateway delivery + Channels wake
+   → channel message #1419, gateway delivery #680
+   → worker replies 1420/1421
+
+3. assignment_ack checkpoint  #4  (runner response #3)
+   → Worker acknowledges assignment; runner provides context.
+
+4. interpretation checkpoint  #5  (runner response #3)
+   → Worker publishes interpretation of task scope.
+
+5. plan checkpoint           #6  (runner response #4)
+   → Worker publishes its execution plan.
+
+6. Wake for completion:
+   → channel message #1425, gateway delivery #682
+   → worker replies 1426/1428
+
+7. completion checkpoint     #7
+   → Final checkpoint. If clean, proceed to cleanup.
+
+8. Cleanup evidence recorded:
+   - scrub_workspace: passed/no-op
+   - process_release: passed/no-op
+   - session_rotation: passed/no-op
+   - scratch_cleanup: passed/no-op
+
+9. Core release or quarantine
+   → Assigned status: completed
+   → Completion packet #9316 (corrected from initial malformed #9315)
+```
+
+### 9.3 Key handles (from #1739)
+
+| Handle | Value |
+|---|---|
+| Worker identity | `pool-coder-1739-preflight` |
+| Work run | `pilot-1739-20260530074809-fa245a3e` |
+| Session | `worker-1169c0018ed0a23f` |
+| Assignment | `#2` (GET `/api/gateway/assignments/2/trace?projectId=den-hermes-bridge`) |
+| Core availability | `available` with `gateway_available` evidence |
+| Channel messages | `1419` (wake), `1420/1421` (ack reply), `1422` (plan wake), `1423/1424` (plan reply), `1425` (completion wake), `1426/1428` (completion reply) |
+| Gateway delivery IDs | `680`, `681`, `682` |
+| Channel membership marker | message #1431 (tagged `assignmentId=2`) |
+| Checkpoint IDs | assignment_ack #4, interpretation #5, plan #6, completion #7 |
+| Runner response IDs | #3 (for ack+interpretation), #4 (for plan) |
+| Den Web trace | `GET /api/gateway/assignments/2/trace?projectId=den-hermes-bridge` |
+
+### 9.4 Green-path success criteria
+
+Before claiming completion, verify:
+
+- [ ] Lease was granted and acknowledged via `assignment_ack` checkpoint.
+- [ ] Interpretation and plan checkpoints posted and runner-acknowledged.
+- [ ] Completion packet posted with correct `branch`, `head_commit`, `files_changed`,
+      `tests_run`, and `acceptance_evidence`.
+- [ ] Cleanup evidence recorded (all four fields: scrub_workspace, process_release,
+      session_rotation, scratch_cleanup).
+- [ ] Core release or quarantine applied.
+- [ ] Assignment trace accessible: `GET /api/gateway/assignments/<id>/trace?projectId=<project>`.
+- [ ] Lobby presence reflects correct status (available back to idle, or quarantined).
+
+### 9.5 Failure paths
+
+| Failure mode | Exemplar | Recovery |
+|---|---|---|
+| No available worker | See #1785 no-capacity policy | Retry, wait, escalate to Patch/Planner |
+| Ambiguous same-profile workers | Multiple ~reviewer~ bindings without concrete `pool_member_id` | Fail closed; require explicit `pool_member_id` in delivery |
+| Unclaimed wake | `den-hermes-runner` pilot (#1739 preflight): both direct-agent messages stayed `recorded_pending_claim` | Quarantine the worker; investigate Gateway routing |
+| Malformed completion packet | `pool-coder-1739-preflight` initially omitted `branch`/`head_commit` (#9315) | Runner corrects and reposts (#9316) |
+| Cleanup uncertain/failure | Incomplete cleanup evidence → quarantine | Manual inspection via quarantine reason text |
+| Quarantined/retired pilot members | `den-hermes-runner`, `pool-coder-1739-preflight`, `den-mcp-runner` | Lease system excludes `status=quarantined`; Den Web shows in archived section |
+
+## 10. Worker-pool ownership boundaries
+
+| Service | Owns | Key endpoints/files |
+|---|---|---|
+| **den-core** | Canonical pool member registry, lease lifecycle, no-capacity reads | `upsert_pool_member`, `lease_worker`, `quarantine_pool_member`, `list_pool_members`, `get_assignment`, `get_worker_pool_summary` |
+| **den-channels** | `#worker-pool` lobby channel, membership, presence records, activity events | `GET /api/worker-pool/lobby/presence`, `UpsertWorkerPoolLobbyPresence`, `GET /api/channels?project=<project>` |
+| **den-gateway** | Delivery routing, wake state, echo suppression, outage pause | Gateway delivery envelope, `agent_instance_bindings`, direct-agent message transport |
+| **den-hermes-bridge** | Profile identity mapping, spawn-hermes runtime registry, role/profile/runtime glue | `spawned-hermes-runtimes.yaml`, `den_hermes/orchestrator.py`, `den_hermes/no_capacity_policy.py`, `scripts/provision_pool_workers.py` |
+| **den-web** | Human-facing lobby, assignment traces, agents overview (including Worker Pool sub-tab) | Agents tab → Worker Pool sub-tab, `AssignmentTraceView`, `AgentsOverviewView` |
+| **den-desktop** (future) | Desktop-focused worker-pool UX | TBD |
+
+## 11. First-real-task checklist
+
+When running the first real non-noop task through the worker-pool workflow:
+
+### 11.1 Task selection
+
+- [ ] Task is well-scoped: ≤3 files changed, deterministic output, clear acceptance criteria.
+- [ ] All prerequisite tasks are done (dependencies resolved).
+- [ ] Task has no external credential/network requirements (pool worker isolation is limited).
+- [ ] Task does not require live-service endpoints that the pool worker cannot reach.
+
+### 11.2 Role requirements
+
+- [ ] At least one pool worker with matching role is available (`list_pool_members` shows `status=available` for the required profile).
+- [ ] If a `scout` role is needed (codebase unfamiliar), a dedicated Scout worker must be available or a one-shot spawned-Hermes scraper must run first.
+- [ ] If multiple roles are needed, they must be assigned sequentially (one lease at a time per project).
+
+### 11.3 Pre-launch evidence
+
+- [ ] Pool member identity, profile, and agent_instance_id recorded.
+- [ ] Channels lobby presence confirmed (`GET /api/worker-pool/lobby/presence` includes the worker).
+- [ ] Assignment trace baseline: no stale assignments for this worker.
+- [ ] No-capacity fallback: if no worker is available, use #1785 policy (retry, wait, escalate — do not fake assignments).
+
+### 11.4 Post-completion evidence
+
+- [ ] Assignment trace returned `coreAvailability=available` with `gateway_available` evidence.
+- [ ] All checkpoint IDs recorded (ack, interpretation, plan, completion).
+- [ ] Completion packet verified: branch, head_commit, files_changed, tests_run, acceptance_evidence.
+- [ ] Cleanup evidence recorded (all four fields).
+- [ ] Worker returned to `available` in lobby (or quarantined with reason).
+- [ ] Task thread posted with completion packet and trace links.
+
+### 11.5 Cross-links
+
+- Design/plan: #1685 (worker-pool implementation plan)
+- First pilot: #1739 (first real worker-pool pilot)
+- Orchestrator pool: #1762 (project-duration orchestrator pool assignments)
+- Lobby presence: #1771 (visible #worker-pool home channel)
+- Activity ordering: #1776 (fixed channel activity ordering)
+- This umbrella: #1778 (worker-pool post-MVP operationalization)
+
 ## Appendix C: Downstream notes for task #1739
 
 ### Pool-member identity naming convention
