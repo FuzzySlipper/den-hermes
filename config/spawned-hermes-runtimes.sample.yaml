@@ -9,6 +9,11 @@ updated_at: "2026-05-13T00:00:00Z"
 updated_by: patch
 notes: >-
   Central spawned-Hermes runtime picks for Den orchestrator roles.
+  Role catalog: docs/worker-role-catalog.md.
+  Scout design: docs/spawned-scout-design-1691.md.
+  NOTE: scout role entry is design-only (present for documentation/reference).
+  It will not pass resolve_role_runtime validation until CANONICAL_ROLES
+  in runtime_registry.py includes 'scout'. See spawned-scout-design-1691.md §14.
 
 defaults:
   substrate: spawned_hermes
@@ -103,6 +108,27 @@ roles:
     toolsets: [terminal, file]
     timeout_seconds: 900
     reasoning_effort: medium
+    max_retries: 0
+    preflight:
+      enabled: true
+    launch:
+      source: den-worker
+      extra_args: []
+
+  # Scout role (design task #1691) — pre-coder codebase discovery.
+  # Strictly read-only; uses the same high-context model as coder.
+  # Registered in docs/worker-role-catalog.md §3.6 and
+  # docs/spawned-scout-design-1691.md.
+  # NOTE: scout is not yet in CANONICAL_ROLES; adding it requires
+  # updating runtime_registry.py. See spawned-scout-design-1691.md §14.
+  scout:
+    runtime_id: scout-primary
+    profile: den-hermes-runner
+    provider: openai-codex
+    model: gpt-5.5
+    toolsets: [terminal, file]
+    timeout_seconds: 600
+    reasoning_effort: high
     max_retries: 0
     preflight:
       enabled: true
