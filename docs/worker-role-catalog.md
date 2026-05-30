@@ -184,7 +184,7 @@ code quality — only packet integrity.
 | Allowed toolsets | `terminal`, `file` (read-only) |
 | Side-effect envelope | **Strictly read-only** — no file writes, no git mutations, no branching |
 | Checkpoint types | `assignment_ack`, `blocked_needs_input` |
-| Packet type | `scout_report` (see `docs/spawned-scout-design-1691.md`) |
+| Packet type | `scout_report_packet` (see `docs/spawned-scout-design-1691.md`) |
 | Model/provider class | **High-context model strongly recommended** — Scout reads the entire relevant codebase surface before the coder. Provider/model should be chosen for maximum context window and analysis quality rather than speed. Suggested: `glm-5.1` (same as coder) or equivalent high-context provider. |
 | Reasoning effort | `high` recommended |
 | Cleanup/release | Standard (minimal since no mutations) |
