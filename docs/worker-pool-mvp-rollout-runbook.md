@@ -272,6 +272,111 @@ Each assignment trace can be correlated with:
 - **Channels messages**: via `assignment_id` and `run_id` on the
   message record.
 
+## 5a. No-capacity worker handling (task #1785)
+
+The Runner/Bridge **no-capacity policy** consumes Core no-capacity
+diagnostics (den-core #1780) and maps them to operator decisions,
+retry/backoff behaviour, and task-thread messages.
+
+No-capacity occurs when Core attempts to assign a worker but cannot
+find an available, non-quarantined, unambiguous candidate.
+
+### 5a.1 Core reason codes
+
+Core reports no-capacity via these canonical ``reason_code`` strings
+(defined in ``den_hermes/no_capacity_policy.py`` ``CANONICAL_REASON_CODES``):
+
+| Core reason_code | Meaning | Bridge decision |
+|---|---|---|
+| ``no_matching_worker`` | No role/profile/capabilities match | ``blocked_no_role_profile`` |
+| ``all_busy`` | All candidates busy | ``blocked_all_candidates_busy`` |
+| ``all_quarantined_or_offline`` | All quarantined/offline | ``blocked_all_candidates_quarantined_or_offline`` |
+| ``ambiguous`` | Multiple candidates, cannot select | ``blocked_ambiguous_worker_selection`` |
+| ``preferred_not_found_or_busy`` | Preferred worker not ready | ``queued_waiting_for_worker`` |
+
+Unknown or malformed codes produce ``operator_action_required_spawn_capacity``
+(fail-closed, never success).
+
+### 5a.2 Policy decisions and behaviour
+
+| Decision string | Retry? | Operator? | Backoff | Notes |
+|---|---|---|---|---|
+| ``queued_waiting_for_worker`` | Yes | No | 5s, 15s, 30s, 60s, 120s, 300s | Auto-retry; cancellation available |
+| ``blocked_no_role_profile`` | No | Yes | — | Verify runtime registry and role catalog |
+| ``blocked_all_candidates_busy`` | Yes | No | 15s, 30s, 60s, 120s | Auto-retry; request capacity if persistent |
+| ``blocked_all_candidates_quarantined_or_offline`` | No | Yes | — | Clean/reprovision quarantined workers |
+| ``blocked_ambiguous_worker_selection`` | No | Yes | — | Specify concrete ``pool_member_id`` |
+| ``operator_action_required_spawn_capacity`` | No | Yes | — | Inspect Core record; escalate to Patch/Planner |
+
+### 5a.3 Queued request lifecycle
+
+When a decision is ``queued_waiting_for_worker``, the Bridge creates a
+``QueuedWaitRequest`` with a configurable TTL. The request can be:
+
+- **Retried**: Bridge automatically retries with backoff.
+- **Cancelled**: Bridge produces ``CancellationEvidence`` for
+  deterministic cleanup so the request does not become a zombie.
+- **Expired**: ``sweep_expired_queued_requests()`` ages out expired
+  entries and emits cancellation evidence.
+
+### 5a.4 Worker wake safety invariants
+
+Before waking any concrete worker, the Bridge must validate the
+candidate via ``validate_wake_candidate()`` (defined in the policy
+module). These invariants are enforced:
+
+- **Role match**: candidate role must match expected role.
+- **No quarantined workers**: candidates with ``quarantined`` status
+  or ``is_quarantined=True`` are rejected.
+- **No supervisor profiles**: ``den-hermes-runner``, ``runner``,
+  ``default`` are forbidden for worker wake.
+- **No ambiguous bindings**: ``is_ambiguous=True`` candidates are
+  rejected.
+- **Idle/available only**: candidates must have status ``idle``,
+  ``available``, or ``ready``.
+- **No random wake**: never wake same-profile workers without a
+  concrete ``pool_member_id`` — Core must have leased a concrete
+  worker first.
+
+### 5a.5 Commands quick reference
+
+| Step | Command | Expected exit |
+|---|---|---|
+| Run no-capacity policy tests | ``PYTHONPATH=. python -m pytest tests/test_no_capacity_policy.py -q --tb=short`` | 0 |
+| Full test suite | ``PYTHONPATH=. python -m pytest -q --tb=short`` | 0 |
+| Git hygiene | ``git diff --check`` | 0 |
+
+### 5a.6 Readback correlation
+
+Each no-capacity diagnostic carries a ``readback_handle`` that
+references the Core no-capacity record. Bridge decisions mirror
+this handle so operators can correlate:
+
+- Bridge operator_message contains ``readback_handle``.
+- ``NoCapacityDecision.readback_handle`` matches Core record id.
+- ``NoCapacityDiagnostic.readback_handle`` matches the same id.
+
+### 5a.7 Module reference
+
+The no-capacity policy lives in ``den_hermes/no_capacity_policy.py``.
+Key entry points:
+
+- ``decide_no_capacity(diagnostic)`` — primary pure-function mapper.
+- ``decide_from_core_record(record)`` — convenience wrapper for raw
+  Core JSON records.
+- ``validate_wake_candidate(candidate, expected_role=)`` — safety
+  check before waking a concrete worker.
+- ``create_queued_request(diagnostic, request_id)`` — create a
+  cancelleable queued request.
+- ``cancel_queued_request(queued, reason=)`` — produce cancellation
+  evidence.
+- ``sweep_expired_queued_requests(requests, now)`` — age out expired
+  queued entries.
+
+This module is **pure and deterministic**: no I/O, no network, no
+Den API calls. It only consumes Core records; it never invents or
+overrides Core assignment state.
+
 ## 6. Constrained live-smoke runbook
 
 ### 6.1 Preconditions
