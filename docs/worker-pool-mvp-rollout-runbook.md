@@ -960,6 +960,57 @@ contains these fields for each durable handle:
 - `checkpoints` (string — e.g. "2/0")
 - `completion_status` (string | null)
 
+## 8. Pilot and test member lifecycle (retirement)
+
+### 8.1 Current retired pilots
+
+Three pilot pool members were created during the initial worker-pool rollout
+and are now quarantined (retired):
+
+| Worker identity | Type | Reason | Quarantined at |
+|---|---|---|---|
+| `den-hermes-runner` | #1739 preflight pilot | Failed closed: wake delivery stayed `recorded_pending_claim` | #1739 |
+| `pool-coder-1739-preflight` | #1739 preflight pilot | Superseded by #1784 live provisioning; no real coder pool yet | #1782 |
+| `den-mcp-runner` | #1728 live-smoke pilot | Old smoke-only member; not actionable | #1782 |
+
+These members remain in the Core worker pool table with `status=quarantined`
+so that assignment traces and audit evidence are preserved. They are **not**
+returned as candidate workers by `lease_worker` — the lease system filters to
+`status=available` only. They also do not appear in the Channels `#worker-pool`
+lobby presence.
+
+### 8.2 Creating a new pilot or test member
+
+1. Register via `upsert_pool_member` with:
+   - A descriptive `worker_identity` (e.g. `pool-coder-$(date +%s)-pilot`).
+   - `status=available` initially.
+   - Metadata documenting the pilot's purpose, task_id, and expected evidence.
+2. Optionally register Channels lobby presence via `UpsertWorkerPoolLobbyPresence`
+   so the member appears in Den Web.
+3. Run the pilot. Collect assignment evidence (checkpoint IDs, completion
+   packets, log paths).
+4. **After the pilot is complete:**
+   - **Successful and keeping**: Leave as `status=available`. Optionally
+     rename to a permanent `worker_identity`.
+   - **Deprecated or superseded (most test members)**: Quarantine via
+     `quarantine_pool_member` with a descriptive reason. Do not delete
+     — preserve evidence.
+   - **Accidental or broken**: Quarantine with reason. Do not delete.
+
+### 8.3 Retirement policy
+
+- **Do not delete** pilot members from the worker pool table. Preserved
+  quarantine records maintain traceability for assignment history, operational
+  audits, and debug investigations.
+- **Do not mark retired pilots available** without explicit re-approval.
+  Re-activating a quarantined pilot requires a documented fresh preflight.
+- **Test/proof members** follow the same lifecycle: create, use, quarantine
+  or keep. No silent deletion.
+- **The `#worker-pool` lobby** automatically excludes quarantined members.
+- **Den Web UI** (introduced in #1781) treats quarantined members separately,
+  rendering them in an "Archived / Legacy" section with reduced visual weight
+  and a quarantine chip — never as candidate workers.
+
 ## Appendix C: Downstream notes for task #1739
 
 ### Pool-member identity naming convention
