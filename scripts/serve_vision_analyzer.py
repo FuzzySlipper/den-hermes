@@ -33,6 +33,7 @@ from den_hermes.vision_analyzer import (
     ExecutorRequest,
     ResponseEnvelope,
     ResponseStatus,
+    _error_response,
     execute_vision_analysis,
 )
 
@@ -85,11 +86,10 @@ class VisionAnalyzerHandler(BaseHTTPRequestHandler):
         if content_length == 0:
             self._send_json(
                 400,
-                ResponseEnvelope(
+                _error_response(
                     status=ResponseStatus.INVALID_REQUEST.value,
                     output_summary="Empty request body",
-                    output={"error": "Request body is required"},
-                    model="",
+                    output_data={"error": "Request body is required"},
                 ),
             )
             return
@@ -102,35 +102,43 @@ class VisionAnalyzerHandler(BaseHTTPRequestHandler):
         except json.JSONDecodeError as e:
             self._send_json(
                 400,
-                ResponseEnvelope(
+                _error_response(
                     status=ResponseStatus.INVALID_REQUEST.value,
                     output_summary="Invalid JSON in request body",
-                    output={"error": f"JSON parse error: {e}"},
-                    model="",
+                    output_data={"error": f"JSON parse error: {e}"},
                 ),
             )
             return
 
-        # Build executor request
+        # Build executor request with Core shape tolerance
         try:
+            caller = body.get("caller", "")
+            if isinstance(caller, dict):
+                # Core sends caller as object with agent/project_id/task_id
+                # Preserve the object in ExecutorRequest
+                pass
+
+            deadline_val = body.get("deadline_utc", 0.0)
+            # Core sends ISO-8601 string; prototype sends float
+            # ExecutorRequest accepts either type
+
             executor_req = ExecutorRequest(
                 invocation_id=body.get("invocation_id", ""),
                 capability_id=body.get("capability_id", ""),
-                capability_version=body.get("capability_version", ""),
-                caller=body.get("caller", ""),
+                capability_version=body.get("capability_version"),
+                caller=caller,
                 side_effect_level=body.get("side_effect_level", ""),
-                deadline_utc=body.get("deadline_utc", 0.0),
+                deadline_utc=deadline_val,
                 request=body.get("request", {}),
                 safety=body.get("safety", {}),
             )
         except (ValueError, TypeError) as e:
             self._send_json(
                 400,
-                ResponseEnvelope(
+                _error_response(
                     status=ResponseStatus.INVALID_REQUEST.value,
                     output_summary="Failed to parse executor request",
-                    output={"error": str(e)},
-                    model="",
+                    output_data={"error": str(e)},
                 ),
             )
             return

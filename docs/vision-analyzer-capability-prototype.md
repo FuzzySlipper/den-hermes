@@ -105,35 +105,43 @@ Returns `{"status": "ok", "capability_id": "vision.analyze_image.v1"}`.
 }
 ```
 
-### Response Envelope
+### Response Envelope (Core-compatible wire format)
+
+On the wire, `output` is a JSON-encoded string because Core stores `invocation.OutputJson`
+from this field. The contained JSON string has the Vision Analyzer structured output schema.
 
 ```json
 {
   "status": "completed",
   "output_summary": "Brief summary of the analysis",
-  "output": {
-    "summary": "string",
-    "answer": "string",
-    "observations": ["string", "..."],
-    "ocr_text": "string (if include_ocr=true)",
-    "region_coordinate_space": "string (if include_regions=true)",
-    "warnings": ["string", "..."],
-    "limitations": ["string", "..."],
-    "injection_like_text": ["string", "..."],
-    "confidence": 0.95
-  },
+  "output": "{\"summary\":\"string\",\"answer\":\"string\",\"observations\":[...],\"confidence\":0.95}",
   "output_artifact_refs": [],
-  "model": "fake-analyzer-local-v1",
-  "timings_ms": {"total_ms": 0.09},
-  "cost": {"total_cost": 0.0, "currency": "USD"},
+  "model": {
+    "provider": "local-fake",
+    "name": "fake-analyzer-local-v1",
+    "version": "1.0.0"
+  },
+  "timings_ms": {"total_ms": 1},
+  "cost": {"total_cost": 0.0},
   "metadata": {
     "capability_id": "vision.analyze_image.v1",
     "capability_version": "1.0.0",
     "mode": "ui_screenshot",
-    "include_ocr": false
+    "include_ocr": false,
+    "currency": "USD"
   }
 }
 ```
+
+**Difference from internal Python helpers:** The Python `execute_vision_analysis()` returns
+a `ResponseEnvelope` whose `output` field is always a JSON string. Use `extract_output_json(resp)`
+to get the structured `VisionOutput` dict back. Internal helpers (`VisionOutput`, `run_fake_analyzer`,
+`parse_model_output`) work with structured Python objects; only the envelope serialization
+to Core uses the JSON string format.
+
+The `model` field is always a JSON object with `provider`, `name`, and `version` — never
+a bare string. `timings_ms` values are integers. `cost` values are numeric only; any
+currency indicator moves to `metadata.currency`.
 
 **Status values:** `completed`, `invalid_request`, `safety_rejected`,
 `model_error`, `timeout`, `internal_error`

@@ -22,6 +22,7 @@ import json
 import re
 import time
 import uuid
+from datetime import datetime, timezone
 from typing import Any
 
 
@@ -60,6 +61,58 @@ OUTPUT_DETAIL_ORDER = ["auto", "low", "high"]
 DEFAULT_TIMEOUT_SECONDS = 60
 DEFAULT_FALLBACK_MODEL = "fake-analyzer-local-v1"
 DEFAULT_FALLBACK_TAGS = ["fake", "local", "vision-analyzer"]
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _parse_deadline_utc(value: str | float) -> float | None:
+    """Parse deadline_utc from Core envelope (ISO-8601 string or numeric epoch).
+
+    Returns epoch-seconds float, or None if unparseable.
+    """
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            return dt.timestamp()
+        except (ValueError, TypeError):
+            return None
+    return None
+
+
+def _error_response(
+    status: str,
+    output_summary: str,
+    output_data: dict[str, Any],
+    *,
+    model: dict[str, Any] | None = None,
+) -> ResponseEnvelope:
+    """Build a minimal error ResponseEnvelope with JSON-encoded output."""
+    return ResponseEnvelope(
+        status=status,
+        output_summary=output_summary,
+        output=json.dumps(output_data, ensure_ascii=False),
+        model=model or {},
+        timings_ms={},
+        cost={},
+        metadata={},
+    )
+
+
+def extract_output_json(resp: ResponseEnvelope) -> dict[str, Any]:
+    """Extract the structured vision output dict from a response envelope.
+
+    The response envelope stores `output` as a JSON-encoded string (Core wire
+    format). This helper parses it back to a Python dict for internal use.
+    """
+    try:
+        return json.loads(resp.output)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return {"error": "Failed to parse output JSON", "raw_output": resp.output}
 
 
 # ---------------------------------------------------------------------------
@@ -120,14 +173,21 @@ class SafetySpec:
 
 @dataclasses.dataclass(frozen=True)
 class ExecutorRequest:
-    """External executor request envelope fields."""
+    """External executor request envelope fields.
+
+    Supports both the original prototype shape and the actual Core shape:
+    - caller may be a string (prototype) or object (Core: agent/project_id/task_id)
+    - deadline_utc may be a float/epoch (prototype) or ISO-8601 string (Core)
+    - capability_version may be None/null (Core invokes by capability_id)
+    - safety may be empty (Core); defaults visible_writes_allowed=false
+    """
 
     invocation_id: str
     capability_id: str
-    capability_version: str
-    caller: str
+    capability_version: str | None
+    caller: str | dict[str, Any]
     side_effect_level: str
-    deadline_utc: float
+    deadline_utc: str | float
     request: dict[str, Any]
     safety: dict[str, Any] = dataclasses.field(default_factory=dict)
 
@@ -163,15 +223,23 @@ class VisionOutput:
 
 @dataclasses.dataclass(frozen=True)
 class ResponseEnvelope:
-    """Response envelope compatible with Core's proxy executor contract."""
+    """Response envelope compatible with Core's proxy executor contract.
+
+    Wire format (JSON-serialized):
+    - output: JSON-encoded string so Core stores invocation.OutputJson from this field.
+      The contained JSON string has the VisionOutput schema (summary, answer, etc.).
+    - model: object with provider/name/version (not a bare string)
+    - timings_ms: dict with int values (not float)
+    - cost: dict with numeric values only; currency goes in metadata
+    """
 
     status: str
     output_summary: str
-    output: dict[str, Any]
+    output: str
     output_artifact_refs: list[str] = dataclasses.field(default_factory=list)
-    model: str = ""
-    timings_ms: dict[str, float] = dataclasses.field(default_factory=dict)
-    cost: dict[str, float | str] = dataclasses.field(default_factory=dict)
+    model: dict[str, Any] = dataclasses.field(default_factory=dict)
+    timings_ms: dict[str, int] = dataclasses.field(default_factory=dict)
+    cost: dict[str, float] = dataclasses.field(default_factory=dict)
     metadata: dict[str, Any] = dataclasses.field(default_factory=dict)
 
 
@@ -228,71 +296,73 @@ def validate_executor_request(req: ExecutorRequest) -> ResponseEnvelope | None:
     """
     # Capability id must match
     if req.capability_id != CAPABILITY_ID:
-        return ResponseEnvelope(
+        return _error_response(
             status=ResponseStatus.INVALID_REQUEST.value,
             output_summary=f"Unsupported capability_id: {req.capability_id}",
-            output={
+            output_data={
                 "error": f"Expected capability_id '{CAPABILITY_ID}', got '{req.capability_id}'",
                 "field": "capability_id",
             },
-            model="",
         )
 
-    # Capability version sanity
-    if not req.capability_version:
-        return ResponseEnvelope(
-            status=ResponseStatus.INVALID_REQUEST.value,
-            output_summary="Missing capability_version",
-            output={"error": "capability_version is required", "field": "capability_version"},
-            model="",
-        )
+    # Capability version may be null/empty for Core invocation by capability_id
+    # Non-null versions just pass through without strict checking
 
     # Side effect level must be read_only
     if req.side_effect_level != SIDE_EFFECT_LEVEL:
-        return ResponseEnvelope(
+        return _error_response(
             status=ResponseStatus.INVALID_REQUEST.value,
             output_summary=f"Side effect level must be '{SIDE_EFFECT_LEVEL}'",
-            output={
+            output_data={
                 "error": f"Expected side_effect_level '{SIDE_EFFECT_LEVEL}', got '{req.side_effect_level}'",
                 "field": "side_effect_level",
             },
-            model="",
         )
 
-    # Deadline sanity
+    # Deadline sanity: parse ISO string or numeric epoch
+    deadline_ts = _parse_deadline_utc(req.deadline_utc)
+    if deadline_ts is None:
+        return _error_response(
+            status=ResponseStatus.INVALID_REQUEST.value,
+            output_summary="Invalid deadline_utc format",
+            output_data={
+                "error": f"deadline_utc must be ISO-8601 string or numeric epoch, got {type(req.deadline_utc).__name__}",
+                "field": "deadline_utc",
+                "deadline_utc_repr": repr(req.deadline_utc),
+            },
+        )
+
     now = time.time()
-    if req.deadline_utc and req.deadline_utc < now - MAX_DEADLINE_AGE_SECONDS:
-        return ResponseEnvelope(
+    if deadline_ts < now - MAX_DEADLINE_AGE_SECONDS:
+        return _error_response(
             status=ResponseStatus.INVALID_REQUEST.value,
             output_summary="Deadline has expired",
-            output={
+            output_data={
                 "error": "deadline_utc has already passed",
                 "field": "deadline_utc",
-                "deadline_utc": req.deadline_utc,
+                "deadline_utc": deadline_ts,
                 "now_utc": now,
             },
-            model="",
         )
 
-    if req.deadline_utc and req.deadline_utc > now + MAX_DEADLINE_AGE_SECONDS * 2:
-        return ResponseEnvelope(
+    if deadline_ts > now + MAX_DEADLINE_AGE_SECONDS * 2:
+        return _error_response(
             status=ResponseStatus.INVALID_REQUEST.value,
             output_summary="Deadline too far in the future",
-            output={
+            output_data={
                 "error": f"deadline_utc cannot exceed {now + MAX_DEADLINE_AGE_SECONDS * 2}",
                 "field": "deadline_utc",
             },
-            model="",
         )
 
-    # Safety validation
-    safety_errors = _validate_safety(req.safety)
+    # Safety validation: default visible_writes_allowed=false for empty safety
+    safety = req.safety or {}
+    safety_errors = _validate_safety(safety)
     if safety_errors:
-        return ResponseEnvelope(
+        return _error_response(
             status=ResponseStatus.SAFETY_REJECTED.value,
             output_summary="Safety validation failed",
-            output={"errors": safety_errors, "field": "safety"},
-            model="",
+            output_data={"errors": safety_errors, "field": "safety"},
         )
 
     return None
@@ -345,11 +415,10 @@ def validate_vision_request(request: dict[str, Any]) -> ResponseEnvelope | None:
         )
 
     if errors:
-        return ResponseEnvelope(
+        return _error_response(
             status=ResponseStatus.INVALID_REQUEST.value,
             output_summary="Vision request validation failed",
-            output={"errors": errors, "field": "request"},
-            model="",
+            output_data={"errors": errors, "field": "request"},
         )
 
     return None
@@ -362,11 +431,10 @@ def validate_safety_for_request(safety: dict[str, Any]) -> ResponseEnvelope | No
     spec = SafetySpec(**{k: v for k, v in safety.items() if k in {f.name for f in dataclasses.fields(SafetySpec)}})
     errors = spec.validate()
     if errors:
-        return ResponseEnvelope(
+        return _error_response(
             status=ResponseStatus.SAFETY_REJECTED.value,
             output_summary="Safety constraint violation",
-            output={"errors": errors, "field": "safety.visible_writes_allowed"},
-            model="",
+            output_data={"errors": errors, "field": "safety.visible_writes_allowed"},
         )
     return None
 
@@ -779,15 +847,16 @@ def execute_vision_analysis(
             ui_context=executor_req.request.get("ui_context", ""),
         )
     except (ValueError, TypeError) as e:
-        return ResponseEnvelope(
+        return _error_response(
             status=ResponseStatus.INVALID_REQUEST.value,
             output_summary="Failed to parse vision request",
-            output={"error": str(e), "field": "request"},
-            model=model_name,
+            output_data={"error": str(e), "field": "request"},
+            model={"provider": "local-fake", "name": model_name, "version": CAPABILITY_VERSION},
         )
 
     # 4. Validate safety invariants for the request
-    error = validate_safety_for_request(executor_req.safety)
+    safety = executor_req.safety or {}
+    error = validate_safety_for_request(safety)
     if error:
         return error
 
@@ -796,19 +865,18 @@ def execute_vision_analysis(
         if use_fake_analyzer:
             output = run_fake_analyzer(vision_req, injection_texts=injection_texts)
         else:
-            # Real model path — would call external API here
-            return ResponseEnvelope(
+            return _error_response(
                 status=ResponseStatus.MODEL_ERROR.value,
                 output_summary="Real model execution not implemented in this prototype",
-                output={"error": "Real model path requires OpenAI-compatible endpoint integration"},
-                model=model_name,
+                output_data={"error": "Real model path requires OpenAI-compatible endpoint integration"},
+                model={"provider": "local-fake", "name": model_name, "version": CAPABILITY_VERSION},
             )
     except Exception as e:
-        return ResponseEnvelope(
+        return _error_response(
             status=ResponseStatus.INTERNAL_ERROR.value,
             output_summary="Analysis execution failed",
-            output={"error": str(e)},
-            model=model_name,
+            output_data={"error": str(e)},
+            model={"provider": "local-fake", "name": model_name, "version": CAPABILITY_VERSION},
         )
 
     # 6. Build response envelope
@@ -825,19 +893,26 @@ def execute_vision_analysis(
     if not output.limitations:
         output_dict.pop("limitations", None)
 
+    output_json = json.dumps(output_dict, ensure_ascii=False)
+
     return ResponseEnvelope(
         status=ResponseStatus.COMPLETED.value,
         output_summary=output.summary,
-        output=output_dict,
+        output=output_json,
         output_artifact_refs=[],
-        model=model_name,
-        timings_ms={"total_ms": round(elapsed_ms, 2)},
-        cost={"total_cost": 0.0, "currency": "USD"},
+        model={
+            "provider": "local-fake",
+            "name": model_name,
+            "version": CAPABILITY_VERSION,
+        },
+        timings_ms={"total_ms": int(round(elapsed_ms))},
+        cost={"total_cost": 0.0},
         metadata={
             "capability_id": CAPABILITY_ID,
             "capability_version": CAPABILITY_VERSION,
             "mode": vision_req.mode,
             "include_ocr": vision_req.include_ocr,
+            "currency": "USD",
         },
     )
 
