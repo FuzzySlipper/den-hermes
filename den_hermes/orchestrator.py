@@ -13,6 +13,12 @@ logger = logging.getLogger(__name__)
 
 from den_hermes.runtime_registry import DEFAULT_RUNTIME_REGISTRY_PATH, RuntimeRegistryError, resolve_role_runtime
 from den_hermes.worker_launcher import run_hermes_worker, _verify_git_branch_head
+from den_hermes.work_complete_notifier import (
+    WorkCompleteNotification,
+    WorkCompleteEmissionGuard,
+    _final_status_for_action,
+    emit_work_complete_notification,
+)
 
 
 class OrchestratorActionType(str, Enum):
@@ -457,6 +463,25 @@ class DenWorkflowAdapter:
             context=f"assignment release for {assignment_id}",
         )
         return payload_response
+
+    def send_user_notification(
+        self,
+        *,
+        content: str,
+        task_id: int,
+        metadata: Mapping[str, Any],
+        urgency: str = "normal",
+    ) -> Mapping[str, Any]:
+        """Emit a user-facing notification via Core ``send_user_notification``."""
+        response = self.tools.mcp_den_send_user_notification(
+            project_id=self.project_id,
+            sender=self.requested_by,
+            content=content,
+            task_id=task_id,
+            metadata=dict(metadata),
+            urgency=urgency,
+        )
+        return _coerce_mapping_response(response)
 
     def create_review_finding(
         self,
@@ -1213,6 +1238,48 @@ def build_mcp_adapter(*, project_id: str, requested_by: str) -> DenWorkflowAdapt
     )
 
 
+def _maybe_emit_drain_notification(
+    adapter: DenWorkflowAdapter,
+    *,
+    action: OrchestratorAction,
+    task_id: int,
+    guard: WorkCompleteEmissionGuard | None = None,
+) -> None:
+    """Emit an ``agent_work_complete`` notification for terminal drain states.
+
+    Fires at most once per drain cycle when the guard is provided.  Non-terminal
+    action types (``START_CODER``, ``START_REVIEWER``, etc.) are silently skipped.
+    """
+    final_status = _final_status_for_action(action.type.value)
+    if final_status is None:
+        return
+
+    notification = WorkCompleteNotification(
+        agent_identity=adapter.requested_by,
+        completion_scope="assigned_queue",
+        final_status=final_status,
+        project_ids=[adapter.project_id],
+        task_ids=[task_id],
+        completed_task_ids=[task_id] if final_status == "completed" else [],
+        blocked_task_ids=[task_id] if final_status == "blocked" else [task_id] if final_status == "failed" else [],
+        run_ids=[],
+        source_refs=[
+            {"kind": "task", "project_id": adapter.project_id, "task_id": task_id},
+            {"kind": "action", "action_type": action.type.value, "reason": action.reason},
+        ],
+    )
+    try:
+        emit_work_complete_notification(adapter, notification, guard=guard)
+    except Exception:
+        logger.warning(
+            "Failed to emit work-complete notification for task %s (status=%s); "
+            "orchestrator drain continues.",
+            task_id,
+            final_status,
+            exc_info=True,
+        )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Evaluate the next Den spawned-Hermes orchestrator action.")
     parser.add_argument("--project-id", required=True)
@@ -1223,7 +1290,14 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     adapter = build_mcp_adapter(project_id=args.project_id, requested_by=args.requested_by)
+    emission_guard = WorkCompleteEmissionGuard()
     action = decide_next_action(adapter, task_id=args.task_id, max_attempts=args.max_attempts)
+
+    # Emit work-complete notification for terminal drain states. The guard is
+    # scoped to this top-level drain invocation so repeated terminal readbacks
+    # in the same process cannot spam Patch/operator notification feeds.
+    _maybe_emit_drain_notification(adapter, action=action, task_id=args.task_id, guard=emission_guard)
+
     if args.json:
         print(json.dumps(action.to_json_dict(), sort_keys=True))
     else:

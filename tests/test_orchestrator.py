@@ -300,6 +300,10 @@ class RecordingCoderTools:
         self.calls.append(("release_assignment", kwargs))
         return {"ok": True}
 
+    def mcp_den_send_user_notification(self, **kwargs):
+        self.calls.append(("send_user_notification", kwargs))
+        return {"id": 9003}
+
 
 def test_artifact_repo_metadata_uses_orchestrator_values_over_worker_claims():
     artifact = {
@@ -1158,3 +1162,106 @@ def test_gate_path_with_assignment_finalizes_lifecycle(tmp_path):
     assert ckpt_call[1]["assignment_id"] == 13
     assert ckpt_call[1]["checkpoint_type"] == "completion"
     assert json.loads(ckpt_call[1]["payload"])["role"] == "validator"
+
+
+# ---------------------------------------------------------------------------
+# main() notification emission at drain boundary
+# ---------------------------------------------------------------------------
+
+def _main_test_adapter(summary, next_action, tools_list):
+    """Build a fake adapter for main() notification tests."""
+    return make_adapter(
+        RecordingWorkflowTools(summary=summary, next_action=next_action)
+    )
+
+
+def test_main_emits_notification_on_done(monkeypatch, capsys):
+    tools = RecordingWorkflowTools(
+        summary={"task": {"id": 1790, "status": "done"}},
+        next_action={"next_action": "done", "reason": "task already complete"},
+    )
+    # Need notification fake on the same tools object
+    sent = []
+    def fake_send_user_notification(**kwargs):
+        sent.append(kwargs)
+        return {"id": 9003}
+    tools.mcp_den_send_user_notification = fake_send_user_notification
+
+    def fake_build_adapter(*, project_id, requested_by):
+        return make_adapter(tools)
+
+    monkeypatch.setattr("den_hermes.orchestrator.build_mcp_adapter", fake_build_adapter)
+    exit_code = main(["--project-id", "den-hermes-bridge", "--task-id", "1790", "--json"])
+
+    assert exit_code == 0
+    assert len(sent) == 1
+    assert sent[0]["urgency"] == "normal"
+    assert sent[0]["metadata"]["final_status"] == "completed"
+    assert sent[0]["metadata"]["type"] == "agent_work_complete"
+
+
+def test_main_emits_notification_on_blocked(monkeypatch, capsys):
+    tools = RecordingWorkflowTools(
+        summary={"task": {"id": 1790, "status": "blocked"}},
+        next_action={"next_action": "blocked", "reason": "dependency not met"},
+    )
+    sent = []
+    def fake_send_user_notification(**kwargs):
+        sent.append(kwargs)
+        return {"id": 9003}
+    tools.mcp_den_send_user_notification = fake_send_user_notification
+
+    def fake_build_adapter(*, project_id, requested_by):
+        return make_adapter(tools)
+
+    monkeypatch.setattr("den_hermes.orchestrator.build_mcp_adapter", fake_build_adapter)
+    exit_code = main(["--project-id", "den-hermes-bridge", "--task-id", "1790", "--json"])
+
+    assert exit_code == 0
+    assert len(sent) == 1
+    assert sent[0]["urgency"] == "high"
+    assert sent[0]["metadata"]["final_status"] == "blocked"
+
+
+def test_main_emits_notification_on_failed(monkeypatch, capsys):
+    tools = RecordingWorkflowTools(
+        summary={"task": {"id": 1790, "status": "failed"}},
+        next_action={"next_action": "failed", "reason": "worker crashed"},
+    )
+    sent = []
+    def fake_send_user_notification(**kwargs):
+        sent.append(kwargs)
+        return {"id": 9003}
+    tools.mcp_den_send_user_notification = fake_send_user_notification
+
+    def fake_build_adapter(*, project_id, requested_by):
+        return make_adapter(tools)
+
+    monkeypatch.setattr("den_hermes.orchestrator.build_mcp_adapter", fake_build_adapter)
+    exit_code = main(["--project-id", "den-hermes-bridge", "--task-id", "1790", "--json"])
+
+    assert exit_code == 0
+    assert len(sent) == 1
+    assert sent[0]["urgency"] == "high"
+    assert sent[0]["metadata"]["final_status"] == "failed"
+
+
+def test_main_no_notification_on_start_coder(monkeypatch, capsys):
+    tools = RecordingWorkflowTools(
+        summary={"task": {"id": 1790, "status": "planned"}},
+        next_action={"next_action": "start_coder", "reason": "ready"},
+    )
+    sent = []
+    def fake_send_user_notification(**kwargs):
+        sent.append(kwargs)
+        return {"id": 9003}
+    tools.mcp_den_send_user_notification = fake_send_user_notification
+
+    def fake_build_adapter(*, project_id, requested_by):
+        return make_adapter(tools)
+
+    monkeypatch.setattr("den_hermes.orchestrator.build_mcp_adapter", fake_build_adapter)
+    exit_code = main(["--project-id", "den-hermes-bridge", "--task-id", "1790", "--json"])
+
+    assert exit_code == 0
+    assert len(sent) == 0
