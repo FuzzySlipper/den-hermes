@@ -48,6 +48,18 @@ class RecordingMcpTools:
         self.calls.append(("get_worker_run_status", kwargs))
         return {"worker_run": {"run_id": kwargs["run_id"], "state": "completed"}}
 
+    def mcp_den_append_checkpoint(self, **kwargs):
+        self.calls.append(("append_checkpoint", kwargs))
+        return {"checkpoint_id": 5001}
+
+    def mcp_den_record_cleanup_evidence(self, **kwargs):
+        self.calls.append(("record_cleanup_evidence", kwargs))
+        return {"ok": True}
+
+    def mcp_den_release_assignment(self, **kwargs):
+        self.calls.append(("release_assignment", kwargs))
+        return {"ok": True}
+
 
 class StatefulFakeDenTools:
     def __init__(self):
@@ -81,6 +93,18 @@ class StatefulFakeDenTools:
         if run is None:
             return {"state": "missing_run"}
         return {"worker_run": run, "latest_completion": self.completions.get(kwargs["run_id"])}
+
+    def mcp_den_append_checkpoint(self, **kwargs):
+        self.calls.append(("append_checkpoint", kwargs))
+        return {"checkpoint_id": 5001}
+
+    def mcp_den_record_cleanup_evidence(self, **kwargs):
+        self.calls.append(("record_cleanup_evidence", kwargs))
+        return {"ok": True}
+
+    def mcp_den_release_assignment(self, **kwargs):
+        self.calls.append(("release_assignment", kwargs))
+        return {"ok": True}
 
 
 def make_adapter(tools):
@@ -448,3 +472,109 @@ def test_den_mcp_adapter_fails_closed_when_worker_completion_is_rejected():
 
     assert "missing_run" in str(excinfo.value)
     assert "smoke-run" in str(excinfo.value)
+
+
+# ------------------------------------------------------------------
+# Pool assignment lifecycle adapter tests
+# ------------------------------------------------------------------
+
+
+def test_append_assignment_checkpoint_calls_core_tool():
+    tools = RecordingMcpTools()
+    adapter = make_adapter(tools)
+    result = adapter.append_assignment_checkpoint(
+        assignment_id=11,
+        run_id="coder-run",
+        checkpoint_type="completion",
+        payload={"type": "completion", "run_id": "coder-run", "role": "coder", "summary": "done"},
+    )
+    assert result == {"checkpoint_id": 5001}
+    assert ("append_checkpoint",) [0] in [c[0] for c in tools.calls]
+    ckpt_call = [c for c in tools.calls if c[0] == "append_checkpoint"][0]
+    assert ckpt_call[1]["assignment_id"] == 11
+    assert ckpt_call[1]["run_id"] == "coder-run"
+    assert ckpt_call[1]["checkpoint_type"] == "completion"
+    assert json.loads(ckpt_call[1]["payload"])["type"] == "completion"
+
+
+def test_append_assignment_failure_checkpoint():
+    tools = RecordingMcpTools()
+    adapter = make_adapter(tools)
+    adapter.append_assignment_checkpoint(
+        assignment_id=11,
+        run_id="coder-run",
+        checkpoint_type="failure",
+        payload={"type": "failure", "run_id": "coder-run", "role": "coder", "summary": "worker crashed"},
+    )
+    ckpt_call = [c for c in tools.calls if c[0] == "append_checkpoint"][0]
+    assert ckpt_call[1]["checkpoint_type"] == "failure"
+    assert json.loads(ckpt_call[1]["payload"])["type"] == "failure"
+
+
+def test_record_assignment_cleanup_evidence():
+    tools = RecordingMcpTools()
+    adapter = make_adapter(tools)
+    adapter.record_assignment_cleanup_evidence(assignment_id=11)
+    cleanup_call = [c for c in tools.calls if c[0] == "record_cleanup_evidence"][0]
+    assert cleanup_call[1]["assignment_id"] == 11
+    evidence = json.loads(cleanup_call[1]["evidence"])
+    assert evidence["status"] == "cleaned_up"
+    assert evidence["source"] == "spawned_hermes_orchestrator"
+
+
+def test_release_assignment():
+    tools = RecordingMcpTools()
+    adapter = make_adapter(tools)
+    adapter.release_assignment(assignment_id=11)
+    release_call = [c for c in tools.calls if c[0] == "release_assignment"][0]
+    assert release_call[1]["assignment_id"] == 11
+
+
+def test_release_assignment_raises_when_tool_unavailable():
+    class MinimalTools:
+        pass
+
+    adapter = DenMcpAdapter(
+        tools=MinimalTools(),
+        project_id="den-hermes-bridge",
+        requested_by="runner",
+        base_branch="main",
+        base_commit="a" * 40,
+    )
+    with pytest.raises(RuntimeError, match="mcp_den_release_assignment is unavailable"):
+        adapter.release_assignment(assignment_id=11)
+
+
+def test_append_assignment_checkpoint_raises_when_tool_unavailable():
+    class MinimalTools:
+        pass
+
+    adapter = DenMcpAdapter(
+        tools=MinimalTools(),
+        project_id="den-hermes-bridge",
+        requested_by="runner",
+        base_branch="main",
+        base_commit="a" * 40,
+    )
+    with pytest.raises(RuntimeError, match="mcp_den_append_checkpoint is unavailable"):
+        adapter.append_assignment_checkpoint(
+            assignment_id=11,
+            run_id="coder-run",
+            checkpoint_type="completion",
+            payload={"type": "completion"},
+        )
+
+
+def test_record_cleanup_evidence_raises_when_tool_unavailable():
+    class MinimalTools:
+        pass
+
+    adapter = DenMcpAdapter(
+        tools=MinimalTools(),
+        project_id="den-hermes-bridge",
+        requested_by="runner",
+        base_branch="main",
+        base_commit="a" * 40,
+    )
+    with pytest.raises(RuntimeError, match="mcp_den_record_cleanup_evidence is unavailable"):
+        adapter.record_assignment_cleanup_evidence(assignment_id=11)

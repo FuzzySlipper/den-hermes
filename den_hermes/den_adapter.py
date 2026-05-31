@@ -5,6 +5,20 @@ from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
 
+def _coerce_mapping_response(response: Any) -> Mapping[str, Any]:
+    if isinstance(response, Mapping):
+        return response
+    return {"raw": response}
+
+
+def _ensure_den_did_not_reject(payload: Mapping[str, Any], *, context: str) -> None:
+    status = str(payload.get("status") or "").lower()
+    if status in {"error", "failed", "rejected", "malformed"}:
+        raise RuntimeError(f"Den rejected {context}: {payload}")
+    if payload.get("error"):
+        raise RuntimeError(f"Den rejected {context}: {payload}")
+
+
 @dataclass(frozen=True)
 class DenMcpAdapter:
     """Adapter from spawned-Hermes workflow events to Den MCP tool calls.
@@ -135,6 +149,76 @@ class DenMcpAdapter:
             task_id=task_id,
             run_id=run_id,
         )
+
+    # ------------------------------------------------------------------
+    # Pool assignment lifecycle methods
+    # ------------------------------------------------------------------
+
+    def append_assignment_checkpoint(
+        self,
+        *,
+        assignment_id: int,
+        run_id: str,
+        checkpoint_type: str,
+        payload: Mapping[str, Any],
+    ) -> Any:
+        """Append a terminal checkpoint to a Core worker-pool assignment."""
+        tool = getattr(self.tools, "mcp_den_append_checkpoint", None)
+        if tool is None:
+            raise RuntimeError(
+                "Den MCP tool mcp_den_append_checkpoint is unavailable; "
+                "cannot finalize pool assignment lifecycle."
+            )
+        response = tool(
+            assignment_id=assignment_id,
+            run_id=run_id,
+            checkpoint_type=checkpoint_type,
+            payload=json.dumps(dict(payload)),
+        )
+        payload_response = _coerce_mapping_response(response)
+        _ensure_den_did_not_reject(
+            payload_response,
+            context=f"assignment {checkpoint_type} checkpoint for {run_id}",
+        )
+        return payload_response
+
+    def record_assignment_cleanup_evidence(self, *, assignment_id: int) -> Any:
+        """Record cleanup evidence on a Core worker-pool assignment."""
+        tool = getattr(self.tools, "mcp_den_record_cleanup_evidence", None)
+        if tool is None:
+            raise RuntimeError(
+                "Den MCP tool mcp_den_record_cleanup_evidence is unavailable; "
+                "cannot record cleanup evidence for pool assignment."
+            )
+        response = tool(
+            assignment_id=assignment_id,
+            evidence=json.dumps({
+                "status": "cleaned_up",
+                "source": "spawned_hermes_orchestrator",
+            }),
+        )
+        payload_response = _coerce_mapping_response(response)
+        _ensure_den_did_not_reject(
+            payload_response,
+            context=f"assignment cleanup evidence for {assignment_id}",
+        )
+        return payload_response
+
+    def release_assignment(self, *, assignment_id: int) -> Any:
+        """Release a Core worker-pool assignment back to the pool."""
+        tool = getattr(self.tools, "mcp_den_release_assignment", None)
+        if tool is None:
+            raise RuntimeError(
+                "Den MCP tool mcp_den_release_assignment is unavailable; "
+                "cannot release pool assignment."
+            )
+        response = tool(assignment_id=assignment_id)
+        payload_response = _coerce_mapping_response(response)
+        _ensure_den_did_not_reject(
+            payload_response,
+            context=f"assignment release for {assignment_id}",
+        )
+        return payload_response
 
     def request_review(
         self,

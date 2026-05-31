@@ -16,6 +16,7 @@ from den_hermes.orchestrator import (
     handle_review_outcome,
     CoderPathResult,
     _artifact_with_repo_metadata,
+    _finalize_pool_assignment,
 )
 from test_spawned_hermes_worker import FAKE_HEAD, fake_env, init_git_repo, read_fake_calls, write_runtime_registry
 
@@ -286,6 +287,18 @@ class RecordingCoderTools:
     def mcp_den_set_review_finding_status(self, **kwargs):
         self.calls.append(("set_review_finding_status", kwargs))
         return {"id": kwargs["review_finding_id"], "status": kwargs.get("status")}
+
+    def mcp_den_append_checkpoint(self, **kwargs):
+        self.calls.append(("append_checkpoint", kwargs))
+        return {"checkpoint_id": 5001}
+
+    def mcp_den_record_cleanup_evidence(self, **kwargs):
+        self.calls.append(("record_cleanup_evidence", kwargs))
+        return {"ok": True}
+
+    def mcp_den_release_assignment(self, **kwargs):
+        self.calls.append(("release_assignment", kwargs))
+        return {"ok": True}
 
 
 def test_artifact_repo_metadata_uses_orchestrator_values_over_worker_claims():
@@ -907,3 +920,241 @@ def test_tracked_gate_role_path_registration_failure_prevents_launch(tmp_path):
     assert "validator registration rejected" in result.error
     assert [name for name, _ in tools.calls] == ["prepare_validator_context_packet", "register_worker_run"]
     assert not (tmp_path / "fake-hermes-call.jsonl").exists()
+
+
+# ------------------------------------------------------------------
+# Pool assignment lifecycle tests
+# ------------------------------------------------------------------
+
+
+def test_coder_path_with_assignment_finalizes_lifecycle(tmp_path):
+    """Pool-managed coder path: assignment_id provided → full lifecycle."""
+    head = init_git_repo(tmp_path)
+    subprocess.run(["git", "checkout", "-b", "task/1368-fake"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    env = fake_env(tmp_path)
+    env["FAKE_HEAD"] = head
+    tools = RecordingCoderTools(launch_log=tmp_path / "fake-hermes-call.jsonl")
+    adapter = make_adapter(tools)
+
+    result = run_tracked_coder_path(
+        adapter,
+        task_id=1799,
+        prompt="Implement pool completion release.",
+        run_id="t1799-pool-coder",
+        cwd=tmp_path,
+        env_overrides=env,
+        runtime_registry_path=write_runtime_registry(tmp_path),
+        verify_git=True,
+        assignment_id=11,
+    )
+
+    assert result.status == "completed"
+    assert result.assignment_finalized is True
+
+    # Verify call order: completion_packet → append_checkpoint → record_cleanup → release
+    lifecycle_calls = [
+        name for name, _ in tools.calls
+        if name in ("post_worker_completion_packet", "append_checkpoint", "record_cleanup_evidence", "release_assignment")
+    ]
+    assert lifecycle_calls == [
+        "post_worker_completion_packet",
+        "append_checkpoint",
+        "record_cleanup_evidence",
+        "release_assignment",
+    ]
+
+    # Verify checkpoint has correct assignment context
+    ckpt_call = [c for c in tools.calls if c[0] == "append_checkpoint"][0]
+    assert ckpt_call[1]["assignment_id"] == 11
+    assert ckpt_call[1]["run_id"] == "t1799-pool-coder"
+    assert ckpt_call[1]["checkpoint_type"] == "completion"
+    assert json.loads(ckpt_call[1]["payload"])["role"] == "coder"
+
+
+def test_coder_path_without_assignment_skips_lifecycle(tmp_path):
+    """Legacy coder path: no assignment_id → no lifecycle calls, assignment_finalized=False."""
+    head = init_git_repo(tmp_path)
+    subprocess.run(["git", "checkout", "-b", "task/1368-fake"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    env = fake_env(tmp_path)
+    env["FAKE_HEAD"] = head
+    tools = RecordingCoderTools()
+    adapter = make_adapter(tools)
+
+    result = run_tracked_coder_path(
+        adapter,
+        task_id=1396,
+        prompt="Implement.",
+        run_id="coder-run",
+        cwd=tmp_path,
+        env_overrides=env,
+        runtime_registry_path=write_runtime_registry(tmp_path),
+        verify_git=True,
+    )
+
+    assert result.status == "completed"
+    assert result.assignment_finalized is False
+    lifecycle_calls = [
+        name for name, _ in tools.calls
+        if name in ("append_checkpoint", "record_cleanup_evidence", "release_assignment")
+    ]
+    assert lifecycle_calls == []
+
+
+def test_finalize_pool_assignment_requires_assignment_for_pool_managed_run():
+    """Pool-managed finalization fails closed when assignment identity is missing."""
+    tools = RecordingCoderTools()
+    adapter = make_adapter(tools)
+
+    with pytest.raises(RuntimeError, match="Missing assignment_id"):
+        _finalize_pool_assignment(
+            adapter,
+            assignment_id=None,
+            requires_assignment=True,
+            run_id="pool-run",
+            role="coder",
+            success=True,
+            summary="completed",
+        )
+
+    lifecycle_calls = [
+        name for name, _ in tools.calls
+        if name in ("append_checkpoint", "record_cleanup_evidence", "release_assignment")
+    ]
+    assert lifecycle_calls == []
+
+
+def test_finalize_pool_assignment_allows_explicit_legacy_no_assignment_mode():
+    """Non-pool legacy finalization may skip only when assignment is not required."""
+    tools = RecordingCoderTools()
+    adapter = make_adapter(tools)
+
+    finalized = _finalize_pool_assignment(
+        adapter,
+        assignment_id=None,
+        requires_assignment=False,
+        run_id="legacy-run",
+        role="coder",
+        success=True,
+        summary="completed",
+    )
+
+    assert finalized is False
+    lifecycle_calls = [
+        name for name, _ in tools.calls
+        if name in ("append_checkpoint", "record_cleanup_evidence", "release_assignment")
+    ]
+    assert lifecycle_calls == []
+
+
+def test_coder_failure_with_assignment_finalizes_lifecycle(tmp_path):
+    """Pool-managed coder failure: assignment_id provided → failure checkpoint + cleanup + release."""
+    tools = RecordingCoderTools()
+    adapter = make_adapter(tools)
+
+    result = run_tracked_coder_path(
+        adapter,
+        task_id=1799,
+        prompt="Implement.",
+        run_id="coder-run",
+        cwd=tmp_path,
+        env_overrides=fake_env(tmp_path, mode="missing_artifact"),
+        runtime_registry_path=write_runtime_registry(tmp_path),
+        assignment_id=11,
+    )
+
+    assert result.status == "failed"
+    assert result.assignment_finalized is True
+
+    lifecycle_calls = [
+        name for name, _ in tools.calls
+        if name in ("post_worker_completion_packet", "append_checkpoint", "record_cleanup_evidence", "release_assignment")
+    ]
+    assert lifecycle_calls == [
+        "post_worker_completion_packet",  # failure packet
+        "append_checkpoint",
+        "record_cleanup_evidence",
+        "release_assignment",
+    ]
+
+    ckpt_call = [c for c in tools.calls if c[0] == "append_checkpoint"][0]
+    assert ckpt_call[1]["checkpoint_type"] == "failure"
+    assert ckpt_call[1]["assignment_id"] == 11
+
+
+def test_reviewer_path_with_assignment_finalizes_lifecycle(tmp_path):
+    """Pool-managed reviewer path: assignment_id provided → full lifecycle after completion."""
+    tools = RecordingCoderTools()
+    adapter = make_adapter(tools)
+
+    result = run_tracked_reviewer_path(
+        adapter,
+        task_id=1799,
+        prompt="Review changes.",
+        run_id="reviewer-run",
+        coder_artifact={
+            "branch": "task/1799-pool",
+            "head_commit": FAKE_HEAD,
+            "tests_run": [{"command": "pytest", "result": "all passed"}],
+        },
+        cwd=tmp_path,
+        env_overrides=fake_env(tmp_path, mode="reviewer_changes_requested"),
+        runtime_registry_path=write_runtime_registry(tmp_path),
+        assignment_id=12,
+    )
+
+    assert result.status == "completed"
+    assert result.assignment_finalized is True
+
+    lifecycle_calls = [
+        name for name, _ in tools.calls
+        if name in ("post_worker_completion_packet", "append_checkpoint", "record_cleanup_evidence", "release_assignment")
+    ]
+    assert lifecycle_calls == [
+        "post_worker_completion_packet",
+        "append_checkpoint",
+        "record_cleanup_evidence",
+        "release_assignment",
+    ]
+
+    ckpt_call = [c for c in tools.calls if c[0] == "append_checkpoint"][0]
+    assert ckpt_call[1]["assignment_id"] == 12
+    assert ckpt_call[1]["checkpoint_type"] == "completion"
+
+
+def test_gate_path_with_assignment_finalizes_lifecycle(tmp_path):
+    """Pool-managed gate path: assignment_id provided → full lifecycle after completion."""
+    tools = RecordingCoderTools()
+    adapter = make_adapter(tools)
+
+    result = run_tracked_gate_role_path(
+        adapter,
+        task_id=1799,
+        role="validator",
+        prompt="Validate.",
+        run_id="validator-run",
+        branch="task/1799-pool",
+        head_commit=FAKE_HEAD,
+        cwd=tmp_path,
+        env_overrides=fake_env(tmp_path),
+        runtime_registry_path=write_runtime_registry(tmp_path),
+        assignment_id=13,
+    )
+
+    assert result.status == "completed"
+    assert result.assignment_finalized is True
+
+    lifecycle_calls = [
+        name for name, _ in tools.calls
+        if name in ("post_worker_completion_packet", "append_checkpoint", "record_cleanup_evidence", "release_assignment")
+    ]
+    assert lifecycle_calls == [
+        "post_worker_completion_packet",
+        "append_checkpoint",
+        "record_cleanup_evidence",
+        "release_assignment",
+    ]
+
+    ckpt_call = [c for c in tools.calls if c[0] == "append_checkpoint"][0]
+    assert ckpt_call[1]["assignment_id"] == 13
+    assert ckpt_call[1]["checkpoint_type"] == "completion"
+    assert json.loads(ckpt_call[1]["payload"])["role"] == "validator"

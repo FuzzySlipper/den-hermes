@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Any, Mapping
+
+logger = logging.getLogger(__name__)
 
 from den_hermes.runtime_registry import DEFAULT_RUNTIME_REGISTRY_PATH, RuntimeRegistryError, resolve_role_runtime
 from den_hermes.worker_launcher import run_hermes_worker, _verify_git_branch_head
@@ -144,6 +147,7 @@ class CoderPathResult:
     error: str | None = None
     claimed_finding_ids: list[int] = field(default_factory=list)
     response_notes: str | None = None
+    assignment_finalized: bool = False
 
 
 @dataclass(frozen=True)
@@ -157,6 +161,7 @@ class ReviewerPathResult:
     worker_status: Mapping[str, Any] | None = None
     review_request: Mapping[str, Any] | None = None
     error: str | None = None
+    assignment_finalized: bool = False
 
 
 @dataclass(frozen=True)
@@ -179,6 +184,7 @@ class GateRolePathResult:
     latest_completion: Mapping[str, Any] | None = None
     worker_status: Mapping[str, Any] | None = None
     error: str | None = None
+    assignment_finalized: bool = False
 
 
 @dataclass(frozen=True)
@@ -405,6 +411,38 @@ class DenWorkflowAdapter:
         )
         return _coerce_mapping_response(response)
 
+    def append_assignment_checkpoint(
+        self,
+        *,
+        assignment_id: int,
+        run_id: str,
+        checkpoint_type: str,
+        payload: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        response = self.tools.mcp_den_append_checkpoint(
+            assignment_id=assignment_id,
+            run_id=run_id,
+            checkpoint_type=checkpoint_type,
+            payload=json.dumps(dict(payload)),
+        )
+        return _coerce_mapping_response(response)
+
+    def record_assignment_cleanup_evidence(self, *, assignment_id: int) -> Mapping[str, Any]:
+        response = self.tools.mcp_den_record_cleanup_evidence(
+            assignment_id=assignment_id,
+            evidence=json.dumps({
+                "status": "cleaned_up",
+                "source": "spawned_hermes_orchestrator",
+            }),
+        )
+        return _coerce_mapping_response(response)
+
+    def release_assignment(self, *, assignment_id: int) -> Mapping[str, Any]:
+        response = self.tools.mcp_den_release_assignment(
+            assignment_id=assignment_id,
+        )
+        return _coerce_mapping_response(response)
+
     def create_review_finding(
         self,
         *,
@@ -528,6 +566,65 @@ def decide_next_action(adapter: DenWorkflowAdapter, *, task_id: int, max_attempt
     )
 
 
+def _finalize_pool_assignment(
+    adapter: DenWorkflowAdapter,
+    *,
+    assignment_id: int | None,
+    run_id: str,
+    role: str,
+    success: bool,
+    requires_assignment: bool = False,
+    summary: str = "",
+    error: str | None = None,
+    branch: str | None = None,
+    head_commit: str | None = None,
+) -> bool:
+    """Complete the pool assignment lifecycle: checkpoint → cleanup → release.
+
+    Returns True when the lifecycle was finalized.
+
+    When requires_assignment=True (pool-managed paths):
+        - assignment_id MUST be a valid integer; raises RuntimeError if None.
+    When requires_assignment=False (legacy/non-pool paths):
+        - assignment_id=None is acceptable; logs info and returns False.
+    """
+    if assignment_id is None:
+        if requires_assignment:
+            raise RuntimeError(
+                f"Missing assignment_id for pool-managed run {run_id!r} role {role!r}. "
+                f"Pool runs must carry assignment_id from lease/acquisition context. "
+                f"Cannot finalize pool assignment lifecycle."
+            )
+        logger.info(
+            "No assignment_id for run %s role %s — legacy/non-pool path, "
+            "skipping pool assignment lifecycle.",
+            run_id,
+            role,
+        )
+        return False
+
+    checkpoint_payload: dict[str, Any] = {
+        "type": "completion" if success else "failure",
+        "run_id": run_id,
+        "role": role,
+        "summary": summary or error or "",
+    }
+    if branch:
+        checkpoint_payload["branch"] = branch
+    if head_commit:
+        checkpoint_payload["head_commit"] = head_commit
+
+    adapter.append_assignment_checkpoint(
+        assignment_id=assignment_id,
+        run_id=run_id,
+        checkpoint_type="completion" if success else "failure",
+        payload=checkpoint_payload,
+    )
+    adapter.record_assignment_cleanup_evidence(assignment_id=assignment_id)
+    adapter.release_assignment(assignment_id=assignment_id)
+    return True
+
+
 def run_tracked_coder_path(
     adapter: DenWorkflowAdapter,
     *,
@@ -543,6 +640,7 @@ def run_tracked_coder_path(
     base_commit: str | None = None,
     allowed_scope: str | None = None,
     activity_context: Mapping[str, Any] | None = None,
+    assignment_id: int | None = None,
 ) -> CoderPathResult:
     """Run the tracked spawned-Hermes coder path for a START_CODER action.
 
@@ -622,12 +720,23 @@ def run_tracked_coder_path(
     if worker.status != "completed" or worker.artifact is None:
         error = worker.error or "Coder worker did not complete"
         adapter.mark_worker_failed(task_id=task_id, run_id=run_id, role="coder", error=error)
-        return CoderPathResult(status="failed", run_id=run_id, artifact_path=artifact_path, error=error)
+        _finalize_pool_assignment(
+            adapter, assignment_id=assignment_id, run_id=run_id, role="coder",
+            success=False, error=error, requires_assignment=assignment_id is not None,
+        )
+        return CoderPathResult(
+            status="failed", run_id=run_id, artifact_path=artifact_path, error=error,
+            assignment_finalized=assignment_id is not None,
+        )
 
     if verify_git:
         git_error = _verify_git_branch_head(worker.artifact, cwd=cwd if cwd is not None else runtime.workdir)
         if git_error:
             adapter.mark_worker_failed(task_id=task_id, run_id=run_id, role="coder", error=git_error)
+            _finalize_pool_assignment(
+                adapter, assignment_id=assignment_id, run_id=run_id, role="coder",
+                success=False, error=git_error, requires_assignment=assignment_id is not None,
+            )
             return CoderPathResult(
                 status="failed",
                 run_id=run_id,
@@ -635,11 +744,16 @@ def run_tracked_coder_path(
                 head_commit=str(worker.artifact.get("head_commit")),
                 artifact_path=artifact_path,
                 error=git_error,
+                assignment_finalized=assignment_id is not None,
             )
 
     try:
         adapter.mark_worker_completed(task_id=task_id, run_id=run_id, role="coder", artifact=worker.artifact)
     except Exception as exc:  # noqa: BLE001 - Den rejected authoritative completion
+        _finalize_pool_assignment(
+            adapter, assignment_id=assignment_id, run_id=run_id, role="coder",
+            success=False, error=str(exc), requires_assignment=assignment_id is not None,
+        )
         return CoderPathResult(
             status="failed",
             run_id=run_id,
@@ -647,7 +761,15 @@ def run_tracked_coder_path(
             head_commit=str(worker.artifact.get("head_commit")),
             artifact_path=artifact_path,
             error=f"Coder completion rejected by Den: {exc}",
+            assignment_finalized=assignment_id is not None,
         )
+    _finalize_pool_assignment(
+        adapter, assignment_id=assignment_id, run_id=run_id, role="coder",
+        success=True,
+        summary=str(worker.artifact.get("summary", "")),
+        branch=str(worker.artifact.get("branch")),
+        head_commit=str(worker.artifact.get("head_commit")),
+    )
     latest_completion = adapter.get_latest_worker_completion(task_id=task_id, run_id=run_id, role="coder")
     worker_status = adapter.get_worker_run_status(task_id=task_id, run_id=run_id)
     return CoderPathResult(
@@ -660,6 +782,7 @@ def run_tracked_coder_path(
         worker_status=worker_status,
         claimed_finding_ids=[int(value) for value in worker.artifact.get("claimed_finding_ids", [])],
         response_notes=worker.artifact.get("response_notes"),
+        assignment_finalized=assignment_id is not None,
     )
 
 
@@ -677,6 +800,7 @@ def run_tracked_reviewer_path(
     base_branch: str | None = None,
     base_commit: str | None = None,
     activity_context: Mapping[str, Any] | None = None,
+    assignment_id: int | None = None,
 ) -> ReviewerPathResult:
     """Run the tracked spawned-Hermes reviewer path after coder completion."""
 
@@ -777,7 +901,15 @@ def run_tracked_reviewer_path(
     if worker.status != "completed" or worker.artifact is None:
         error = worker.error or "Reviewer worker did not complete"
         adapter.mark_worker_failed(task_id=task_id, run_id=run_id, role="reviewer", error=error)
-        return ReviewerPathResult(status="failed", run_id=run_id, review_request=review_request, artifact_path=artifact_path, error=error)
+        _finalize_pool_assignment(
+            adapter, assignment_id=assignment_id, run_id=run_id, role="reviewer",
+            success=False, error=error,
+        )
+        return ReviewerPathResult(
+            status="failed", run_id=run_id, review_request=review_request,
+            artifact_path=artifact_path, error=error,
+            assignment_finalized=assignment_id is not None,
+        )
 
     try:
         finding_ids = _publish_reviewer_finding_entries(
@@ -804,8 +936,23 @@ def run_tracked_reviewer_path(
             summary=str(worker.artifact.get("summary", "")),
         )
     except Exception as exc:  # noqa: BLE001 - publication failures are fail-closed
-        return ReviewerPathResult(status="failed", run_id=run_id, review_request=review_request, artifact_path=artifact_path, error=str(exc))
+        _finalize_pool_assignment(
+            adapter, assignment_id=assignment_id, run_id=run_id, role="reviewer",
+            success=False, error=str(exc),
+        )
+        return ReviewerPathResult(
+            status="failed", run_id=run_id, review_request=review_request,
+            artifact_path=artifact_path, error=str(exc),
+            assignment_finalized=assignment_id is not None,
+        )
 
+    _finalize_pool_assignment(
+        adapter, assignment_id=assignment_id, run_id=run_id, role="reviewer",
+        success=True,
+        summary=str(worker.artifact.get("summary", "")),
+        branch=branch,
+        head_commit=head_commit,
+    )
     latest_completion = adapter.get_latest_worker_completion(task_id=task_id, run_id=run_id, role="reviewer")
     worker_status = adapter.get_worker_run_status(task_id=task_id, run_id=run_id)
     return ReviewerPathResult(
@@ -817,6 +964,7 @@ def run_tracked_reviewer_path(
         latest_completion=latest_completion,
         worker_status=worker_status,
         review_request=review_request,
+        assignment_finalized=assignment_id is not None,
     )
 
 
@@ -836,6 +984,7 @@ def run_tracked_gate_role_path(
     base_commit: str | None = None,
     allowed_scope: str | None = None,
     activity_context: Mapping[str, Any] | None = None,
+    assignment_id: int | None = None,
 ) -> GateRolePathResult:
     """Run an optional post-review gate role through tracked spawned-Hermes."""
 
@@ -918,7 +1067,15 @@ def run_tracked_gate_role_path(
     if worker.status != "completed" or worker.artifact is None:
         error = worker.error or f"{role} worker did not complete"
         adapter.mark_worker_failed(task_id=task_id, run_id=run_id, role=role, error=error)
-        return GateRolePathResult(status="failed", run_id=run_id, role=role, artifact_path=artifact_path, error=error)
+        _finalize_pool_assignment(
+            adapter, assignment_id=assignment_id, run_id=run_id, role=role,
+            success=False, error=error,
+        )
+        return GateRolePathResult(
+            status="failed", run_id=run_id, role=role,
+            artifact_path=artifact_path, error=error,
+            assignment_finalized=assignment_id is not None,
+        )
 
     try:
         gate_artifact = _artifact_with_repo_metadata(
@@ -929,14 +1086,26 @@ def run_tracked_gate_role_path(
         )
         adapter.mark_worker_completed(task_id=task_id, run_id=run_id, role=role, artifact=gate_artifact)
     except Exception as exc:  # noqa: BLE001 - Den rejected authoritative completion
+        _finalize_pool_assignment(
+            adapter, assignment_id=assignment_id, run_id=run_id, role=role,
+            success=False, error=str(exc),
+        )
         return GateRolePathResult(
             status="failed",
             run_id=run_id,
             role=role,
             artifact_path=artifact_path,
             error=f"{role} completion rejected by Den: {exc}",
+            assignment_finalized=assignment_id is not None,
         )
 
+    _finalize_pool_assignment(
+        adapter, assignment_id=assignment_id, run_id=run_id, role=role,
+        success=True,
+        summary=str(worker.artifact.get("summary", "")),
+        branch=branch,
+        head_commit=head_commit,
+    )
     latest_completion = adapter.get_latest_worker_completion(task_id=task_id, run_id=run_id, role=role)
     worker_status = adapter.get_worker_run_status(task_id=task_id, run_id=run_id)
     return GateRolePathResult(
@@ -948,6 +1117,7 @@ def run_tracked_gate_role_path(
         artifact_path=artifact_path,
         latest_completion=latest_completion,
         worker_status=worker_status,
+        assignment_finalized=assignment_id is not None,
     )
 
 
