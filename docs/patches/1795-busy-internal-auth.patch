@@ -1,0 +1,20 @@
+diff --git a/gateway/run.py b/gateway/run.py
+index 1b2220a56..b3df00853 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -3148,6 +3148,15 @@ class GatewayRunner:
+         merge_pending_message_event(adapter._pending_messages, session_key, event)
+ 
+     async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
++        # --- Internal events (e.g. Den Channels trusted deliveries) ---
++        # Internal events are system-generated and must skip user authorization —
++        # matching the cold-path behaviour in _handle_message.  Without this,
++        # trusted Den Gateway deliveries with internal=True and user_id=None
++        # are dropped as unauthorized when the session is busy (#1795).
++        if getattr(event, "internal", False):
++            self._queue_or_replace_pending_event(session_key, event)
++            return True
++
+         # --- Authorization gate (#17775) ---
+         # The cold path (_handle_message) checks _is_user_authorized before
+         # creating a session.  The busy path must enforce the same check;
