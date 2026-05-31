@@ -18,6 +18,7 @@ from den_hermes.orchestrator import (
     _artifact_with_repo_metadata,
     _finalize_pool_assignment,
 )
+from den_hermes.worker_launcher import HermesWorkerResult
 from test_spawned_hermes_worker import FAKE_HEAD, fake_env, init_git_repo, read_fake_calls, write_runtime_registry
 
 
@@ -1265,3 +1266,267 @@ def test_main_no_notification_on_start_coder(monkeypatch, capsys):
 
     assert exit_code == 0
     assert len(sent) == 0
+
+
+# ---------------------------------------------------------------------------
+# Pool-mode runtime authority tests
+# ---------------------------------------------------------------------------
+
+
+def _fake_resolved_runtime(**overrides):
+    """Build a ResolvedRuntime with overridable fields."""
+    from den_hermes.runtime_registry import ResolvedRuntime
+
+    defaults = dict(
+        schema_version=1,
+        registry_id="test-registry",
+        registry_path="/tmp/test.yaml",
+        registry_fingerprint="sha256:test",
+        resolved_at="2026-05-31T00:00:00Z",
+        role="coder",
+        runtime_id="rt-coder-001",
+        substrate="spawned_hermes",
+        hermes_binary="hermes",
+        profile="spawned-coder",
+        provider="openai",
+        model="gpt-4o",
+        toolsets=("terminal", "file"),
+        timeout_seconds=300,
+        workdir="/tmp/work",
+        run_root="/tmp/runs",
+        artifact_filename="completion.json",
+        log_filename="worker.log",
+        source="den-worker",
+        extra_args=(),
+        preflight={},
+    )
+    defaults.update(overrides)
+    return ResolvedRuntime(**defaults)
+
+
+def _fake_coder_artifact(**overrides):
+    artifact = {
+        "status": "completed",
+        "branch": "task/test-pool",
+        "head_commit": "a" * 40,
+        "tests_run": [{"command": "pytest", "result": "pass"}],
+        "summary": "Test",
+    }
+    artifact.update(overrides)
+    return artifact
+
+
+class TestCoderPathPoolMode:
+    def setup_registry(self, tmp_path):
+        """Create a minimal runtime registry for testing."""
+        registry_path = tmp_path / "runtime-registry.yaml"
+        registry_path.write_text("""\
+schema_version: 1
+registry_id: test-pool-registry
+defaults:
+  substrate: spawned_hermes
+  hermes_binary: hermes
+  run_root: /tmp/runs
+  artifact_filename: completion.json
+  log_filename: worker.log
+  profile_required: true
+  provider_required: true
+  model_required: true
+  timeout_seconds: 600
+  toolsets: [file]
+  workdir: /tmp/work
+roles:
+  coder:
+    runtime_id: coder-pool
+    profile: spawned-coder
+    provider: openai
+    model: gpt-4o
+    toolsets: [terminal, file]
+    workdir: /tmp/work
+    run_root: /tmp/runs
+  reviewer:
+    runtime_id: reviewer-pool
+    profile: spawned-reviewer
+    provider: openai
+    model: gpt-4o
+    toolsets: [terminal, file]
+    workdir: /tmp/work
+    run_root: /tmp/runs
+  validator:
+    runtime_id: validator-pool
+    profile: spawned-validator
+    provider: openai
+    model: gpt-4o
+    toolsets: [terminal, file]
+    workdir: /tmp/work
+    run_root: /tmp/runs
+  drift_checker:
+    runtime_id: drift-checker-pool
+    profile: spawned-drift-checker
+    provider: openai
+    model: gpt-4o
+    toolsets: [terminal, file]
+    workdir: /tmp/work
+    run_root: /tmp/runs
+  packet_auditor:
+    runtime_id: packet-auditor-pool
+    profile: spawned-packet-auditor
+    provider: openai
+    model: gpt-4o
+    toolsets: [terminal, file]
+    workdir: /tmp/work
+    run_root: /tmp/runs
+""")
+        return registry_path
+
+    def test_pool_mode_skips_provider_model_in_worker_launch(self, monkeypatch, tmp_path):
+        """pool_mode=True → provider/model are None in run_hermes_worker args."""
+        registry = self.setup_registry(tmp_path)
+        captured_args = {}
+
+        def fake_worker(**kwargs):
+            captured_args.update(kwargs)
+            return HermesWorkerResult(status="completed", exit_code=0, stdout="", stderr="",
+                                      artifact=_fake_coder_artifact())
+
+        monkeypatch.setattr("den_hermes.orchestrator.run_hermes_worker", fake_worker)
+        monkeypatch.setattr("os.environ", {
+            "DEN_HERMES_POOL_MEMBER_ID": "pool-coder-01",
+            "DEN_HERMES_PROFILE": "spawned-coder",
+        })
+
+        tools = RecordingCoderTools()
+        adapter = make_adapter(tools)
+        result = run_tracked_coder_path(
+            adapter,
+            task_id=1798,
+            prompt="Test",
+            run_id="pool-coder-run",
+            cwd=str(tmp_path),
+            runtime_registry_path=str(registry),
+            verify_git=False,
+            pool_mode=True,
+        )
+
+        assert result.status == "completed"
+        assert captured_args["provider"] is None, "provider should be None in pool_mode"
+        assert captured_args["model"] is None, "model should be None in pool_mode"
+        assert captured_args["profile"] == "spawned-coder", "profile should be preserved in pool_mode"
+        assert captured_args["toolsets"] is None, "toolsets should be None in pool_mode"
+
+    def test_one_shot_passes_provider_model_in_worker_launch(self, monkeypatch, tmp_path):
+        """pool_mode=False (default) → provider/model are passed as-is."""
+        registry = self.setup_registry(tmp_path)
+        captured_args = {}
+
+        def fake_worker(**kwargs):
+            captured_args.update(kwargs)
+            return HermesWorkerResult(status="completed", exit_code=0, stdout="", stderr="",
+                                      artifact=_fake_coder_artifact())
+
+        monkeypatch.setattr("den_hermes.orchestrator.run_hermes_worker", fake_worker)
+        tools = RecordingCoderTools()
+        adapter = make_adapter(tools)
+        result = run_tracked_coder_path(
+            adapter,
+            task_id=1798,
+            prompt="Test",
+            run_id="one-shot-run",
+            cwd=str(tmp_path),
+            runtime_registry_path=str(registry),
+            verify_git=False,
+            pool_mode=False,
+        )
+
+        assert result.status == "completed"
+        assert captured_args["provider"] is not None, "provider should be passed in one-shot mode"
+        assert captured_args["model"] is not None, "model should be passed in one-shot mode"
+
+    def test_pool_mode_drift_blocks_assignment(self, monkeypatch, tmp_path):
+        """Pool mode with missing pool identity → blocked result."""
+        registry = self.setup_registry(tmp_path)
+        monkeypatch.setattr("os.environ", {
+            "DEN_HERMES_POOL_MEMBER_ID": "",
+            "DEN_HERMES_PROFILE": "",
+        })
+
+        tools = RecordingCoderTools()
+        adapter = make_adapter(tools)
+        result = run_tracked_coder_path(
+            adapter,
+            task_id=1798,
+            prompt="Test",
+            run_id="pool-drift-run",
+            cwd=str(tmp_path),
+            runtime_registry_path=str(registry),
+            verify_git=False,
+            assignment_id=1,
+            pool_mode=True,
+        )
+
+        assert result.status == "blocked"
+        assert "Pool runtime drift" in (result.error or "")
+        assert "DEN_HERMES_POOL_MEMBER_ID" in (result.error or "")
+        assert result.assignment_finalized is True
+
+    def test_pool_mode_drift_role_profile_mismatch(self, monkeypatch, tmp_path):
+        """Pool mode with role/profile mismatch → blocked result."""
+        registry = self.setup_registry(tmp_path)
+        monkeypatch.setattr("os.environ", {
+            "DEN_HERMES_POOL_MEMBER_ID": "pool-coder-01",
+            "DEN_HERMES_PROFILE": "spawned-reviewer",
+        })
+
+        tools = RecordingCoderTools()
+        adapter = make_adapter(tools)
+        result = run_tracked_coder_path(
+            adapter,
+            task_id=1798,
+            prompt="Test",
+            run_id="pool-drift-role",
+            cwd=str(tmp_path),
+            runtime_registry_path=str(registry),
+            verify_git=False,
+            assignment_id=2,
+            pool_mode=True,
+        )
+
+        assert result.status == "blocked"
+        assert "Pool runtime drift" in (result.error or "")
+        assert "spawned-reviewer" in (result.error or "")
+
+    def test_pool_mode_no_drift_proceeds(self, monkeypatch, tmp_path):
+        """Pool mode with correct env → normal completion."""
+        registry = self.setup_registry(tmp_path)
+        captured_args = {}
+
+        def fake_worker(**kwargs):
+            captured_args.update(kwargs)
+            return HermesWorkerResult(status="completed", exit_code=0, stdout="", stderr="",
+                                      artifact=_fake_coder_artifact())
+
+        monkeypatch.setattr("den_hermes.orchestrator.run_hermes_worker", fake_worker)
+        monkeypatch.setattr("os.environ", {
+            "DEN_HERMES_POOL_MEMBER_ID": "pool-coder-01",
+            "DEN_HERMES_PROFILE": "spawned-coder",
+        })
+
+        tools = RecordingCoderTools()
+        adapter = make_adapter(tools)
+        result = run_tracked_coder_path(
+            adapter,
+            task_id=1798,
+            prompt="Test",
+            run_id="pool-good-run",
+            cwd=str(tmp_path),
+            runtime_registry_path=str(registry),
+            verify_git=False,
+            pool_mode=True,
+        )
+
+        assert result.status == "completed"
+        # Registration should suppress provider/model in pool mode
+        reg_call = tools.calls[1]  # register_worker_run
+        assert reg_call[1].get("provider") is None
+        assert reg_call[1].get("model") is None
+        assert reg_call[1].get("profile") == "spawned-coder"

@@ -13,6 +13,7 @@ logger = logging.getLogger(__name__)
 
 from den_hermes.runtime_registry import DEFAULT_RUNTIME_REGISTRY_PATH, RuntimeRegistryError, resolve_role_runtime
 from den_hermes.worker_launcher import run_hermes_worker, _verify_git_branch_head
+from den_hermes.pool_drift import check_pool_runtime_drift
 from den_hermes.work_complete_notifier import (
     WorkCompleteNotification,
     WorkCompleteEmissionGuard,
@@ -665,6 +666,42 @@ def _finalize_pool_assignment(
     return True
 
 
+def _post_pool_drift_blocked(
+    adapter: DenWorkflowAdapter,
+    *,
+    drift: Any,
+    task_id: int,
+    run_id: str,
+    role: str,
+    assignment_id: int | None,
+) -> None:
+    """Post blocked/quarantine evidence for pool runtime authority drift.
+
+    Posts a worker failure packet with drift diagnostics, finalizes the
+    assignment with quarantine evidence, and does NOT fall back to one-shot
+    implementation.
+    """
+    details = str(getattr(drift, "details", drift) if not isinstance(drift, str) else drift)
+    error_msg = f"Pool runtime drift: {details}"
+    logger.warning("%s task=%s run=%s role=%s", error_msg, task_id, run_id, role)
+
+    adapter.mark_worker_failed(
+        task_id=task_id,
+        run_id=run_id,
+        role=role,
+        error=error_msg,
+    )
+    _finalize_pool_assignment(
+        adapter,
+        assignment_id=assignment_id,
+        run_id=run_id,
+        role=role,
+        success=False,
+        error=error_msg,
+        requires_assignment=assignment_id is not None,
+    )
+
+
 def run_tracked_coder_path(
     adapter: DenWorkflowAdapter,
     *,
@@ -681,6 +718,7 @@ def run_tracked_coder_path(
     allowed_scope: str | None = None,
     activity_context: Mapping[str, Any] | None = None,
     assignment_id: int | None = None,
+    pool_mode: bool = False,
 ) -> CoderPathResult:
     """Run the tracked spawned-Hermes coder path for a START_CODER action.
 
@@ -689,6 +727,12 @@ def run_tracked_coder_path(
     registers the worker before launch, validates the artifact through the
     existing launcher, verifies git branch/head evidence, posts the authoritative
     implementation packet, and returns durable Den handles.
+
+    When ``pool_mode=True`` (persistent pool worker), the subprocess inherits
+    the pool gateway's profile context: registry provider/model/toolsets CLI
+    overrides are suppressed, but profile identity and path/timeout settings
+    are preserved.  A pool runtime authority drift check is performed and
+    blocks the assignment on missing pool identity or role/profile mismatch.
     """
 
     try:
@@ -709,6 +753,35 @@ def run_tracked_coder_path(
     except (RuntimeRegistryError, KeyError, TypeError, ValueError) as exc:
         return CoderPathResult(status="failed", run_id=run_id, error=str(exc))
 
+    # Persistent pool assignments are identified by a Den assignment plus the
+    # pool gateway envelope.  Infer pool mode here so callers cannot
+    # accidentally bypass profile-owned runtime authority by omitting a flag.
+    pool_mode = pool_mode or (
+        assignment_id is not None
+        and bool(os.environ.get("DEN_HERMES_POOL_MEMBER_ID") or os.environ.get("DEN_HERMES_PROFILE"))
+    )
+
+    # Pool-mode drift check: block on missing identity / role-profile mismatch
+    if pool_mode:
+        drift = check_pool_runtime_drift(
+            registry_runtime=runtime,
+            role="coder",
+            pool_member_id=os.environ.get("DEN_HERMES_POOL_MEMBER_ID"),
+            pool_profile=os.environ.get("DEN_HERMES_PROFILE"),
+        )
+        if drift.drifted:
+            _post_pool_drift_blocked(
+                adapter, drift=drift,
+                task_id=task_id, run_id=run_id, role="coder",
+                assignment_id=assignment_id,
+            )
+            return CoderPathResult(
+                status="blocked",
+                run_id=run_id,
+                error=f"Pool runtime drift: {drift.details}",
+                assignment_finalized=assignment_id is not None,
+            )
+
     artifact_path = runtime.artifact_path or str(Path(runtime.run_root) / run_id / runtime.artifact_filename)
     log_path = runtime.log_path or str(Path(runtime.run_root) / run_id / runtime.log_filename)
     try:
@@ -719,10 +792,10 @@ def run_tracked_coder_path(
             branch=branch,
             base_branch=base_branch,
             base_commit=base_commit,
-            profile=runtime.profile,
-            provider=runtime.provider,
-            model=runtime.model,
-            toolsets=list(runtime.toolsets),
+            profile=runtime.profile if not pool_mode else runtime.profile,
+            provider=runtime.provider if not pool_mode else None,
+            model=runtime.model if not pool_mode else None,
+            toolsets=list(runtime.toolsets) if not pool_mode else None,
             workdir=str(cwd) if cwd is not None else runtime.workdir,
             timeout_seconds=runtime.timeout_seconds,
             artifact_path=artifact_path,
@@ -742,10 +815,10 @@ def run_tracked_coder_path(
         role="coder",
         prompt=worker_prompt,
         expected_artifact=artifact_path,
-        provider=runtime.provider,
-        model=runtime.model,
+        provider=runtime.provider if not pool_mode else None,
+        model=runtime.model if not pool_mode else None,
         profile=runtime.profile,
-        toolsets=list(runtime.toolsets),
+        toolsets=list(runtime.toolsets) if not pool_mode else None,
         cwd=cwd if cwd is not None else runtime.workdir,
         env_overrides=env_overrides,
         activity_context=_child_activity_context(
@@ -841,8 +914,14 @@ def run_tracked_reviewer_path(
     base_commit: str | None = None,
     activity_context: Mapping[str, Any] | None = None,
     assignment_id: int | None = None,
+    pool_mode: bool = False,
 ) -> ReviewerPathResult:
-    """Run the tracked spawned-Hermes reviewer path after coder completion."""
+    """Run the tracked spawned-Hermes reviewer path after coder completion.
+
+    When ``pool_mode=True``, registry provider/model/toolsets CLI overrides
+    are suppressed (the pool gateway's profile is the runtime authority),
+    and pool runtime identity is verified before launch.
+    """
 
     missing = [field for field in ("branch", "head_commit", "tests_run") if not coder_artifact.get(field)]
     if missing:
@@ -884,6 +963,36 @@ def run_tracked_reviewer_path(
     except (RuntimeRegistryError, KeyError, TypeError, ValueError) as exc:
         return ReviewerPathResult(status="failed", run_id=run_id, review_request=review_request, error=str(exc))
 
+    # Persistent pool assignments are identified by a Den assignment plus the
+    # pool gateway envelope.  Infer pool mode here so callers cannot
+    # accidentally bypass profile-owned runtime authority by omitting a flag.
+    pool_mode = pool_mode or (
+        assignment_id is not None
+        and bool(os.environ.get("DEN_HERMES_POOL_MEMBER_ID") or os.environ.get("DEN_HERMES_PROFILE"))
+    )
+
+    # Pool-mode drift check: block on missing identity / role-profile mismatch
+    if pool_mode:
+        drift = check_pool_runtime_drift(
+            registry_runtime=runtime,
+            role="reviewer",
+            pool_member_id=os.environ.get("DEN_HERMES_POOL_MEMBER_ID"),
+            pool_profile=os.environ.get("DEN_HERMES_PROFILE"),
+        )
+        if drift.drifted:
+            _post_pool_drift_blocked(
+                adapter, drift=drift,
+                task_id=task_id, run_id=run_id, role="reviewer",
+                assignment_id=assignment_id,
+            )
+            return ReviewerPathResult(
+                status="blocked",
+                run_id=run_id,
+                review_request=review_request,
+                error=f"Pool runtime drift: {drift.details}",
+                assignment_finalized=assignment_id is not None,
+            )
+
     artifact_path = runtime.artifact_path or str(Path(runtime.run_root) / run_id / runtime.artifact_filename)
     log_path = runtime.log_path or str(Path(runtime.run_root) / run_id / runtime.log_filename)
     try:
@@ -895,10 +1004,10 @@ def run_tracked_reviewer_path(
             head_commit=head_commit,
             base_branch=base_branch,
             base_commit=base_commit,
-            profile=runtime.profile,
-            provider=runtime.provider,
-            model=runtime.model,
-            toolsets=list(runtime.toolsets),
+            profile=runtime.profile if not pool_mode else runtime.profile,
+            provider=runtime.provider if not pool_mode else None,
+            model=runtime.model if not pool_mode else None,
+            toolsets=list(runtime.toolsets) if not pool_mode else None,
             workdir=str(cwd) if cwd is not None else runtime.workdir,
             timeout_seconds=runtime.timeout_seconds,
             artifact_path=artifact_path,
@@ -923,10 +1032,10 @@ def run_tracked_reviewer_path(
             tests_run=tests_run,
         ),
         expected_artifact=artifact_path,
-        provider=runtime.provider,
-        model=runtime.model,
+        provider=runtime.provider if not pool_mode else None,
+        model=runtime.model if not pool_mode else None,
         profile=runtime.profile,
-        toolsets=list(runtime.toolsets),
+        toolsets=list(runtime.toolsets) if not pool_mode else None,
         cwd=cwd if cwd is not None else runtime.workdir,
         env_overrides=env_overrides,
         activity_context=_child_activity_context(
@@ -1025,8 +1134,14 @@ def run_tracked_gate_role_path(
     allowed_scope: str | None = None,
     activity_context: Mapping[str, Any] | None = None,
     assignment_id: int | None = None,
+    pool_mode: bool = False,
 ) -> GateRolePathResult:
-    """Run an optional post-review gate role through tracked spawned-Hermes."""
+    """Run an optional post-review gate role through tracked spawned-Hermes.
+
+    When ``pool_mode=True``, registry provider/model/toolsets CLI overrides
+    are suppressed (the pool gateway's profile is the runtime authority),
+    and pool runtime identity is verified before launch.
+    """
 
     if role not in {"validator", "drift_checker", "packet_auditor"}:
         return GateRolePathResult(status="failed", run_id=run_id, role=role, error=f"Unsupported gate role: {role}")
@@ -1050,6 +1165,36 @@ def run_tracked_gate_role_path(
     except (AttributeError, RuntimeRegistryError, KeyError, TypeError, ValueError) as exc:
         return GateRolePathResult(status="failed", run_id=run_id, role=role, error=str(exc))
 
+    # Persistent pool assignments are identified by a Den assignment plus the
+    # pool gateway envelope.  Infer pool mode here so callers cannot
+    # accidentally bypass profile-owned runtime authority by omitting a flag.
+    pool_mode = pool_mode or (
+        assignment_id is not None
+        and bool(os.environ.get("DEN_HERMES_POOL_MEMBER_ID") or os.environ.get("DEN_HERMES_PROFILE"))
+    )
+
+    # Pool-mode drift check: block on missing identity / role-profile mismatch
+    if pool_mode:
+        drift = check_pool_runtime_drift(
+            registry_runtime=runtime,
+            role=role,
+            pool_member_id=os.environ.get("DEN_HERMES_POOL_MEMBER_ID"),
+            pool_profile=os.environ.get("DEN_HERMES_PROFILE"),
+        )
+        if drift.drifted:
+            _post_pool_drift_blocked(
+                adapter, drift=drift,
+                task_id=task_id, run_id=run_id, role=role,
+                assignment_id=assignment_id,
+            )
+            return GateRolePathResult(
+                status="blocked",
+                run_id=run_id,
+                role=role,
+                error=f"Pool runtime drift: {drift.details}",
+                assignment_finalized=assignment_id is not None,
+            )
+
     artifact_path = runtime.artifact_path or str(Path(runtime.run_root) / run_id / runtime.artifact_filename)
     log_path = runtime.log_path or str(Path(runtime.run_root) / run_id / runtime.log_filename)
     try:
@@ -1061,10 +1206,10 @@ def run_tracked_gate_role_path(
             head_commit=head_commit,
             base_branch=base_branch,
             base_commit=base_commit,
-            profile=runtime.profile,
-            provider=runtime.provider,
-            model=runtime.model,
-            toolsets=list(runtime.toolsets),
+            profile=runtime.profile if not pool_mode else runtime.profile,
+            provider=runtime.provider if not pool_mode else None,
+            model=runtime.model if not pool_mode else None,
+            toolsets=list(runtime.toolsets) if not pool_mode else None,
             workdir=str(cwd) if cwd is not None else runtime.workdir,
             timeout_seconds=runtime.timeout_seconds,
             artifact_path=artifact_path,
@@ -1089,10 +1234,10 @@ def run_tracked_gate_role_path(
             head_commit=head_commit,
         ),
         expected_artifact=artifact_path,
-        provider=runtime.provider,
-        model=runtime.model,
+        provider=runtime.provider if not pool_mode else None,
+        model=runtime.model if not pool_mode else None,
         profile=runtime.profile,
-        toolsets=list(runtime.toolsets),
+        toolsets=list(runtime.toolsets) if not pool_mode else None,
         cwd=cwd if cwd is not None else runtime.workdir,
         env_overrides=env_overrides,
         activity_context=_child_activity_context(

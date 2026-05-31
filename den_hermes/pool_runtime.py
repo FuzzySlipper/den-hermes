@@ -178,7 +178,22 @@ class AssignmentPointer:
     role: str
     project_id: str | None = None
     provider: str | None = None
+    """Readback hint / expected-role annotation, not a runtime override source.
+
+    Persistent pool workers use their deployed profile/gateway config as the
+    runtime authority.  This field is descriptive only: it reflects what Core's
+    pool metadata expected at provisioning time.  Assignment orchestrators must
+    not feed this value as a ``--provider`` CLI flag to already-running pool
+    gateways.
+    """
+
     model: str | None = None
+    """Readback hint / expected-role annotation, not a runtime override source.
+
+    Same semantics as ``provider``.  Descriptive only; pool gateway config
+    is the runtime authority.  Not used as a ``--model`` CLI override.
+    """
+
     session_key: str | None = None
     environment_refs: Mapping[str, str] = field(default_factory=dict)
     metadata: Mapping[str, Any] = field(default_factory=dict)
