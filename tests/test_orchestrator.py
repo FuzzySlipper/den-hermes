@@ -17,6 +17,13 @@ from den_hermes.orchestrator import (
     CoderPathResult,
     _artifact_with_repo_metadata,
     _finalize_pool_assignment,
+    _verify_promotion_head_match,
+    _coder_prompt_with_packet,
+    _reviewer_prompt_with_packet,
+    _gate_prompt_with_packet,
+    WakeStateProjection,
+    project_wake_state,
+    enrich_final_status,
 )
 from den_hermes.worker_launcher import HermesWorkerResult
 from test_spawned_hermes_worker import FAKE_HEAD, fake_env, init_git_repo, read_fake_calls, write_runtime_registry
@@ -1530,3 +1537,248 @@ roles:
         assert reg_call[1].get("provider") is None
         assert reg_call[1].get("model") is None
         assert reg_call[1].get("profile") == "spawned-coder"
+
+
+# ---------------------------------------------------------------------------
+# Green-path acceptance tests (Runner corrections #9582)
+# ---------------------------------------------------------------------------
+
+
+class _FakeAdapterForPromotion:
+    """Minimal fake adapter for _verify_promotion_head_match tests."""
+
+    def __init__(self, *, worker_status=None, workflow_summary=None):
+        self._worker_status = worker_status or {}
+        self._workflow_summary = workflow_summary or {}
+
+    def get_worker_run_status(self, **kwargs):
+        return self._worker_status
+
+    def get_task_workflow_summary(self, **kwargs):
+        return self._workflow_summary
+
+
+class TestVerifyPromotionHeadMatch:
+    """Tests 3 & 4 from plan: promotion head-match gate."""
+
+    def test_heads_match_returns_none(self):
+        adapter = _FakeAdapterForPromotion(
+            worker_status={"head_commit": "abc123"},
+        )
+        result = _verify_promotion_head_match(
+            adapter, task_id=42, reviewed_head="abc123",
+        )
+        assert result is None
+
+    def test_heads_mismatch_returns_blocking_reason(self):
+        adapter = _FakeAdapterForPromotion(
+            worker_status={"head_commit": "def456"},
+        )
+        result = _verify_promotion_head_match(
+            adapter, task_id=42, reviewed_head="abc123", coder_run_id="r1",
+        )
+        assert result is not None
+        assert "promotion blocked" in result
+        assert "abc123" in result
+        assert "def456" in result
+
+    def test_no_current_head_returns_none(self):
+        """If no current head found anywhere, allow promotion (no evidence of drift)."""
+        adapter = _FakeAdapterForPromotion(
+            worker_status={},
+            workflow_summary={},
+        )
+        result = _verify_promotion_head_match(
+            adapter, task_id=42, reviewed_head="abc123",
+        )
+        assert result is None
+
+    def test_falls_back_to_workflow_summary(self):
+        adapter = _FakeAdapterForPromotion(
+            worker_status={},
+            workflow_summary={"latest_coder_completion": {"head_commit": "abc123"}},
+        )
+        result = _verify_promotion_head_match(
+            adapter, task_id=42, reviewed_head="abc123",
+        )
+        assert result is None
+
+    def test_looks_good_review_blocks_done_ready_when_current_head_differs(self):
+        adapter = _FakeAdapterForPromotion(
+            worker_status={"head_commit": "newer-head"},
+        )
+        result = handle_review_outcome(
+            adapter,
+            task_id=42,
+            review_state={
+                "verdict": "looks_good",
+                "head_commit": "reviewed-head",
+                "coder_run_id": "coder-run",
+                "findings": [],
+            },
+            prompt="unused",
+            next_coder_run_id="unused",
+        )
+        assert result.status == "blocked"
+        assert "Reviewed head reviewed-head does not match current head newer-head" in result.reason
+
+
+class TestCoderPromptRequirements:
+    """Test 1: coder prompt includes required fields."""
+
+    def test_includes_known_gaps_and_finding_ids(self):
+        prompt = _coder_prompt_with_packet(prompt="Do work", packet_message_id=99)
+        assert "known_gaps" in prompt
+        assert "claimed_finding_ids" in prompt
+        assert "tests_run" in prompt
+        assert "project_id" in prompt
+        assert "head_commit" in prompt
+
+    def test_includes_packet_message_id(self):
+        prompt = _coder_prompt_with_packet(prompt="Do work", packet_message_id=42)
+        assert "42" in prompt
+
+
+class TestReviewerPromptRequirements:
+    """Test 2: reviewer prompt includes required fields."""
+
+    def test_includes_verdict_and_findings(self):
+        prompt = _reviewer_prompt_with_packet(
+            prompt="Review this",
+            packet_message_id=88,
+            branch="task/123",
+            head_commit="abc",
+            tests_run=[{"cmd": "pytest", "result": "pass"}],
+        )
+        assert "verdict" in prompt
+        assert "findings" in prompt
+        assert "known_gaps" in prompt
+        assert "task/123" in prompt
+        assert "abc" in prompt
+
+    def test_gate_prompt_includes_verdict_and_evidence(self):
+        prompt = _gate_prompt_with_packet(
+            prompt="Validate",
+            role="validator",
+            packet_message_id=77,
+            branch="task/456",
+            head_commit="def",
+        )
+        assert "verdict" in prompt
+        assert "evidence" in prompt
+        assert "known_gaps" in prompt
+        assert "VALIDATOR" in prompt
+
+
+class TestWakeStateProjection:
+    """Test 5: wake state projection distinguishes states.
+
+    Critical regression: recorded-but-unclaimed must NOT be reported as
+    started/running (Runner correction #3).
+    """
+
+    def test_recorded_no_run_is_not_started(self):
+        """Recorded delivery with no worker run → recorded_pending_claim."""
+        adapter = _FakeAdapterForPromotion(
+            workflow_summary={"task": {"status": "in_progress"}},
+        )
+        result = project_wake_state(adapter, task_id=42)
+        assert result.wake_state == "recorded_pending_claim"
+
+    def test_run_registered_no_completion_is_running(self):
+        adapter = _FakeAdapterForPromotion(
+            workflow_summary={"task": {"status": "in_progress"}},
+        )
+        adapter.get_latest_worker_completion = lambda **kw: {}
+        result = project_wake_state(adapter, task_id=42, run_id="r1")
+        assert result.wake_state == "running"
+
+    def test_packet_posted(self):
+        adapter = _FakeAdapterForPromotion(
+            workflow_summary={"task": {"status": "in_progress"}},
+        )
+        adapter.get_latest_worker_completion = lambda **kw: {
+            "status": "completed",
+            "packet_type": "implementation_packet",
+        }
+        result = project_wake_state(adapter, task_id=42, run_id="r1")
+        assert result.wake_state == "packet_posted"
+        assert result.latest_packet_type == "implementation_packet"
+
+    def test_reviewed_state(self):
+        adapter = _FakeAdapterForPromotion(
+            workflow_summary={
+                "task": {"status": "review"},
+                "current_review_state": {"verdict": "looks_good"},
+            },
+        )
+        adapter.get_latest_worker_completion = lambda **kw: {"status": "completed"}
+        result = project_wake_state(adapter, task_id=42, run_id="r1")
+        assert result.wake_state == "reviewed"
+        assert result.review_verdict == "looks_good"
+
+    def test_released_state(self):
+        adapter = _FakeAdapterForPromotion(
+            workflow_summary={"task": {"status": "done"}},
+        )
+        adapter.get_latest_worker_completion = lambda **kw: {"status": "completed"}
+        result = project_wake_state(adapter, task_id=42, run_id="r1")
+        assert result.wake_state == "released"
+
+    def test_frozen_dataclass(self):
+        proj = WakeStateProjection(delivery_request_id=1, wake_state="running")
+        with pytest.raises(AttributeError):
+            proj.wake_state = "released"
+
+
+class TestEnrichFinalStatus:
+    """Runner correction #2: no undefined variables, concrete assignment_id."""
+
+    def test_explicit_params_no_closure(self):
+        result = enrich_final_status(
+            project_id="den-hermes-bridge",
+            task_id=1801,
+            run_id="r1",
+            assignment_id=15,
+            branch="task/1801",
+            head_commit="abc123",
+            base_commit="def456",
+            tests_run=[{"cmd": "pytest", "result": "pass"}],
+            review_round_id=3,
+            packet_message_id=9500,
+            cleanup_released=True,
+        )
+        assert result["project_id"] == "den-hermes-bridge"
+        assert result["task_id"] == 1801
+        assert result["run_id"] == "r1"
+        assert result["assignment_id"] == 15
+        assert result["branch"] == "task/1801"
+        assert result["head_commit"] == "abc123"
+        assert result["tests_run"] == [{"cmd": "pytest", "result": "pass"}]
+        assert result["review_round_id"] == 3
+        assert result["cleanup_state"] == "released"
+        assert result["source_refs"] == [
+            {"kind": "task", "project_id": "den-hermes-bridge", "task_id": 1801},
+            {"kind": "run", "run_id": "r1"},
+            {"kind": "assignment", "assignment_id": 15},
+        ]
+
+    def test_no_run_no_assignment_minimal(self):
+        result = enrich_final_status(
+            project_id="test",
+            task_id=1,
+        )
+        assert result["run_id"] is None
+        assert result["assignment_id"] is None
+        assert result["cleanup_state"] == "pending"
+        assert result["source_refs"] == [
+            {"kind": "task", "project_id": "test", "task_id": 1},
+        ]
+
+    def test_assignment_id_is_integer_not_boolean(self):
+        """Runner correction: assignment_id must be the concrete int, not a boolean."""
+        result = enrich_final_status(
+            project_id="p", task_id=1, assignment_id=42,
+        )
+        assert result["assignment_id"] == 42
+        assert isinstance(result["assignment_id"], int)

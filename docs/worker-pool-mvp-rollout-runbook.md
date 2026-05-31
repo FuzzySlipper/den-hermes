@@ -1059,9 +1059,12 @@ lobby presence.
 
 ## 9. Green-path worker-pool workflow (exemplar: #1739)
 
-This section documents the canonical end-to-end worker-pool assignment lifecycle
-using exact handles from the successful #1739 pilot. Use this as a template for
-planning future pool assignments.
+This section documents the canonical end-to-end worker-pool assignment lifecycle.
+The current default workflow is the #1789/#1800/#1799 green path captured in the
+Den document `den-hermes-bridge/default-agent-workflow-green-path`; the #1739
+handles below remain useful as an early concrete exemplar. Future Runner work
+should treat this as the default Den-managed agent workflow, not a special-case
+pilot.
 
 ### 9.1 Role selection
 
@@ -1132,8 +1135,13 @@ Before claiming completion, verify:
 
 - [ ] Lease was granted and acknowledged via `assignment_ack` checkpoint.
 - [ ] Interpretation and plan checkpoints posted and runner-acknowledged.
-- [ ] Completion packet posted with correct `branch`, `head_commit`, `files_changed`,
-      `tests_run`, and `acceptance_evidence`.
+- [ ] Completion packet posted with correct `project_id`, `task_id`, `run_id`,
+      `session_id`, `role`, `status`, `branch`, `base_commit`, `head_commit`,
+      `tests_run`, `known_gaps`/`remaining_risks`, applicable finding IDs, and
+      acceptance evidence.
+- [ ] Runner-side validation passed before review/promotion.
+- [ ] Review verdict is `looks_good`, no unresolved blocking findings remain, and
+      the reviewed head exactly matches the current head being promoted.
 - [ ] Cleanup evidence recorded (all four fields: scrub_workspace, process_release,
       session_rotation, scratch_cleanup).
 - [ ] Core release or quarantine applied.
@@ -1144,6 +1152,7 @@ Before claiming completion, verify:
 
 | Failure mode | Exemplar | Recovery |
 |---|---|---|
+| Wake lifecycle ambiguity | Recorded direct-agent wake without claim evidence | Treat as `recorded_pending_claim` only; do not report the worker as started/running until claim/run evidence exists |
 | No available worker | See #1785 no-capacity policy | Retry, wait, escalate to Patch/Planner |
 | Ambiguous same-profile workers | Multiple ~reviewer~ bindings without concrete `pool_member_id` | Fail closed; require explicit `pool_member_id` in delivery |
 | Unclaimed wake | `den-hermes-runner` pilot (#1739 preflight): both direct-agent messages stayed `recorded_pending_claim` | Quarantine the worker; investigate Gateway routing |

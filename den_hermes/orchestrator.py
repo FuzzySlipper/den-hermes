@@ -1324,6 +1324,14 @@ def handle_review_outcome(
     finding_ids = [int(finding["id"]) for finding in findings if finding.get("id") is not None]
     blocking_findings = [finding for finding in findings if str(finding.get("category")) != "follow_up_candidate"]
     if verdict == "looks_good":
+        reviewed_head = review_state.get("head_commit")
+        if reviewed_head:
+            head_mismatch = _verify_promotion_head_match(
+                adapter, task_id=task_id, reviewed_head=str(reviewed_head),
+                coder_run_id=review_state.get("coder_run_id"),
+            )
+            if head_mismatch is not None:
+                return ReviewLoopResult(status="blocked", reason=head_mismatch, finding_ids=finding_ids)
         return ReviewLoopResult(status="done_ready", reason="review verdict looks_good", finding_ids=finding_ids)
     if findings and not blocking_findings:
         return ReviewLoopResult(status="follow_up_deferred", reason="only follow-up candidate findings remain", finding_ids=finding_ids)
@@ -1680,7 +1688,15 @@ def _coder_prompt_with_packet(*, prompt: str, packet_message_id: int) -> str:
     return (
         f"{prompt.rstrip()}\n\n"
         "DEN CODER CONTEXT PACKET\n"
-        f"Use Den task-thread packet message id {packet_message_id} as the bounded coder context source.\n"
+        f"Use Den task-thread packet message id {packet_message_id} as the bounded coder context source.\n\n"
+        "COMPLETION PACKET REQUIREMENTS\n"
+        "Your structured completion artifact MUST include:\n"
+        "- project_id, task_id, run_id, session_id, role, status\n"
+        "- branch, head_commit, base_commit\n"
+        "- tests_run (array of command/result objects)\n"
+        "- known_gaps / remaining_risks (empty array if none)\n"
+        "- claimed_finding_ids (array of ints, empty if none)\n"
+        "- summary (concise description of what was done)\n"
     )
 
 
@@ -1699,7 +1715,15 @@ def _reviewer_prompt_with_packet(
         "CODER COMPLETION TO REVIEW\n"
         f"Branch: {branch}\n"
         f"Head commit: {head_commit}\n"
-        f"Tests run: {json.dumps(tests_run, sort_keys=True)}\n"
+        f"Tests run: {json.dumps(tests_run, sort_keys=True)}\n\n"
+        "COMPLETION PACKET REQUIREMENTS\n"
+        "Your structured review findings packet MUST include:\n"
+        "- project_id, task_id, run_id, session_id, role, status\n"
+        "- branch, head_commit, base_commit\n"
+        "- verdict (looks_good / changes_requested / follow_up_needed)\n"
+        "- findings (array of finding objects; empty if none)\n"
+        "- known_gaps / remaining_risks (empty array if none)\n"
+        "- summary (concise description of review outcome)\n"
     )
 
 
@@ -1718,7 +1742,15 @@ def _gate_prompt_with_packet(
         f"DEN {role.upper()} CONTEXT PACKET\n"
         f"Use Den task-thread packet message id {packet_message_id} as the bounded {role} context source.\n"
         "GATE INPUTS\n"
-        f"{branch_line}{head_line}"
+        f"{branch_line}{head_line}\n"
+        "COMPLETION PACKET REQUIREMENTS\n"
+        "Your structured validation/gate packet MUST include:\n"
+        "- project_id, task_id, run_id, session_id, role, status\n"
+        "- branch, head_commit, base_commit\n"
+        "- verdict (passed / failed / unknown)\n"
+        "- evidence (dict with role-specific proof: tests, commands, results)\n"
+        "- known_gaps / remaining_risks (empty array if none)\n"
+        "- summary (concise description of gate outcome)\n"
     )
 
 
@@ -1752,6 +1784,164 @@ def _stale_review_reason(*, adapter: DenWorkflowAdapter, task_id: int, review_st
     if current_verdict in {"looks_good", "follow_up_needed"}:
         return f"newer review state is already terminal: {current_verdict}"
     return None
+
+
+def _verify_promotion_head_match(
+    adapter: DenWorkflowAdapter,
+    *,
+    task_id: int,
+    reviewed_head: str,
+    coder_run_id: str | None = None,
+) -> str | None:
+    """Return a blocking reason if the reviewed head differs from the current
+    branch head.  Returns None when heads match (green path for promotion).
+
+    Reads the current head from the latest coder worker run status or the
+    task workflow summary's latest coder completion.
+    """
+    current_head: str | None = None
+    if coder_run_id:
+        worker_status = adapter.get_worker_run_status(task_id=task_id, run_id=coder_run_id)
+        if isinstance(worker_status, Mapping):
+            current_head = worker_status.get("head_commit")
+    if not current_head:
+        summary = adapter.get_task_workflow_summary(task_id=task_id)
+        latest = summary.get("latest_coder_completion")
+        if isinstance(latest, Mapping):
+            current_head = latest.get("head_commit")
+    if current_head and str(current_head) != str(reviewed_head):
+        return (
+            f"Reviewed head {reviewed_head} does not match current head "
+            f"{current_head}; promotion blocked until rereviewed."
+        )
+    return None
+
+
+@dataclass(frozen=True)
+class WakeStateProjection:
+    """Projection of a delivery/wake lifecycle state for readback.
+
+    Distinguishes: recorded_pending_claim → claimed → running →
+    packet_posted → reviewed → promoted → released.
+    """
+
+    delivery_request_id: int
+    wake_state: str
+    adapter_instance_id: str | None = None
+    session_id: str | None = None
+    external_message_id: str | None = None
+    latest_packet_type: str | None = None
+    latest_packet_status: str | None = None
+    review_verdict: str | None = None
+    assignment_state: str | None = None
+
+
+def project_wake_state(
+    adapter: DenWorkflowAdapter,
+    *,
+    task_id: int,
+    run_id: str | None = None,
+    delivery_request_id: int = 0,
+) -> WakeStateProjection:
+    """Read Den state to project the wake lifecycle stage.
+
+    Returns the earliest unambiguous state using existing MCP tools.
+    A delivery that is recorded but has no worker run is
+    ``recorded_pending_claim`` — it is NOT reported as started/running.
+
+    State progression:
+      recorded_pending_claim → claimed → running → packet_posted →
+      reviewed → promoted → released
+    """
+    summary = adapter.get_task_workflow_summary(task_id=task_id)
+
+    # Check for worker run / completion
+    latest_completion: Mapping[str, Any] = {}
+    if run_id:
+        try:
+            latest_completion = adapter.get_latest_worker_completion(
+                task_id=task_id, run_id=run_id,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+    # Check for assignment cleanup / release
+    task_data = summary.get("task") or {}
+    task_status = str(task_data.get("status", ""))
+
+    # Check for review state
+    review_state = summary.get("current_review_state")
+    review_verdict: str | None = None
+    if isinstance(review_state, Mapping):
+        review_verdict = review_state.get("verdict")
+
+    # Determine state
+    if task_status in {"done", "cancelled"}:
+        wake_state = "released"
+    elif review_verdict in {"looks_good", "follow_up_needed"}:
+        wake_state = "reviewed"
+    elif latest_completion and isinstance(latest_completion, Mapping):
+        pkt_status = latest_completion.get("status")
+        if pkt_status in {"completed", "failed", "blocked"}:
+            wake_state = "packet_posted"
+        else:
+            wake_state = "running"
+    elif run_id:
+        # Run registered but no completion yet
+        wake_state = "running"
+    else:
+        # No run registered — only recorded, NOT started
+        wake_state = "recorded_pending_claim"
+
+    return WakeStateProjection(
+        delivery_request_id=delivery_request_id,
+        wake_state=wake_state,
+        latest_packet_type=latest_completion.get("packet_type") if latest_completion else None,
+        latest_packet_status=latest_completion.get("status") if latest_completion else None,
+        review_verdict=review_verdict,
+        assignment_state=task_status if task_status else None,
+    )
+
+
+def enrich_final_status(
+    *,
+    project_id: str,
+    task_id: int,
+    run_id: str | None = None,
+    assignment_id: int | None = None,
+    branch: str | None = None,
+    head_commit: str | None = None,
+    base_commit: str | None = None,
+    tests_run: Any = None,
+    review_round_id: int | None = None,
+    packet_message_id: int | None = None,
+    cleanup_released: bool = False,
+) -> dict[str, Any]:
+    """Build a final status dict with concrete evidence refs/IDs.
+
+    All parameters are explicit — no closure over outer scope.
+    ``assignment_id`` is the concrete integer when available, not a boolean.
+    """
+    return {
+        "project_id": project_id,
+        "task_id": task_id,
+        "run_id": run_id,
+        "assignment_id": assignment_id,
+        "branch": branch,
+        "head_commit": head_commit,
+        "base_commit": base_commit,
+        "tests_run": list(tests_run or []),
+        "review_round_id": review_round_id,
+        "packet_message_id": packet_message_id,
+        "cleanup_state": "released" if cleanup_released else "pending",
+        "source_refs": [
+            {"kind": "task", "project_id": project_id, "task_id": task_id},
+        ] + (
+            [{"kind": "run", "run_id": run_id}] if run_id else []
+        ) + (
+            [{"kind": "assignment", "assignment_id": assignment_id}] if assignment_id else []
+        ),
+    }
 
 
 def _ensure_den_did_not_reject(payload: Mapping[str, Any], *, context: str) -> None:
