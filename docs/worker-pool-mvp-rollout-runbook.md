@@ -24,6 +24,7 @@ This document covers:
 |- Ownership boundaries (Section 10).
 |- First-real-task checklist (Section 11).
 |- Operator troubleshooting (Section 12).
+|- Reconciling stale active assignments (Section 13).
 
 ## 2. Substrate selection guide
 
@@ -891,6 +892,46 @@ Check:
 - The `state_label` is updated at each major transition. If a step
   was skipped (e.g. a runner checkpoint response was never sent),
   the trace will reflect the last stable state.
+
+## 13. Reconciling stale active assignments
+
+Use this recovery path only when the worker run and completion packet are already terminal, but the Core assignment/member projection is still active or busy.
+
+### 13.1 Symptom
+
+A stale active assignment usually has all of these signals:
+
+- `get_worker_run_status(project_id, run_id, task_id)` reports a terminal worker run (`completed`, `failed`, or `blocked`) and a posted completion packet.
+- `list_assignments(project_id, task_id, state=running|ack)` still shows the assignment as active.
+- `list_pool_members(worker_identity=...)` still shows the pool member as `busy` even though the worker has finished.
+- Cleanup evidence may already say `cleaned_up`, but the assignment has no terminal `completion`/`failure` checkpoint.
+
+This was observed in #1789 for coder assignment #6 and reviewer assignment #8: completion packets existed, but the assignment rows remained active until a terminal checkpoint plus cleanup/release was applied.
+
+### 13.2 Recovery sequence
+
+Fail closed: verify the worker run really is terminal before applying these tools. Do not release an assignment for a still-running worker.
+
+1. Reconcile the assignment to a terminal checkpoint:
+   - Success: call `mcp_den_append_checkpoint(assignment_id=..., run_id=..., checkpoint_type="completion", payload=...)`.
+   - Failure/blocked: call `mcp_den_append_checkpoint(..., checkpoint_type="failure", payload=...)` with the failure/block evidence.
+   - Include `assignment_id`, `run_id`, `role`, completion packet/message id, branch/head/base when relevant, and a short evidence summary in the JSON payload.
+2. Record cleanup evidence with `mcp_den_record_cleanup_evidence(assignment_id=..., evidence=...)`.
+3. Release the assignment with `mcp_den_release_assignment(assignment_id=...)`.
+4. Re-read `get_assignment(...)` and `list_pool_members(...)` to verify the assignment is terminal/released and the worker returned to `available` (or remained quarantined if policy/evidence requires it).
+
+### 13.3 Why this should be rare after #1799
+
+#1799 wires the spawned-Hermes orchestrator to perform the same sequence automatically after worker completion/failure publication:
+
+```text
+post_worker_completion_packet
+  -> append assignment terminal checkpoint
+  -> record cleanup evidence
+  -> release assignment
+```
+
+If the stale-active pattern recurs after #1799, treat it as a regression in assignment lifecycle finalization and preserve the worker run id, assignment id, completion packet id, and pool member id in the task thread before retrying.
 
 ## Appendix A: State transition reference
 
