@@ -765,7 +765,7 @@ def run_tracked_coder_path(
         )
     _finalize_pool_assignment(
         adapter, assignment_id=assignment_id, run_id=run_id, role="coder",
-        success=True,
+        success=True, requires_assignment=assignment_id is not None,
         summary=str(worker.artifact.get("summary", "")),
         branch=str(worker.artifact.get("branch")),
         head_commit=str(worker.artifact.get("head_commit")),
@@ -903,7 +903,7 @@ def run_tracked_reviewer_path(
         adapter.mark_worker_failed(task_id=task_id, run_id=run_id, role="reviewer", error=error)
         _finalize_pool_assignment(
             adapter, assignment_id=assignment_id, run_id=run_id, role="reviewer",
-            success=False, error=error,
+            success=False, error=error, requires_assignment=assignment_id is not None,
         )
         return ReviewerPathResult(
             status="failed", run_id=run_id, review_request=review_request,
@@ -938,7 +938,7 @@ def run_tracked_reviewer_path(
     except Exception as exc:  # noqa: BLE001 - publication failures are fail-closed
         _finalize_pool_assignment(
             adapter, assignment_id=assignment_id, run_id=run_id, role="reviewer",
-            success=False, error=str(exc),
+            success=False, error=str(exc), requires_assignment=assignment_id is not None,
         )
         return ReviewerPathResult(
             status="failed", run_id=run_id, review_request=review_request,
@@ -1088,7 +1088,7 @@ def run_tracked_gate_role_path(
     except Exception as exc:  # noqa: BLE001 - Den rejected authoritative completion
         _finalize_pool_assignment(
             adapter, assignment_id=assignment_id, run_id=run_id, role=role,
-            success=False, error=str(exc),
+            success=False, error=str(exc), requires_assignment=assignment_id is not None,
         )
         return GateRolePathResult(
             status="failed",
@@ -1101,7 +1101,7 @@ def run_tracked_gate_role_path(
 
     _finalize_pool_assignment(
         adapter, assignment_id=assignment_id, run_id=run_id, role=role,
-        success=True,
+        success=True, requires_assignment=assignment_id is not None,
         summary=str(worker.artifact.get("summary", "")),
         branch=branch,
         head_commit=head_commit,
