@@ -4,6 +4,7 @@ import argparse
 import json
 import logging
 import os
+import uuid
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -197,6 +198,43 @@ class GateRolePathResult:
     worker_status: Mapping[str, Any] | None = None
     error: str | None = None
     assignment_finalized: bool = False
+
+
+@dataclass(frozen=True)
+class OrchestratorStopResult:
+    """Result of a lease-aware orchestrator stop/drain operation."""
+    status: str  # "drained", "released", "no_lease_active", "blocked", "failed"
+    run_id: str
+    lease_count: int = 0
+    released_leases: list[str] = field(default_factory=list)
+    reconciled_assignments: int = 0
+    stuck_assignments_cleaned: list[int] = field(default_factory=list)
+    diagnostic: str | None = None
+    error: str | None = None
+
+
+# ---------------------------------------------------------------------------
+# Diagnostic guardrail instructions for project_orchestrator deliveries
+# ---------------------------------------------------------------------------
+
+PROJECT_ORCHESTRATOR_DIAGNOSTIC_GUARDRAILS = (
+    "DIAGNOSTIC GUARDRAILS (project_orchestrator): "
+    "Do NOT search GitHub/web for Den task numbers. "
+    "Do NOT SSH to hosts, inspect tmux/systemd/journals/processes, or alter services. "
+    "Do NOT treat Den task IDs as GitHub issues. "
+    "Limit diagnostics to Den state (tasks, messages, docs, lease records), "
+    "Core worker-pool bindings/assignments, Channels membership, and runtime registry evidence. "
+    "If infrastructure-level investigation is required, send a direct-agent request to sysadmin. "
+    "Summarize findings without runaway command exploration."
+)
+
+CIDER_DIAGNOSTIC_GUARDRAILS = (
+    "DIAGNOSTIC GUARDRAILS (coder): "
+    "Work only within the repo branch/worktree assigned. "
+    "Do NOT search GitHub/web for task numbers; use Den as the source of truth. "
+    "Do NOT SSH or administer infrastructure. "
+    "Run only local git/code/tests operations."
+)
 
 
 @dataclass(frozen=True)
@@ -484,6 +522,142 @@ class DenWorkflowAdapter:
             context=f"assignment release for {assignment_id}",
         )
         return payload_response
+
+    def check_active_orchestrator_leases(self) -> Mapping[str, Any]:
+        """Query Core for active project_orchestrator leases for this project/profile.
+
+        Returns a mapping with ``active_leases`` list of active lease records,
+        plus ``lease_count`` and diagnostic summary fields.
+        When the MCP tool is unavailable, returns a safe fallback.
+        """
+        tool = getattr(self.tools, "mcp_den_list_active_leases", None)
+        if tool is None:
+            return {
+                "active_leases": [],
+                "lease_count": 0,
+                "unavailable": True,
+                "diagnostic": "mcp_den_list_active_leases tool unavailable; skipping lease check.",
+            }
+        try:
+            response = tool(
+                project_id=self.project_id,
+                lease_kind="project_orchestrator",
+            )
+        except Exception as exc:
+            logger.warning(
+                "Core lease check failed for project %s: %s",
+                self.project_id,
+                exc,
+            )
+            return {
+                "active_leases": [],
+                "lease_count": 0,
+                "error": str(exc)[:500],
+                "diagnostic": f"Core lease query failed: {str(exc)[:200]}",
+            }
+        payload = _coerce_mapping_response(response)
+        leases = list(payload.get("leases") or payload.get("active_leases") or [])
+        return {
+            "active_leases": leases,
+            "lease_count": len(leases),
+            "diagnostic": f"Found {len(leases)} active project_orchestrator leases for {self.project_id}.",
+        }
+
+    def list_active_child_assignments(self) -> Mapping[str, Any]:
+        """List active child worker-pool assignments under this orchestrator.
+
+        Returns assignments in ``launching`` or ``ack`` state that may need
+        reconciliation during a stop/drain.
+        """
+        tool = getattr(self.tools, "mcp_den_get_worker_pool_summary", None)
+        if tool is None:
+            return {
+                "active_assignments": [],
+                "stuck_assignments": [],
+                "assignment_count": 0,
+                "stuck_count": 0,
+                "unavailable": True,
+            }
+        try:
+            response = tool()
+        except Exception as exc:
+            logger.warning(
+                "Worker pool summary query failed for project %s: %s",
+                self.project_id,
+                exc,
+            )
+            return {
+                "active_assignments": [],
+                "stuck_assignments": [],
+                "assignment_count": 0,
+                "stuck_count": 0,
+                "error": str(exc)[:500],
+            }
+        payload = _coerce_mapping_response(response)
+        assignments = list(
+            payload.get("active_assignments")
+            or payload.get("assignments")
+            or []
+        )
+        stuck = [
+            a for a in assignments
+            if str(a.get("status", "")).lower() in {"launching", "ack", "acknowledged"}
+        ]
+        return {
+            "active_assignments": assignments,
+            "stuck_assignments": stuck,
+            "assignment_count": len(assignments),
+            "stuck_count": len(stuck),
+        }
+
+    def fail_child_assignment(
+        self,
+        *,
+        assignment_id: int,
+        run_id: str,
+        reason: str,
+        role: str = "coder",
+    ) -> Mapping[str, Any]:
+        """Fail a stuck child assignment and record cleanup evidence.
+
+        This is the green path for zombie assignment cleanup: mark the worker
+        as failed, append a failure checkpoint, record cleanup evidence, and
+        release the assignment back to the pool.
+        """
+        assignment_id_int = int(assignment_id)
+        try:
+            self.mark_worker_failed(
+                task_id=0,
+                run_id=run_id,
+                role=role,
+                error=f"Zombie assignment {assignment_id_int} cleaned up by orchestrator stop: {reason}",
+                failure_category="orchestrator_stop_zombie_cleanup",
+                recovery_guidance=(
+                    "Worker assignment was stuck in launching/ack and had no bridge/process "
+                    "evidence. Orchestrator stop cleaned it up. Re-check task state before "
+                    "restarting."
+                ),
+                dedupe_key=f"orchestrator-stop:{assignment_id_int}:zombie",
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed to mark zombie worker for assignment %s: %s",
+                assignment_id_int,
+                exc,
+            )
+        self.append_assignment_checkpoint(
+            assignment_id=assignment_id_int,
+            run_id=run_id,
+            checkpoint_type="failure",
+            payload={
+                "type": "zombie_cleanup",
+                "run_id": run_id,
+                "reason": reason,
+                "source": "orchestrator_stop",
+            },
+        )
+        self.record_assignment_cleanup_evidence(assignment_id=assignment_id_int)
+        return self.release_assignment(assignment_id=assignment_id_int)
 
     def send_user_notification(
         self,
@@ -1528,6 +1702,135 @@ def _maybe_emit_drain_notification(
         )
 
 
+def lease_aware_stop(
+    adapter: DenWorkflowAdapter,
+    *,
+    task_id: int,
+    run_id: str,
+    reason: str = "Operator stop requested",
+) -> OrchestratorStopResult:
+    """Perform a lease-aware orchestrator stop/drain.
+
+    Sequence:
+    1. Check for active Core project_orchestrator leases.
+    2. If leases are active, record evidence and drain/release them.
+    3. Check for stuck child assignments (launching/ack).
+    4. Clean up stuck assignments with failure checkpoints and release.
+    5. Return structured result for operator visibility.
+    """
+    # Phase 1: Check active leases
+    lease_state = adapter.check_active_orchestrator_leases()
+    lease_count = int(lease_state.get("lease_count", 0))
+    active_leases = list(lease_state.get("active_leases", []))
+
+    if lease_count == 0:
+        # No active leases — check for stuck children anyway
+        child_state = adapter.list_active_child_assignments()
+        stuck = list(child_state.get("stuck_assignments", []))
+        reconciled = 0
+        cleaned_ids: list[int] = []
+        for assignment in stuck:
+            assignment_id = int(assignment.get("assignment_id") or assignment.get("id") or 0)
+            child_run_id = str(assignment.get("run_id") or f"zombie-{assignment_id}")
+            child_role = str(assignment.get("role") or "coder")
+            try:
+                adapter.fail_child_assignment(
+                    assignment_id=assignment_id,
+                    run_id=child_run_id,
+                    reason=f"Orchestrator stop cleaned up stuck {child_role} assignment {assignment_id} (no active lease)",
+                    role=child_role,
+                )
+                reconciled += 1
+                cleaned_ids.append(assignment_id)
+            except Exception as exc:
+                logger.warning(
+                    "Failed to clean up stuck assignment %s during stop: %s",
+                    assignment_id,
+                    exc,
+                )
+        return OrchestratorStopResult(
+            status="no_lease_active" if reconciled == 0 else "reconciled_stuck",
+            run_id=run_id,
+            lease_count=0,
+            reconciled_assignments=reconciled,
+            stuck_assignments_cleaned=cleaned_ids,
+            diagnostic=(
+                f"No active project_orchestrator leases found for {adapter.project_id}."
+                if reconciled == 0
+                else f"No active leases; cleaned up {reconciled} stuck child assignments."
+            ),
+        )
+
+    # Phase 2: Release active leases
+    released_lease_ids: list[str] = []
+    lease_errors: list[str] = []
+    for lease in active_leases:
+        lease_id = str(lease.get("lease_id") or lease.get("id") or "")
+        public_lease_id = str(lease.get("public_lease_id") or lease_id)
+        try:
+            release_tool = getattr(adapter.tools, "mcp_den_release_orchestrator_lease", None)
+            if release_tool is not None:
+                release_tool(
+                    project_id=adapter.project_id,
+                    lease_id=lease_id or public_lease_id,
+                    released_by=adapter.requested_by,
+                    reason=reason,
+                )
+            released_lease_ids.append(public_lease_id or lease_id)
+        except Exception as exc:
+            msg = f"Lease {lease_id}: {str(exc)[:200]}"
+            lease_errors.append(msg)
+            logger.warning("Failed to release orchestrator lease %s: %s", lease_id, exc)
+
+    # Phase 3: Reconcile stuck child assignments
+    child_state = adapter.list_active_child_assignments()
+    stuck = list(child_state.get("stuck_assignments", []))
+    reconciled = 0
+    cleaned_ids: list[int] = []
+    for assignment in stuck:
+        assignment_id = int(assignment.get("assignment_id") or assignment.get("id") or 0)
+        child_run_id = str(assignment.get("run_id") or f"zombie-{assignment_id}")
+        child_role = str(assignment.get("role") or "coder")
+        try:
+            adapter.fail_child_assignment(
+                assignment_id=assignment_id,
+                run_id=child_run_id,
+                reason=f"Orchestrator stop cleaned up stuck {child_role} assignment {assignment_id} (lease drain)",
+                role=child_role,
+            )
+            reconciled += 1
+            cleaned_ids.append(assignment_id)
+        except Exception as exc:
+            logger.warning(
+                "Failed to clean up stuck assignment %s during lease drain: %s",
+                assignment_id,
+                exc,
+            )
+
+    # Build diagnostic
+    diag_parts = [
+        f"Stop reason: {reason}.",
+        f"Released {len(released_lease_ids)}/{lease_count} active leases.",
+    ]
+    if lease_errors:
+        diag_parts.append(f"Lease release errors: {'; '.join(lease_errors[:3])}.")
+    if reconciled > 0:
+        diag_parts.append(f"Cleaned up {reconciled} stuck child assignments.")
+    else:
+        diag_parts.append("No stuck child assignments found.")
+
+    return OrchestratorStopResult(
+        status="released" if not lease_errors else "drained_with_errors",
+        run_id=run_id,
+        lease_count=lease_count,
+        released_leases=released_lease_ids,
+        reconciled_assignments=reconciled,
+        stuck_assignments_cleaned=cleaned_ids,
+        diagnostic=" ".join(diag_parts),
+        error="; ".join(lease_errors) if lease_errors else None,
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Evaluate the next Den spawned-Hermes orchestrator action.")
     parser.add_argument("--project-id", required=True)
@@ -1535,9 +1838,27 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--requested-by", default="den-hermes-runner")
     parser.add_argument("--max-attempts", type=int, default=3)
     parser.add_argument("--json", action="store_true", help="Print a machine-readable JSON action")
+    parser.add_argument("--stop", action="store_true", help="Perform lease-aware orchestrator stop/drain")
+    parser.add_argument("--stop-reason", default=None, help="Reason for stop request (operator-facing)")
     args = parser.parse_args(argv)
 
     adapter = build_mcp_adapter(project_id=args.project_id, requested_by=args.requested_by)
+
+    # Lease-aware stop path: drain active leases, clean up stuck children, free pool member
+    if args.stop:
+        stop_run_id = f"orchestrator-stop-{args.task_id}-{uuid.uuid4().hex[:8]}"
+        stop_result = lease_aware_stop(
+            adapter,
+            task_id=args.task_id,
+            run_id=stop_run_id,
+            reason=args.stop_reason or "Operator stop requested via Channels /stop",
+        )
+        if args.json:
+            print(json.dumps(asdict(stop_result), sort_keys=True))
+        else:
+            print(f"stop: {stop_result.status} — {stop_result.diagnostic}")
+        return 1 if stop_result.status in {"failed", "blocked"} else 0
+
     emission_guard = WorkCompleteEmissionGuard()
     action = decide_next_action(adapter, task_id=args.task_id, max_attempts=args.max_attempts)
 

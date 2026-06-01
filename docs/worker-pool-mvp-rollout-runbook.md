@@ -1298,6 +1298,74 @@ Leased handoff smoke:
 
 Operational note: an earlier handoff attempt (`lease-handoff-smoke-1812-b28dc41540`, messages `1820`/`1821`) stalled while confirming Den state after a Core MCP reconnect; the lease was released with cleanup evidence and the spawned-orchestrator gateway was restarted before the successful final handoff smoke.
 
+### 14.7 Lease-aware operator stop (from #1832)
+
+An operator `/stop` sent to a leased pooled project_orchestrator profile now discovers active Core leases, drains/releases them, and reconciles stuck child assignments instead of returning "No active task to stop."
+
+**Stop sequence** (invoked via `hermes orchestrator --stop` or Channels `/stop`):
+1. Query Core for active `project_orchestrator` leases on the current project.
+2. For each active lease: call `mcp_den_release_orchestrator_lease` with the lease id, operator identity, and stop reason.
+3. Query Core for active child assignments in `launching`/`ack` state.
+4. For each stuck child: append a zombie-cleanup failure checkpoint, record cleanup evidence, and release the assignment.
+5. Return structured `OrchestratorStopResult` with status (`released`, `drained_with_errors`, `no_lease_active`, `reconciled_stuck`), lease count, released lease ids, cleaned assignment ids, and diagnostic summary.
+
+**CLI invocation:**
+```bash
+python -m den_hermes.orchestrator --project-id <project> --task-id <task> --stop --stop-reason "Operator reclaiming pool member"
+```
+
+**Operator playbook:**
+- Send `/stop` via Den Channels to the spawned-orchestrator profile lane.
+- The profile invokes the lease-aware stop path; verify the structured output.
+- Expected output includes `released`, `no_lease_active`, or `reconciled_stuck`.
+- If `drained_with_errors`, inspect lease release errors and remedy manually.
+- After stop, verify the Core pool summary shows the member as `available`.
+
+### 14.8 Stuck child assignment cleanup green path (from #1832)
+
+Child assignments that remain in `launching`/`ack` state with no bridge/process evidence (zombies) are now cleaned up automatically during orchestrator stop:
+
+- `DenWorkflowAdapter.list_active_child_assignments()` queries `mcp_den_get_worker_pool_summary` and identifies assignments with status `launching`, `ack`, or `acknowledged`.
+- `DenWorkflowAdapter.fail_child_assignment()` performs the cleanup: marks the worker as failed with `failure_category=orchestrator_stop_zombie_cleanup`, appends a failure checkpoint, records cleanup evidence, and releases the assignment.
+- Cleanup is best-effort per assignment — failures on one zombie do not block cleanup of others.
+
+This eliminates the manual planner cleanup required in the GoblinBench #1752 incident (child coder assignment #57 manually failed/cleaned/released).
+
+### 14.9 Diagnostic guardrails (from #1832)
+
+Project-orchestrator deliveries now carry role-specific diagnostic guardrails in the wake envelope. The `_build_delivery_envelope()` function in `channels_bridge.py` injects bounded instructions:
+
+**project_orchestrator guardrails:**
+- Do NOT search GitHub/web for Den task numbers.
+- Do NOT SSH to hosts or inspect tmux/systemd/journals/processes.
+- Do NOT treat Den task IDs as GitHub issues.
+- Limit diagnostics to: Den state (tasks, messages, docs, lease records), Core worker-pool bindings/assignments, Channels membership, runtime registry evidence.
+- If infrastructure investigation is required, send a direct-agent request to `sysadmin`.
+- Summarize findings without runaway command exploration.
+
+**role-worker (coder/reviewer/validator/etc.) guardrails:**
+- Work only within the assigned repo branch/worktree.
+- Do NOT search GitHub/web for task numbers; use Den as the source of truth.
+- Do NOT SSH to hosts or administer infrastructure.
+- Run only local git/code/tests operations.
+
+These guardrails prevent the diagnostic-routing issues observed in GoblinBench #1752 (controlled #1830 diagnostic wandered into GH/web/tmux/SSH/systemd sweeps).
+
+### 14.10 OrchestratorStopResult schema
+
+The `OrchestratorStopResult` dataclass (`orchestrator.py`) provides a deterministic, machine-readable stop outcome:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `status` | str | `released`, `drained_with_errors`, `no_lease_active`, `reconciled_stuck`, `blocked`, `failed` |
+| `run_id` | str | Stop operation run id |
+| `lease_count` | int | Number of active leases found |
+| `released_leases` | list[str] | Public lease ids successfully released |
+| `reconciled_assignments` | int | Number of stuck child assignments cleaned up |
+| `stuck_assignments_cleaned` | list[int] | Assignment ids cleaned up |
+| `diagnostic` | str | Human-readable summary |
+| `error` | str? | Aggregate error detail if any |
+
 ## Appendix C: Downstream notes for task #1739
 
 ### Pool-member identity naming convention

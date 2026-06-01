@@ -659,6 +659,30 @@ def _build_delivery_envelope(delivery: Mapping[str, Any], *, binding: Mapping[st
         target["pool_member_id"] = pool_member_id
     target["profile_identity"] = _binding_profile(binding)
     target["worker_identity"] = pool_member_id or _binding_instance_id(binding)
+    role = str(binding.get("role", ""))
+
+    # Role-specific diagnostic guardrails
+    instructions = [
+        "Refresh Den state before acting.",
+        "Use source pointers for full context.",
+        "Acknowledge the delivery if possible.",
+    ]
+    if role == "project_orchestrator":
+        instructions.extend([
+            "DIAGNOSTIC GUARDRAILS: Do NOT search GitHub/web for Den task numbers.",
+            "Do NOT SSH to hosts or inspect tmux/systemd/journals/processes.",
+            "Do NOT treat Den task IDs as GitHub issues.",
+            "Limit diagnostics to Den state, Core worker-pool evidence, Channels membership, and runtime registry.",
+            "If infrastructure investigation is needed, send a direct-agent request to sysadmin.",
+        ])
+    elif role in ("coder", "reviewer", "validator", "drift_checker", "packet_auditor"):
+        instructions.extend([
+            "DIAGNOSTIC GUARDRAILS: Work only within the assigned repo branch/worktree.",
+            "Do NOT search GitHub/web for task numbers; use Den as the source of truth.",
+            "Do NOT SSH to hosts or administer infrastructure.",
+            "Run only local git/code/tests operations.",
+        ])
+
     return {
         "type": "den_delivery",
         "schema_version": 1,
@@ -670,11 +694,7 @@ def _build_delivery_envelope(delivery: Mapping[str, Any], *, binding: Mapping[st
         "target": target,
         "source": _sanitize_mapping(_mapping(delivery.get("source", {}), "source")),
         "message": _sanitize_mapping(_mapping(delivery.get("message", {}), "message")),
-        "instructions": [
-            "Refresh Den state before acting.",
-            "Use source pointers for full context.",
-            "Acknowledge the delivery if possible.",
-        ],
+        "instructions": instructions,
     }
 
 
