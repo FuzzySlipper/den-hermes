@@ -1321,15 +1321,17 @@ python -m den_hermes.orchestrator --project-id <project> --task-id <task> --stop
 - If `drained_with_errors`, inspect lease release errors and remedy manually.
 - After stop, verify the Core pool summary shows the member as `available`.
 
-### 14.8 Stuck child assignment cleanup green path (from #1832)
+### 14.8 Stuck child assignment cleanup green path (from #1832/#1833)
 
-Child assignments that remain in `launching`/`ack` state with no bridge/process evidence (zombies) are now cleaned up automatically during orchestrator stop:
+Child assignments that remain in `launching`/`ack` state with no bridge/process evidence (zombies) are cleaned up during orchestrator stop, but cleanup must be **claim-aware**:
 
 - `DenWorkflowAdapter.list_active_child_assignments()` queries `list_assignments(project_id, verbose=true)` and identifies assignments with state/status `launching`, `ack`, or `acknowledged`.
-- `DenWorkflowAdapter.fail_child_assignment()` performs the cleanup: marks the worker as failed with `failure_category=orchestrator_stop_zombie_cleanup`, appends a failure checkpoint, records cleanup evidence, and releases the assignment.
+- Before classifying a direct-agent launch as a zombie, inspect the Channels events around the direct wake message (query from `after_id=message_id-1`, not from channel start). If the target profile posts a `gateway_delivery` agent reply/progress event after the wake, the launch is claimed/in progress; do not fail or release that assignment merely because the Core worker-run record is still `launching` before the completion packet arrives.
+- `DenChannelsAgentMessenger` reports this as `delivery_status="agent_reply_posted"` when no `deliveryRequestId` is available but the target agent replies through the gateway after the wake. Treat that as live claim evidence.
+- Only when the assignment is still `ack`/`launching` **and** there is no direct wake claim/progress/completion evidence should `DenWorkflowAdapter.fail_child_assignment()` perform cleanup: mark the worker as failed with `failure_category=orchestrator_stop_zombie_cleanup`, append a failure checkpoint, record cleanup evidence, and release the assignment.
 - Cleanup is best-effort per assignment — failures on one zombie do not block cleanup of others.
 
-This eliminates the manual planner cleanup required in the GoblinBench #1752 incident (child coder assignment #57 manually failed/cleaned/released).
+This preserves the manual cleanup green path for true zombies such as the GoblinBench #1752 child coder assignment #57, while avoiding premature failure of slow-but-claimed role workers like #61/#62/#63.
 
 ### 14.9 Diagnostic guardrails (from #1832)
 

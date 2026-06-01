@@ -93,8 +93,13 @@ class DenChannelsAgentMessenger:
         message_payload = self._read_message(message_id)
         if delivery_request_id is None:
             delivery_request_id = _extract_delivery_request_id(message_payload)
-        events_payload = self._read_events(resolved_channel_id)
-        delivery_status = _extract_delivery_status(events_payload, message_id=message_id, delivery_request_id=delivery_request_id)
+        events_payload = self._read_events(resolved_channel_id, after_id=_events_after_id(message_id))
+        delivery_status = _extract_delivery_status(
+            events_payload,
+            message_id=message_id,
+            delivery_request_id=delivery_request_id,
+            member_identity=member_identity,
+        )
         return AgentMessageResult(
             status="sent",
             member_identity=member_identity,
@@ -126,11 +131,11 @@ class DenChannelsAgentMessenger:
         except Exception:  # noqa: BLE001 - evidence enrichment is best-effort after send.
             return None
 
-    def _read_events(self, channel_id: int) -> Mapping[str, Any] | None:
+    def _read_events(self, channel_id: int, *, after_id: int = 0) -> Mapping[str, Any] | None:
         if not hasattr(self.tools, "den_channels_get_events"):
             return None
         try:
-            return self.tools.den_channels_get_events(channel_id=channel_id, after_id=0, limit=20)
+            return self.tools.den_channels_get_events(channel_id=channel_id, after_id=after_id, limit=50)
         except Exception:  # noqa: BLE001 - evidence enrichment is best-effort after send.
             return None
 
@@ -169,7 +174,26 @@ def _extract_message_id(response: Any) -> int | str | None:
 
 
 def _extract_delivery_request_id(response: Any) -> int | str | None:
-    return _extract_first_nested(response, "delivery_request_id", "deliveryRequestId", "request_id", "requestId")
+    return _extract_first_nested(
+        response,
+        "delivery_request_id",
+        "deliveryRequestId",
+        "gateway_delivery_request_id",
+        "gatewayDeliveryRequestId",
+        "delivery_id",
+        "deliveryId",
+        "request_id",
+        "requestId",
+    )
+
+
+def _events_after_id(message_id: int | str | None) -> int:
+    if message_id is None:
+        return 0
+    try:
+        return max(0, int(message_id) - 1)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _extract_delivery_status(
@@ -177,6 +201,7 @@ def _extract_delivery_status(
     *,
     message_id: int | str | None,
     delivery_request_id: int | str | None,
+    member_identity: str | None = None,
 ) -> str | None:
     if not isinstance(events_payload, Mapping):
         return None
@@ -187,20 +212,39 @@ def _extract_delivery_status(
         return None
     message_text = str(message_id) if message_id is not None else None
     delivery_text = str(delivery_request_id) if delivery_request_id is not None else None
-    fallback_status: str | None = None
+    saw_direct_message = False
     for event in events:
         if not isinstance(event, Mapping):
             continue
         event_status = _optional_str(
             _first_present(event, "deliveryStatus", "delivery_status", "eventType", "event_type", "type", "status")
         )
-        if fallback_status is None:
-            fallback_status = event_status
         event_message_id = _optional_str(_first_present(event, "messageId", "message_id"))
         event_delivery_id = _optional_str(_first_present(event, "deliveryRequestId", "delivery_request_id", "requestId", "request_id"))
-        if (message_text and event_message_id == message_text) or (delivery_text and event_delivery_id == delivery_text):
+        matches_direct_message = bool(message_text and event_message_id == message_text)
+        matches_delivery = bool(delivery_text and event_delivery_id == delivery_text)
+        if matches_direct_message:
+            saw_direct_message = True
+        if matches_direct_message or matches_delivery:
+            if event_status is None:
+                continue
             return event_status
-    return fallback_status
+        if saw_direct_message and member_identity and _event_is_agent_gateway_reply(event, member_identity):
+            return "agent_reply_posted"
+    return None
+
+
+def _event_is_agent_gateway_reply(event: Mapping[str, Any], member_identity: str) -> bool:
+    sender_identity = _optional_str(_first_present(event, "senderIdentity", "sender_identity"))
+    sender_type = (_optional_str(_first_present(event, "senderType", "sender_type")) or "").lower()
+    source_kind = (_optional_str(_first_present(event, "sourceKind", "source_kind")) or "").lower()
+    message_kind = (_optional_str(_first_present(event, "messageKind", "message_kind")) or "").lower()
+    return (
+        sender_identity == member_identity
+        and sender_type == "agent"
+        and source_kind == "gateway_delivery"
+        and (not message_kind or message_kind == "agent_text")
+    )
 
 
 def _extract_first_nested(value: Any, *keys: str) -> int | str | None:
