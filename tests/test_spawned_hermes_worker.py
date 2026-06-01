@@ -239,6 +239,20 @@ roles:
     profile: den-audit-profile
     provider: provider-audit
     model: model-audit
+  project_orchestrator:
+    runtime_id: project-orchestrator-runtime
+    profile: spawned-orchestrator
+    provider: provider-orchestrator
+    model: model-orchestrator
+    toolsets: [terminal, file]
+    timeout_seconds: 903
+    launch:
+      source: den-project-orchestrator
+      extra_args: []
+    lease_kind: project_orchestrator
+role_aliases:
+  orchestrator: project_orchestrator
+  pooled_orchestrator: project_orchestrator
 """
     )
     return registry

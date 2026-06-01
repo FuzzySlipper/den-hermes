@@ -1387,6 +1387,18 @@ roles:
     toolsets: [terminal, file]
     workdir: /tmp/work
     run_root: /tmp/runs
+  project_orchestrator:
+    runtime_id: project-orchestrator-pool
+    profile: spawned-orchestrator
+    provider: openai
+    model: gpt-4o
+    toolsets: [terminal, file]
+    workdir: /tmp/work
+    run_root: /tmp/runs
+    lease_kind: project_orchestrator
+role_aliases:
+  orchestrator: project_orchestrator
+  pooled_orchestrator: project_orchestrator
 """)
         return registry_path
 

@@ -358,6 +358,18 @@ def test_spawned_hermes_profile_transport_launches_profile_from_runtime_registry
             toolsets: [terminal]
             timeout_seconds: 600
             launch: {source: den-worker, extra_args: []}
+          project_orchestrator:
+            runtime_id: project-orchestrator-primary
+            profile: spawned-orchestrator
+            provider: test-provider
+            model: test-model
+            toolsets: [terminal]
+            timeout_seconds: 600
+            launch: {source: den-project-orchestrator, extra_args: []}
+            lease_kind: project_orchestrator
+        role_aliases:
+          orchestrator: project_orchestrator
+          pooled_orchestrator: project_orchestrator
         """.replace("RUN_ROOT", str(tmp_path / "runs")).replace("WORKDIR", str(tmp_path))
     )
     launches = []
