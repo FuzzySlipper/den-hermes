@@ -197,6 +197,8 @@ code quality — only packet integrity.
 
 **Contract**: A project orchestrator is leased to a project, channel, task tree, or workstream for a bounded window. It shapes work, links dependencies, posts durable handoffs/checkpoints, and routes bounded coder/reviewer/validator/drift/audit work through Den. It is not a permanent project Planner/Runner and not a code implementation workhorse. Channel membership proves presence, Gateway/Core binding proves reachability, and the Core project-duration lease proves responsibility.
 
+**Clarification boundary**: A project orchestrator should continue clear in-scope lease work without low-value “can I continue?” prompts, but must stop and ask a concrete question when the lease, task, workdir, project ownership, acceptance criteria, safety boundary, or authority path is unclear. It is not empowered to go on infrastructure quests: no SSH, tmux/systemd/journal/process sweeps, service/fleet mutation, or GitHub-issue reinterpretation of Den task ids unless the lease explicitly grants infrastructure-diagnostic scope. If progress requires outside-workdir or host/service action, file a Den Channels/direct-agent request to `sysadmin` with task/lease id, evidence, requested action, and urgency.
+
 **Live smoke reference**: #1812 verified `spawned-orchestrator` / `pool-orchestrator-01` with a real Core lease lifecycle (`project_orchestrator` lease create/read/active/release/cleanup) and a leased Den Channels handoff reply (`SPAWNED-ORCHESTRATOR-HANDOFF-OK`, gateway delivery `943`) without taking implementation work. See `docs/worker-pool-mvp-rollout-runbook.md` §14.6 for handles and cleanup evidence.
 
 ### 3.7 Scout

@@ -1247,6 +1247,9 @@ Use the pooled orchestrator lane when a project/workstream needs temporary coord
 - Post scheduled checkpoints with progress, open decisions, worker routes, and release/renewal posture.
 - Ask Patch only for material product/architecture/safety decisions, not routine queue movement.
 - Do not perform substantial implementation/review/validation directly as the orchestrator.
+- Continue clear in-scope lease work without “can I continue?” prompts, but stop and ask a concrete question when the lease, task, workdir, project ownership, acceptance criteria, safety boundary, or authority path is genuinely unclear.
+- Stay inside the assigned project/repo workdir and explicit Den artifact/context paths. Do not SSH to hosts, sweep tmux/systemd/journals/processes, alter services, chase fleet state, or treat Den task numbers as GitHub issues unless the lease explicitly grants infrastructure-diagnostic scope.
+- If progress requires outside-workdir or host/service/fleet action, send a Den Channels/direct-agent request to `sysadmin` with task/lease id, evidence, requested action, and urgency instead of solving it ad hoc.
 
 ### 14.4 Renew / drain / release
 
