@@ -79,7 +79,7 @@ REQUIRED_SECTIONS = [
     "6.4 Smoke lesson fields",
     "6.5 Example lesson record (passed)",
     "6.6 Example lesson record (failed at delivery)",
-    "7. Operator troubleshooting",
+    "12. Operator troubleshooting",
     "Appendix A",
     "Appendix B",
 ]

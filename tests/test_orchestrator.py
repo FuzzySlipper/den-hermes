@@ -315,16 +315,16 @@ class RecordingCoderTools:
         self.calls.append(("send_user_notification", kwargs))
         return {"id": 9003}
 
-    def mcp_den_list_active_leases(self, **kwargs):
-        self.calls.append(("list_active_leases", kwargs))
+    def mcp_den_list_orchestrator_leases(self, **kwargs):
+        self.calls.append(("list_orchestrator_leases", kwargs))
         return {"leases": [], "active_leases": []}
 
-    def mcp_den_get_worker_pool_summary(self, **kwargs):
-        self.calls.append(("get_worker_pool_summary", kwargs))
+    def mcp_den_list_assignments(self, **kwargs):
+        self.calls.append(("list_assignments", kwargs))
         return {"active_assignments": [], "assignments": []}
 
-    def mcp_den_release_orchestrator_lease(self, **kwargs):
-        self.calls.append(("release_orchestrator_lease", kwargs))
+    def mcp_den_transition_orchestrator_lease(self, **kwargs):
+        self.calls.append(("transition_orchestrator_lease", kwargs))
         return {"ok": True}
 
     def mcp_den_fail_assignment(self, **kwargs):
@@ -1833,25 +1833,25 @@ class LeasingRecordingTools:
         self._stuck = stuck_assignments or []
         self._release_fails = release_fails
 
-    def mcp_den_list_active_leases(self, **kwargs):
-        self.calls.append(("list_active_leases", kwargs))
+    def mcp_den_list_orchestrator_leases(self, **kwargs):
+        self.calls.append(("list_orchestrator_leases", kwargs))
         return {
             "leases": self._leases,
             "active_leases": self._leases,
         }
 
-    def mcp_den_get_worker_pool_summary(self, **kwargs):
-        self.calls.append(("get_worker_pool_summary", kwargs))
+    def mcp_den_list_assignments(self, **kwargs):
+        self.calls.append(("list_assignments", kwargs))
         return {
             "active_assignments": self._stuck,
             "assignments": self._stuck,
         }
 
-    def mcp_den_release_orchestrator_lease(self, **kwargs):
-        self.calls.append(("release_orchestrator_lease", kwargs))
+    def mcp_den_transition_orchestrator_lease(self, **kwargs):
+        self.calls.append(("transition_orchestrator_lease", kwargs))
         if self._release_fails:
             raise RuntimeError("Lease release failed")
-        return {"ok": True, "lease_id": kwargs.get("lease_id")}
+        return {"ok": True, "lease_id": kwargs.get("lease_internal_id"), "state": kwargs.get("new_state")}
 
     def mcp_den_post_worker_completion_packet(self, **kwargs):
         self.calls.append(("post_worker_completion_packet", kwargs))
@@ -1894,7 +1894,7 @@ def test_lease_aware_stop_no_leases_no_stuck_children():
 def test_lease_aware_stop_releases_active_leases():
     """Active leases should be released during stop."""
     tools = LeasingRecordingTools(active_leases=[
-        {"lease_id": 4, "public_lease_id": "pool-orchestrator-01:goblinbench:b6f39d95"},
+        {"id": 4, "lease_id": "pool-orchestrator-01:goblinbench:b6f39d95"},
     ])
     adapter = _lease_stop_adapter(tools)
 
@@ -1904,6 +1904,10 @@ def test_lease_aware_stop_releases_active_leases():
     assert result.lease_count == 1
     assert len(result.released_leases) == 1
     assert result.released_leases[0] == "pool-orchestrator-01:goblinbench:b6f39d95"
+    transition_calls = [call for call in tools.calls if call[0] == "transition_orchestrator_lease"]
+    assert [call[1]["new_state"] for call in transition_calls] == ["draining", "released"]
+    assert transition_calls[0][1]["lease_internal_id"] == 4
+    assert "operator_stop_released" in transition_calls[1][1]["evidence"]
     assert "Released 1/1 active leases" in (result.diagnostic or "")
     assert "Reclaiming pool member" in (result.diagnostic or "")
 
@@ -1912,7 +1916,7 @@ def test_lease_aware_stop_cleans_stuck_child_assignments():
     """Stuck launching assignments are cleaned up during lease drain."""
     tools = LeasingRecordingTools(
         active_leases=[
-            {"lease_id": 4, "public_lease_id": "pool-orchestrator-01:goblinbench:b6f39d95"},
+            {"id": 4, "lease_id": "pool-orchestrator-01:goblinbench:b6f39d95"},
         ],
         stuck_assignments=[
             {"assignment_id": 57, "run_id": "piw_20260601115732_2313fd08", "role": "coder", "status": "launching"},
@@ -1932,7 +1936,7 @@ def test_lease_aware_stop_multiple_stuck_children():
     """Multiple stuck assignments are all cleaned up."""
     tools = LeasingRecordingTools(
         active_leases=[
-            {"lease_id": 4, "public_lease_id": "pool-orchestrator-01:goblinbench:b6f39d95"},
+            {"id": 4, "lease_id": "pool-orchestrator-01:goblinbench:b6f39d95"},
         ],
         stuck_assignments=[
             {"assignment_id": 57, "run_id": "run-a", "role": "coder", "status": "launching"},
@@ -1970,7 +1974,7 @@ def test_lease_aware_stop_lease_release_failure_partial():
     """When a lease release fails, the stop still reconciles children."""
     tools = LeasingRecordingTools(
         active_leases=[
-            {"lease_id": 4, "public_lease_id": "pool-orchestrator-01:goblinbench:b6f39d95"},
+            {"id": 4, "lease_id": "pool-orchestrator-01:goblinbench:b6f39d95"},
         ],
         release_fails=True,
     )
@@ -1999,7 +2003,7 @@ def test_lease_aware_stop_no_leases_no_children_clean_state():
 def test_adapter_check_active_leases_returns_leases():
     """check_active_orchestrator_leases returns structured lease state."""
     tools = LeasingRecordingTools(active_leases=[
-        {"lease_id": 4, "public_lease_id": "pool-orchestrator-01:goblinbench:b6f39d95"},
+        {"id": 4, "lease_id": "pool-orchestrator-01:goblinbench:b6f39d95"},
     ])
     adapter = _lease_stop_adapter(tools)
 
@@ -2007,7 +2011,10 @@ def test_adapter_check_active_leases_returns_leases():
 
     assert state["lease_count"] == 1
     assert len(state["active_leases"]) == 1
-    assert state["active_leases"][0]["lease_id"] == 4
+    assert state["active_leases"][0]["id"] == 4
+    assert state["active_leases"][0]["lease_id"] == "pool-orchestrator-01:goblinbench:b6f39d95"
+    assert tools.calls[0][0] == "list_orchestrator_leases"
+    assert tools.calls[0][1]["include_terminal"] is False
 
 
 def test_adapter_list_child_assignments_finds_stuck():
@@ -2045,7 +2052,7 @@ def test_cli_stop_flag_triggers_lease_aware_stop(capsys):
         adapter_args["requested_by"] = requested_by
         return _lease_stop_adapter(LeasingRecordingTools(
             active_leases=[
-                {"lease_id": 4, "public_lease_id": "pool-orchestrator-01:goblinbench:b6f39d95"},
+                {"id": 4, "lease_id": "pool-orchestrator-01:goblinbench:b6f39d95"},
             ],
         ))
 

@@ -530,18 +530,19 @@ class DenWorkflowAdapter:
         plus ``lease_count`` and diagnostic summary fields.
         When the MCP tool is unavailable, returns a safe fallback.
         """
-        tool = getattr(self.tools, "mcp_den_list_active_leases", None)
+        tool = getattr(self.tools, "mcp_den_list_orchestrator_leases", None)
         if tool is None:
             return {
                 "active_leases": [],
                 "lease_count": 0,
                 "unavailable": True,
-                "diagnostic": "mcp_den_list_active_leases tool unavailable; skipping lease check.",
+                "diagnostic": "mcp_den_list_orchestrator_leases tool unavailable; skipping lease check.",
             }
         try:
             response = tool(
                 project_id=self.project_id,
-                lease_kind="project_orchestrator",
+                include_terminal=False,
+                limit=200,
             )
         except Exception as exc:
             logger.warning(
@@ -569,7 +570,7 @@ class DenWorkflowAdapter:
         Returns assignments in ``launching`` or ``ack`` state that may need
         reconciliation during a stop/drain.
         """
-        tool = getattr(self.tools, "mcp_den_get_worker_pool_summary", None)
+        tool = getattr(self.tools, "mcp_den_list_assignments", None)
         if tool is None:
             return {
                 "active_assignments": [],
@@ -579,7 +580,7 @@ class DenWorkflowAdapter:
                 "unavailable": True,
             }
         try:
-            response = tool()
+            response = tool(project_id=self.project_id, limit=200, verbose=True)
         except Exception as exc:
             logger.warning(
                 "Worker pool summary query failed for project %s: %s",
@@ -599,14 +600,19 @@ class DenWorkflowAdapter:
             or payload.get("assignments")
             or []
         )
-        stuck = [
+        active_states = {"ack", "acknowledged", "launching", "running", "checkpoint_waiting", "blocked"}
+        active_assignments = [
             a for a in assignments
-            if str(a.get("status", "")).lower() in {"launching", "ack", "acknowledged"}
+            if str(a.get("state", a.get("status", ""))).lower() in active_states
+        ]
+        stuck = [
+            a for a in active_assignments
+            if str(a.get("state", a.get("status", ""))).lower() in {"launching", "ack", "acknowledged"}
         ]
         return {
-            "active_assignments": assignments,
+            "active_assignments": active_assignments,
             "stuck_assignments": stuck,
-            "assignment_count": len(assignments),
+            "assignment_count": len(active_assignments),
             "stuck_count": len(stuck),
         }
 
@@ -1761,26 +1767,52 @@ def lease_aware_stop(
             ),
         )
 
-    # Phase 2: Release active leases
+    # Phase 2: Drain/release active leases via Core's orchestrator-lease API.
     released_lease_ids: list[str] = []
     lease_errors: list[str] = []
+    transition_tool = getattr(adapter.tools, "mcp_den_transition_orchestrator_lease", None)
     for lease in active_leases:
-        lease_id = str(lease.get("lease_id") or lease.get("id") or "")
-        public_lease_id = str(lease.get("public_lease_id") or lease_id)
+        lease_internal_id_value = lease.get("id") or lease.get("lease_internal_id") or lease.get("lease_id")
+        public_lease_id = str(lease.get("lease_id") or lease.get("public_lease_id") or lease_internal_id_value or "")
         try:
-            release_tool = getattr(adapter.tools, "mcp_den_release_orchestrator_lease", None)
-            if release_tool is not None:
-                release_tool(
-                    project_id=adapter.project_id,
-                    lease_id=lease_id or public_lease_id,
-                    released_by=adapter.requested_by,
-                    reason=reason,
-                )
-            released_lease_ids.append(public_lease_id or lease_id)
+            if transition_tool is None:
+                raise RuntimeError("mcp_den_transition_orchestrator_lease tool unavailable")
+            lease_internal_id = int(lease_internal_id_value)
+            evidence = json.dumps({
+                "status": "operator_stop_released",
+                "source": "spawned_hermes_orchestrator",
+                "released_by": adapter.requested_by,
+                "reason": reason,
+                "stop_run_id": run_id,
+            })
+            draining_response = transition_tool(
+                lease_internal_id=lease_internal_id,
+                new_state="draining",
+                evidence=json.dumps({
+                    "status": "operator_stop_draining",
+                    "source": "spawned_hermes_orchestrator",
+                    "reason": reason,
+                    "stop_run_id": run_id,
+                }),
+            )
+            _ensure_den_did_not_reject(
+                _coerce_mapping_response(draining_response),
+                context=f"orchestrator lease {lease_internal_id} draining transition",
+            )
+            release_response = transition_tool(
+                lease_internal_id=lease_internal_id,
+                new_state="released",
+                evidence=evidence,
+            )
+            _ensure_den_did_not_reject(
+                _coerce_mapping_response(release_response),
+                context=f"orchestrator lease {lease_internal_id} release transition",
+            )
+            released_lease_ids.append(public_lease_id or str(lease_internal_id))
         except Exception as exc:
-            msg = f"Lease {lease_id}: {str(exc)[:200]}"
+            msg = f"Lease {public_lease_id or lease_internal_id_value}: {str(exc)[:200]}"
             lease_errors.append(msg)
-            logger.warning("Failed to release orchestrator lease %s: %s", lease_id, exc)
+            logger.warning("Failed to release orchestrator lease %s: %s", public_lease_id or lease_internal_id_value, exc)
 
     # Phase 3: Reconcile stuck child assignments
     child_state = adapter.list_active_child_assignments()

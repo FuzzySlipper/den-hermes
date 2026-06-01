@@ -1303,9 +1303,9 @@ Operational note: an earlier handoff attempt (`lease-handoff-smoke-1812-b28dc415
 An operator `/stop` sent to a leased pooled project_orchestrator profile now discovers active Core leases, drains/releases them, and reconciles stuck child assignments instead of returning "No active task to stop."
 
 **Stop sequence** (invoked via `hermes orchestrator --stop` or Channels `/stop`):
-1. Query Core for active `project_orchestrator` leases on the current project.
-2. For each active lease: call `mcp_den_release_orchestrator_lease` with the lease id, operator identity, and stop reason.
-3. Query Core for active child assignments in `launching`/`ack` state.
+1. Query Core for active `project_orchestrator` leases on the current project with `list_orchestrator_leases(project_id, include_terminal=false)`.
+2. For each active lease: transition it through `draining` and then `released` with `transition_orchestrator_lease(lease_internal_id, new_state, evidence)` so cleanup evidence is attached and the pool member is freed.
+3. Query Core for child assignments with `list_assignments(project_id, verbose=true)` and identify `launching`/`ack` zombies.
 4. For each stuck child: append a zombie-cleanup failure checkpoint, record cleanup evidence, and release the assignment.
 5. Return structured `OrchestratorStopResult` with status (`released`, `drained_with_errors`, `no_lease_active`, `reconciled_stuck`), lease count, released lease ids, cleaned assignment ids, and diagnostic summary.
 
@@ -1325,7 +1325,7 @@ python -m den_hermes.orchestrator --project-id <project> --task-id <task> --stop
 
 Child assignments that remain in `launching`/`ack` state with no bridge/process evidence (zombies) are now cleaned up automatically during orchestrator stop:
 
-- `DenWorkflowAdapter.list_active_child_assignments()` queries `mcp_den_get_worker_pool_summary` and identifies assignments with status `launching`, `ack`, or `acknowledged`.
+- `DenWorkflowAdapter.list_active_child_assignments()` queries `list_assignments(project_id, verbose=true)` and identifies assignments with state/status `launching`, `ack`, or `acknowledged`.
 - `DenWorkflowAdapter.fail_child_assignment()` performs the cleanup: marks the worker as failed with `failure_category=orchestrator_stop_zombie_cleanup`, appends a failure checkpoint, records cleanup evidence, and releases the assignment.
 - Cleanup is best-effort per assignment — failures on one zombie do not block cleanup of others.
 
