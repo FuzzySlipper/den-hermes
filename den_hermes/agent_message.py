@@ -19,6 +19,9 @@ class AgentMessageResult:
     channel_slug: str | None = None
     channel_kind: str | None = None
     project_id: str | None = None
+    target_project_id: str | None = None
+    target_task_id: int | None = None
+    target_assignment_id: int | None = None
     message_id: int | str | None = None
     delivery_request_id: int | str | None = None
     gateway_message_url: str | None = None
@@ -53,6 +56,9 @@ class DenChannelsAgentMessenger:
         project_id: str | None = None,
         channel_id: int | None = None,
         sender_identity: str | None = None,
+        target_project_id: str | None = None,
+        target_task_id: int | None = None,
+        target_assignment_id: int | None = None,
     ) -> AgentMessageResult:
         memberships = self._resolve_memberships(project_id=project_id, channel_id=channel_id)
         resolved_channel_id = _optional_int(_first_present(memberships, "channelId", "channel_id"))
@@ -87,6 +93,12 @@ class DenChannelsAgentMessenger:
         }
         if sender_identity:
             send_args["sender_identity"] = sender_identity
+        if target_project_id:
+            send_args["source_project_id"] = target_project_id
+        if target_task_id is not None:
+            send_args["target_task_id"] = target_task_id
+        if target_assignment_id is not None:
+            send_args["assignment_id"] = str(target_assignment_id)
         response = self.tools.den_channels_send_direct_agent_message(**send_args)
         message_id = _extract_message_id(response)
         delivery_request_id = _extract_delivery_request_id(response)
@@ -107,6 +119,9 @@ class DenChannelsAgentMessenger:
             channel_slug=channel_slug,
             channel_kind=channel_kind,
             project_id=resolved_project_id,
+            target_project_id=target_project_id,
+            target_task_id=target_task_id,
+            target_assignment_id=target_assignment_id,
             message_id=message_id,
             delivery_request_id=delivery_request_id,
             gateway_message_url=self._message_url(message_id) if message_id is not None else None,

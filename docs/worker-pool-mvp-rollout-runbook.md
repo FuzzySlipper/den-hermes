@@ -1368,6 +1368,34 @@ The `OrchestratorStopResult` dataclass (`orchestrator.py`) provides a determinis
 | `diagnostic` | str | Human-readable summary |
 | `error` | str? | Aggregate error detail if any |
 
+### 14.11 Cross-project worker-pool attribution (from #1834)
+
+Pool workers are reachable via a shared control channel (channel 5, `den-hermes-bridge`). This is the **transport channel** — it is not the work project. Every cross-project wake must carry explicit target metadata to avoid collapsing attribution to the control channel's project.
+
+**Attribution model:**
+
+| Concept | Field | Example |
+|---------|-------|---------|
+| Transport/control channel | `channel_id` | 5 (den-hermes-bridge) |
+| Target work project | `SourceProjectId` / `target_project_id` | `den-core` |
+| Target task | `TargetTaskId` / `target_task_id` | 1820 |
+| Target assignment | `AssignmentId` / `target_assignment_id` | 63 |
+
+**Gateway message behavior (den-channels):**
+- `POST /api/gateway/direct-agent-messages` accepts optional `sourceProjectId`, `targetTaskId`, and `assignmentId` fields.
+- When provided, the channel message records `SourceProjectId: <caller's value>` instead of the channel's project.
+- The response DTO echoes all three attribution fields.
+
+**DenChannelsAgentMessenger behavior (den-hermes):**
+- `send_agent_message()` accepts `target_project_id`, `target_task_id`, and `target_assignment_id`.
+- These are passed through to the Gateway as `source_project_id`, `target_task_id`, and `assignment_id`.
+- `AgentMessageResult` carries `target_project_id`, `target_task_id`, and `target_assignment_id` for code-level consumers.
+- `project_id` on the result still reflects the channel's project (transport attribution).
+
+**Backward compatibility:** Omitting target fields preserves existing behavior — the channel's project is used for `SourceProjectId`.
+
+**Smoke defaults caveat:** `scripts/smoke_pool_worker_assignment.py` defaults `task_id=1784` / `project_id="den-hermes-bridge"`. These are **pilot provisioning defaults only**, not structural work-attribution truth. Cross-project callers must supply explicit `target_project_id`.
+
 ## Appendix C: Downstream notes for task #1739
 
 ### Pool-member identity naming convention

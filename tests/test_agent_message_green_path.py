@@ -184,3 +184,64 @@ def test_send_agent_message_observes_agent_reply_after_direct_wake_without_deliv
     assert result.delivery_request_id is None
     assert result.delivery_status == "agent_reply_posted"
     assert tools.last_events_query == {"channel_id": 5, "after_id": 320, "limit": 50}
+
+
+def test_send_agent_message_carries_target_project_and_task_in_send_args():
+    """When target_project_id and target_task_id are provided, they flow to the direct-agent send args."""
+    tools = RecordingChannelsTools({("channel", 5): memberships()})
+    messenger = DenChannelsAgentMessenger(tools=tools)
+
+    result = messenger.send_agent_message(
+        member_identity="den-mcp-runner",
+        body="Review den-core task #1820",
+        channel_id=5,
+        target_project_id="den-core",
+        target_task_id=1820,
+        target_assignment_id=63,
+    )
+
+    assert result.status == "sent"
+    assert result.target_project_id == "den-core"
+    assert result.target_task_id == 1820
+    assert result.target_assignment_id == 63
+    assert result.project_id == "den-hermes-bridge"  # transport channel project
+    sent = tools.sent[0]
+    assert sent["source_project_id"] == "den-core"
+    assert sent["target_task_id"] == 1820
+    assert sent["assignment_id"] == "63"
+
+
+def test_send_agent_message_target_project_differs_from_channel_project():
+    """Regression: non-bridge target_project_id must not collapse to channel project."""
+    tools = RecordingChannelsTools({("channel", 5): memberships()})
+    messenger = DenChannelsAgentMessenger(tools=tools)
+
+    result = messenger.send_agent_message(
+        member_identity="den-mcp-runner",
+        body="Work on goblinbench task",
+        channel_id=5,
+        target_project_id="goblinbench",
+    )
+
+    assert result.status == "sent"
+    assert result.target_project_id == "goblinbench"
+    assert result.project_id == "den-hermes-bridge"
+    assert result.target_project_id != result.project_id
+
+
+def test_send_agent_message_without_target_project_preserves_existing_behavior():
+    """Without target_project_id, project_id is channel project (backward compat)."""
+    tools = RecordingChannelsTools({("channel", 5): memberships()})
+    messenger = DenChannelsAgentMessenger(tools=tools)
+
+    result = messenger.send_agent_message(
+        member_identity="den-mcp-runner",
+        body="Standard wake",
+        channel_id=5,
+    )
+
+    assert result.status == "sent"
+    assert result.target_project_id is None
+    assert result.project_id == "den-hermes-bridge"
+    sent = tools.sent[0]
+    assert "source_project_id" not in sent

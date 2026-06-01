@@ -126,6 +126,12 @@ def smoke_role(
     assignment, acknowledges it, and records role-specific packet/checkpoint
     metadata.
 
+    NOTE: ``task_id=1784`` and ``project_id="den-hermes-bridge"`` are smoke
+    defaults only — they define the pilot provisioning control channel, not
+    the structural work-attribution model.  Cross-project assignments must
+    carry explicit ``target_project_id`` / ``target_task_id`` metadata
+    (see #1834).
+
     Returns a RoleSmokeResult with handles that Runner can connect to
     Core/assignment records during live application.
     """
