@@ -98,6 +98,11 @@ roles:
     profile: den-hermes-runner
     provider: openai-codex
     model: gpt-5.5
+  project_orchestrator:
+    runtime_id: project-orchestrator-test
+    profile: spawned-orchestrator
+    provider: deepseek
+    model: deepseek-v4-flash
 """.format(run_root=tmp_path / "runs", workdir=tmp_path)
     )
 
@@ -169,6 +174,11 @@ def test_resolver_normalizes_aliases_to_canonical_roles():
 
     assert runtime.role == "drift_checker"
     assert runtime.runtime_id == "drift-checker-primary"
+
+    orchestrator = resolve_role_runtime("pooled_orchestrator", registry_path=SAMPLE_REGISTRY)
+
+    assert orchestrator.role == "project_orchestrator"
+    assert orchestrator.runtime_id == "project-orchestrator-primary"
 
 
 def test_resolver_redacts_secret_like_values(tmp_path):

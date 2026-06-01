@@ -11,12 +11,14 @@ notes: >-
   Central spawned-Hermes runtime picks for Den orchestrator roles.
   Role catalog: docs/worker-role-catalog.md.
   Scout design: docs/spawned-scout-design-1691.md.
-  All live roles (coder, reviewer, validator, drift_checker, packet_auditor)
+  All live roles (coder, reviewer, validator, drift_checker, packet_auditor, project_orchestrator)
   use shared role profiles (spawned-*) per pool-member identity convention.
   See docs/spawned-role-pool-member-identity.md.
   NOTE: scout role entry is design-only (present for documentation/reference).
   It will not pass resolve_role_runtime validation until CANONICAL_ROLES
   in runtime_registry.py includes 'scout'. See spawned-scout-design-1691.md §14.
+  The project_orchestrator role is for project-duration leases, not ordinary
+  task-scoped worker assignments.
 
 defaults:
   substrate: spawned_hermes
@@ -118,6 +120,25 @@ roles:
       source: den-worker
       extra_args: []
 
+  project_orchestrator:
+    runtime_id: project-orchestrator-primary
+    profile: spawned-orchestrator
+    provider: deepseek
+    model: deepseek-v4-flash
+    toolsets: [terminal, file]
+    timeout_seconds: 1800
+    reasoning_effort: high
+    max_retries: 0
+    preflight:
+      enabled: true
+    launch:
+      source: den-project-orchestrator
+      extra_args: []
+    lease_kind: project_orchestrator
+    pool_member_id: pool-orchestrator-01
+    memory_policy: zero_long_term_den_durable_handoffs_only
+    memory_enabled: false
+
   # Scout role (design task #1691) — pre-coder codebase discovery.
   # Strictly read-only; uses the same high-context model as coder.
   # Registered in docs/worker-role-catalog.md §3.6 and
@@ -142,3 +163,5 @@ roles:
 role_aliases:
   drift: drift_checker
   audit: packet_auditor
+  orchestrator: project_orchestrator
+  pooled_orchestrator: project_orchestrator

@@ -30,6 +30,7 @@ profile identity is a grouping handle; concrete instance selection uses
 | Validator | `spawned-validator` | `validator` | `validator` |
 | Drift Checker | `spawned-drift-checker` | `drift_checker` | `drift_checker` |
 | Packet Auditor | `spawned-packet-auditor` | `packet_auditor` | `packet_auditor` |
+| Project Orchestrator | `spawned-orchestrator` | `project_orchestrator` | `project_orchestrator` / `pooled_orchestrator` |
 | Scout | `spawned-scout` | `scout` | `scout` |
 
 ### Identity rules
@@ -54,6 +55,8 @@ profile identity is a grouping handle; concrete instance selection uses
 |---|---|
 | `drift` | `drift_checker` |
 | `audit` | `packet_auditor` |
+| `orchestrator` | `project_orchestrator` |
+| `pooled_orchestrator` | `project_orchestrator` |
 
 No aliases are defined for `coder`, `reviewer`, `validator`, or `scout`
 (see §9 for Scout alias discussion).
@@ -174,7 +177,27 @@ packets, context packets, or checkpoint messages for structural
 correctness, field presence, and identity consistency. Does not assess
 code quality — only packet integrity.
 
-### 3.6 Scout
+### 3.6 Project Orchestrator
+
+| Field | Value |
+|---|---|
+| Profile identity | `spawned-orchestrator` |
+| Worker role | `project_orchestrator` |
+| Capability tags | `planning`, `task-shaping`, `den-coordination`, `worker-routing`, `checkpointing` |
+| Allowed toolsets | `terminal`, `file`; Den MCP/tool access comes from the profile config and lease context |
+| Side-effect envelope | **Coordination mutating**: may create/refine Den tasks, dependencies, docs, handoffs, checkpoints; does not perform substantial implementation/review/validation directly |
+| Checkpoint types | kickoff checkpoint, scheduled lease checkpoint, handoff packet, release/drain checkpoint |
+| Packet type | Project-duration orchestrator lease/checkpoint records (Core #1811); not an ordinary task-scoped worker completion packet |
+| Model/provider class | High-reasoning coordination model; live profile uses `deepseek-v4-flash` unless profile runtime authority changes |
+| Reasoning effort | `high` recommended |
+| Cleanup/release | Release or renew the Core project-duration lease; leave/deactivate target channel membership as appropriate; write cleanup/release evidence |
+| Artifact required fields | lease id, project/channel scope, objective, expiry, wake policy, source docs/tasks read, handoffs/routes, release/renewal recommendation |
+| Memory policy | Zero long-term/local memory; lease continuity lives in Den docs/tasks/messages/checkpoints |
+| Den role registration | `project_orchestrator` (aliases `orchestrator`, `pooled_orchestrator`) |
+
+**Contract**: A project orchestrator is leased to a project, channel, task tree, or workstream for a bounded window. It shapes work, links dependencies, posts durable handoffs/checkpoints, and routes bounded coder/reviewer/validator/drift/audit work through Den. It is not a permanent project Planner/Runner and not a code implementation workhorse. Channel membership proves presence, Gateway/Core binding proves reachability, and the Core project-duration lease proves responsibility.
+
+### 3.7 Scout
 
 | Field | Value |
 |---|---|
@@ -203,6 +226,7 @@ code quality — only packet integrity.
 | Validator | No (runs tests, no code changes) | Read-heavy |
 | Drift Checker | No | Read-only |
 | Packet Auditor | No | Read-only |
+| Project Orchestrator | Den coordination only | Coordination mutating |
 | Scout | No | Strictly read-only |
 
 ## 5. Checkpoint and packet type reference

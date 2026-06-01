@@ -181,6 +181,14 @@ class TestResolveRoleRuntime:
         assert runtime["profile"] == "spawned-packet-auditor"
         assert runtime["provider"] == "openai-codex"
 
+    def test_resolves_project_orchestrator(self, registry):
+        runtime = resolve_role_runtime(
+            "project_orchestrator", registry, registry["defaults"], registry["roles"]
+        )
+        assert runtime["role"] == "project_orchestrator"
+        assert runtime["profile"] == "spawned-orchestrator"
+        assert runtime["provider"] == "deepseek"
+
     def test_missing_role_raises(self, registry):
         with pytest.raises(RuntimeError, match="not found"):
             resolve_role_runtime("nonexistent", registry, registry["defaults"], registry["roles"])
@@ -229,7 +237,7 @@ class TestBuildPoolMember:
             runtime = {
                 "role": role,
                 "runtime_id": f"{role}-primary",
-                "profile": f"spawned-{role}",
+                "profile": "spawned-orchestrator" if role == "project_orchestrator" else f"spawned-{role}",
                 "provider": "opencode-go",
                 "model": "test-model",
                 "toolsets": ["terminal", "file"],
@@ -251,9 +259,9 @@ class TestBuildPoolMember:
 class TestRunProvision:
     def test_dry_run_all_roles_passes(self, registry_path):
         result = run_provision(registry_path, apply_mode=False)
-        assert result.roles_resolved == 4
+        assert result.roles_resolved == 5
         assert result.roles_failed == 0
-        assert len(result.members) == 4
+        assert len(result.members) == 5
         assert result.credential_guard_ok is True
 
     def test_dry_run_verifies_spawned_profiles(self, registry_path):
@@ -288,8 +296,8 @@ class TestRunProvision:
         result = run_provision(registry_path, apply_mode=True)
         captured = capsys.readouterr()
         assert "DEN_MCP_UPSERT" in captured.out
-        # Should have 4 JSON payloads (one per live role)
-        assert captured.out.count("DEN_MCP_UPSERT") == 4
+        # Should have 5 JSON payloads (one per live role/lane)
+        assert captured.out.count("DEN_MCP_UPSERT") == 5
 
 
 # ---------------------------------------------------------------------------
@@ -310,6 +318,8 @@ class TestFormatMatrix:
         assert "pool-validator-01" in matrix
         assert "pool-drift-checker-01" in matrix
         assert "pool-packet-auditor-01" in matrix
+        assert "project_orchestrator" in matrix
+        assert "pool-orchestrator-01" in matrix
 
     def test_matrix_reports_errors(self, registry_path):
         # Force an error by passing an empty roles list

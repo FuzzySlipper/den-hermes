@@ -7,7 +7,7 @@ from typing import Any, Callable, Iterable, Sequence
 
 from den_hermes.runtime_registry import CANONICAL_ROLES, SECRETISH_PATTERN, RuntimeRegistryError, resolve_role_runtime
 
-DEFAULT_ROLE_ORDER = ["coder", "reviewer", "validator", "drift_checker", "packet_auditor"]
+DEFAULT_ROLE_ORDER = ["coder", "reviewer", "validator", "drift_checker", "packet_auditor", "project_orchestrator"]
 
 
 def _redact(text: Any) -> str:

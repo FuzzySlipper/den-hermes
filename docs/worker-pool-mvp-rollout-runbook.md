@@ -25,6 +25,7 @@ This document covers:
 |- First-real-task checklist (Section 11).
 |- Operator troubleshooting (Section 12).
 |- Reconciling stale active assignments (Section 13).
+|- Project-duration orchestrator pool leases (Section 14).
 
 ## 2. Substrate selection guide
 
@@ -1212,6 +1213,58 @@ When running the first real non-noop task through the worker-pool workflow:
 - Lobby presence: #1771 (visible #worker-pool home channel)
 - Activity ordering: #1776 (fixed channel activity ordering)
 - This umbrella: #1778 (worker-pool post-MVP operationalization)
+
+## 14. Project-duration orchestrator pool leases
+
+Use the pooled orchestrator lane when a project/workstream needs temporary coordination attention without creating a permanent project-specific Planner/Runner pair. The lane is intentionally distinct from bounded role-worker assignments:
+
+- profile identity: `spawned-orchestrator`;
+- concrete pool member: `pool-orchestrator-01`;
+- Core role / lease kind: `project_orchestrator` / `pooled_orchestrator`;
+- capability tags: `planning`, `task-shaping`, `den-coordination`, `worker-routing`, `checkpointing`.
+
+### 14.1 Preflight before leasing
+
+1. Confirm the Core project-duration lease APIs from den-core #1811 are deployed. Do **not** fake this with an ordinary task-worker assignment.
+2. Read the target project/task/docs/messages and write the lease objective, scope, explicit non-scope, wake policy, checkpoint cadence, expiry, and release condition.
+3. Verify three separate surfaces:
+   - Channels membership in the target project/channel with intentional wake policy (`mentions_only` by default);
+   - Gateway/Core binding for `spawned-orchestrator` / `pool-orchestrator-01`;
+   - Core pool member status `available` for `worker_role=project_orchestrator`.
+4. Verify the runtime registry resolves `project_orchestrator` to `spawned-orchestrator` and does not pass hidden `--yolo`, provider, model, or toolset overrides in persistent pool mode.
+
+### 14.2 Lease / kickoff
+
+1. Create a Core project-duration orchestrator lease, not an ordinary bounded `lease_worker` task assignment. Required fields should include `lease_kind=project_orchestrator`, `scope_type`, `project_id`, optional `channel_id`/`task_id`/workstream handle, objective, lease owner, duration/expiry, renewal/drain policy, pool member/profile/agent-instance ids, and wake/checkpoint cadence.
+2. Join or activate `spawned-orchestrator` in the target project/channel for the lease window. Membership is presence; it is not itself the lease.
+3. Post a kickoff checkpoint in the project channel/task thread with objective, scope, expiry, wake policy, source docs/tasks read, first handoff targets, and next checkpoint time.
+4. If the kickoff cannot prove lease + binding + membership, mark the lease `degraded` or `blocked` and stop before routing real work.
+
+### 14.3 During the lease
+
+- Shape tasks, split/link dependencies, write durable handoffs, and route coder/reviewer/validator/drift/audit work through Den.
+- Keep project facts in Den docs/tasks/messages/checkpoints; the profile keeps zero long-term/local memory.
+- Post scheduled checkpoints with progress, open decisions, worker routes, and release/renewal posture.
+- Ask Patch only for material product/architecture/safety decisions, not routine queue movement.
+- Do not perform substantial implementation/review/validation directly as the orchestrator.
+
+### 14.4 Renew / drain / release
+
+- **Renew** only when the project still needs temporary coordination. Record the new expiry, objective delta, and checkpoint cadence in Core and the project channel.
+- **Drain** when active handoffs are in flight but no new project-shaping work should start. Post the handoff list, unresolved blockers, and proposed release time.
+- **Release** when the lease objective is satisfied or the project no longer needs the pool. Record cleanup/release evidence, deactivate/leave lease-specific channel membership as appropriate, and set the pool member back to available.
+- **Quarantine/degrade** if profile auth/config drift, stale binding, or failed cleanup means the lane is not safely reusable.
+
+### 14.5 Smoke checklist
+
+A no-risk smoke should prove more than local process startup:
+
+- `spawned-orchestrator` profile exists with `SOUL.md`, zero-memory posture, and `approvals.mode=off`.
+- `hermes-gateway@spawned-orchestrator.service` is active and logs `✓ den_channels connected`.
+- Channels membership and Core binding read back as active for the smoke project/channel.
+- Pool member `pool-orchestrator-01` reads back with role `project_orchestrator` and expected capabilities.
+- Direct Channels smoke receives a visible `gateway_delivery` reply from `spawned-orchestrator`.
+- After #1811 deploys, a real Core project-duration lease kickoff/checkpoint/release cycle reads back distinctly from membership and binding.
 
 ## Appendix C: Downstream notes for task #1739
 

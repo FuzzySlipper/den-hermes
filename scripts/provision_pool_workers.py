@@ -4,9 +4,9 @@
 Reads and validates the central runtime registry at
 ``/home/agents/runtime/spawned-hermes-runtimes.yaml`` (or a supplied
 ``--registry`` path), then produces a pool-member registration matrix
-for the four live roles:
+for the live role-worker lanes plus the pooled project-orchestrator lane:
 
-    reviewer, validator, drift_checker, packet_auditor
+    reviewer, validator, drift_checker, packet_auditor, project_orchestrator
 
 The script:
 
@@ -58,7 +58,7 @@ except ImportError:
 # Constants
 # ---------------------------------------------------------------------------
 
-LIVE_ROLES = ("reviewer", "validator", "drift_checker", "packet_auditor")
+LIVE_ROLES = ("reviewer", "validator", "drift_checker", "packet_auditor", "project_orchestrator")
 
 # Spawned profile prefix — all live roles must use this prefix.
 SPAWNED_PROFILE_PREFIX = "spawned-"
@@ -89,6 +89,7 @@ POOL_MEMBER_PREFIXES: dict[str, str] = {
     "validator": "pool-validator",
     "drift_checker": "pool-drift-checker",
     "packet_auditor": "pool-packet-auditor",
+    "project_orchestrator": "pool-orchestrator",
 }
 
 # Capability tags from the role catalog.
@@ -98,6 +99,7 @@ ROLE_CAPABILITIES: dict[str, list[str]] = {
     "validator": ["validation", "test_verification"],
     "drift_checker": ["drift_detection", "consistency_check"],
     "packet_auditor": ["audit", "packet_verification"],
+    "project_orchestrator": ["planning", "task-shaping", "den-coordination", "worker-routing", "checkpointing"],
 }
 
 

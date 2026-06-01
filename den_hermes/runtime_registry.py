@@ -11,7 +11,7 @@ from typing import Any, Mapping
 import yaml
 
 
-CANONICAL_ROLES = frozenset({"coder", "reviewer", "validator", "drift_checker", "packet_auditor"})
+CANONICAL_ROLES = frozenset({"coder", "reviewer", "validator", "drift_checker", "packet_auditor", "project_orchestrator"})
 SECRETISH_PATTERN = re.compile(r"(?i)(sk-[a-z0-9_-]{8,}|api[_-]?key|auth[_-]?token|secret|bearer\s+)")
 DEFAULT_PREFLIGHT_PROMPT = "Reply with exactly: PROFILE_OK"
 DEFAULT_PREFLIGHT_EXPECTED = "PROFILE_OK"

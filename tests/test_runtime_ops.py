@@ -27,7 +27,7 @@ def test_validate_runtime_registry_reports_all_required_roles():
     result = validate_runtime_registry(SAMPLE_REGISTRY)
 
     assert result["ok"] is True
-    assert result["roles"] == ["coder", "reviewer", "validator", "drift_checker", "packet_auditor"]
+    assert result["roles"] == ["coder", "reviewer", "validator", "drift_checker", "packet_auditor", "project_orchestrator"]
     assert result["registry_id"] == "den-hermes-runner-defaults"
 
 
