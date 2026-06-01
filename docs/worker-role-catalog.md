@@ -197,6 +197,8 @@ code quality — only packet integrity.
 
 **Contract**: A project orchestrator is leased to a project, channel, task tree, or workstream for a bounded window. It shapes work, links dependencies, posts durable handoffs/checkpoints, and routes bounded coder/reviewer/validator/drift/audit work through Den. It is not a permanent project Planner/Runner and not a code implementation workhorse. Channel membership proves presence, Gateway/Core binding proves reachability, and the Core project-duration lease proves responsibility.
 
+**Live smoke reference**: #1812 verified `spawned-orchestrator` / `pool-orchestrator-01` with a real Core lease lifecycle (`project_orchestrator` lease create/read/active/release/cleanup) and a leased Den Channels handoff reply (`SPAWNED-ORCHESTRATOR-HANDOFF-OK`, gateway delivery `943`) without taking implementation work. See `docs/worker-pool-mvp-rollout-runbook.md` §14.6 for handles and cleanup evidence.
+
 ### 3.7 Scout
 
 | Field | Value |

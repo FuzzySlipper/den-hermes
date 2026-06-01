@@ -1264,7 +1264,36 @@ A no-risk smoke should prove more than local process startup:
 - Channels membership and Core binding read back as active for the smoke project/channel.
 - Pool member `pool-orchestrator-01` reads back with role `project_orchestrator` and expected capabilities.
 - Direct Channels smoke receives a visible `gateway_delivery` reply from `spawned-orchestrator`.
-- After #1811 deploys, a real Core project-duration lease kickoff/checkpoint/release cycle reads back distinctly from membership and binding.
+- A real Core project-duration lease create/read/activate/release/cleanup cycle reads back distinctly from membership and binding.
+- A leased direct handoff smoke produces a Den-visible kickoff/handoff response and does not take on implementation/review/validation work.
+
+### 14.6 Live smoke evidence from #1812
+
+Final #1812 verification after den-core #1811 deployed used the live Core facade at `http://192.168.1.10:18080/den-core-api`.
+
+Source and runtime evidence:
+
+- den-core live health after deploy: commit `c18dc36c4180`.
+- Deploy backup path: `/data/services/den-core/app.previous.20260601T110052Z`.
+- Focused server route tests on den-srv before deploy: `dotnet test tests/DenMcp.Server.Tests/DenMcp.Server.Tests.csproj --filter OrchestratorLease --logger "console;verbosity=minimal"` → 4/4 passed.
+- Project-orchestrator member readback: `pool-orchestrator-01`, `profile_identity=spawned-orchestrator`, `worker_role=project_orchestrator`, `status=available`, `agent_instance_id=den-k8plus:spawned-orchestrator:project_orchestrator:gateway`, channel `5`.
+
+Lease lifecycle smoke:
+
+- Lease run: `lease-smoke-1812-f40fc2d001bf`.
+- Public lease id: `pool-orchestrator-01:den-hermes-bridge:d8252d4ff8a240d8a9460e0c309f3b3a`.
+- API steps passed: create `201`, read by id `200`, read by public lease id `200`, residency while leased/active shows `residency_kind=orchestrator_lease`, transition to `active`, list active, transition to `released`, cleanup evidence recorded, final residency shows the pool member back as a `gateway_binding` with `state=available`.
+- Local artifact: `/tmp/lease-smoke-1812-nc1bpjls/smoke.json`.
+
+Leased handoff smoke:
+
+- Lease run: `lease-handoff-smoke-1812-61d90504b3`.
+- Public lease id: `pool-orchestrator-01:den-hermes-bridge:f28c53f67c5549f89f97bcc5d8cb857c`.
+- Direct request message: Channels message `1823`.
+- Final spawned-orchestrator reply: Channels message `1824`, gateway delivery `943`, containing `SPAWNED-ORCHESTRATOR-HANDOFF-OK` and explicitly stating no implementation work was taken on.
+- Release/cleanup artifact: `/tmp/lease-handoff-1812-3-release.json`; final lease state `released` with cleanup evidence recorded.
+
+Operational note: an earlier handoff attempt (`lease-handoff-smoke-1812-b28dc41540`, messages `1820`/`1821`) stalled while confirming Den state after a Core MCP reconnect; the lease was released with cleanup evidence and the spawned-orchestrator gateway was restarted before the successful final handoff smoke.
 
 ## Appendix C: Downstream notes for task #1739
 
