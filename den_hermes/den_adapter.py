@@ -114,7 +114,22 @@ class DenMcpAdapter:
         _ensure_completion_packet_accepted(response, run_id=run_id, role=role)
         return response
 
-    def mark_worker_failed(self, *, task_id: int, run_id: str, role: str, error: str) -> Any:
+    def mark_worker_failed(
+        self,
+        *,
+        task_id: int,
+        run_id: str,
+        role: str,
+        error: str,
+        failure_category: str = "spawned_hermes_worker_failed",
+        recovery_guidance: str | None = None,
+        dedupe_key: str | None = None,
+    ) -> Any:
+        if recovery_guidance is None:
+            recovery_guidance = (
+                "Inspect spawned-Hermes stdout/stderr and completion artifact path, "
+                "then rerun or abort the local worker."
+            )
         response = self.tools.mcp_den_post_worker_completion_packet(
             project_id=self.project_id,
             run_id=run_id,
@@ -123,12 +138,9 @@ class DenMcpAdapter:
             role=role,
             packet_type="worker_failure_packet",
             summary=error,
-            failure_category="spawned_hermes_worker_failed",
-            recovery_guidance=(
-                "Inspect spawned-Hermes stdout/stderr and completion artifact path, "
-                "then rerun or abort the local worker."
-            ),
-            dedupe_key=f"{run_id}:failed",
+            failure_category=failure_category,
+            recovery_guidance=recovery_guidance,
+            dedupe_key=dedupe_key or f"{run_id}:failed",
         )
         _ensure_completion_packet_accepted(response, run_id=run_id, role=role)
         return response

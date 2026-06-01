@@ -460,15 +460,18 @@ def test_tracked_coder_path_missing_artifact_posts_failure_and_skips_completion(
 
     assert result.status == "failed"
     assert "Missing completion artifact" in result.error
-    assert [name for name, _ in tools.calls] == [
+    call_names = [name for name, _ in tools.calls]
+    assert call_names == [
         "prepare_coder_context_packet",
         "register_worker_run",
         "send_message",
         "post_worker_completion_packet",
+        "post_worker_completion_packet",  # budget-exhaustion backstop
     ]
     failure_packet = tools.calls[-1][1]
     assert failure_packet["packet_type"] == "worker_failure_packet"
     assert failure_packet["status"] == "failed"
+    assert "budget exhausted" in failure_packet["summary"].lower()
 
 
 def test_tracked_coder_path_git_mismatch_posts_failure_before_completion(tmp_path):
@@ -1086,6 +1089,7 @@ def test_coder_failure_with_assignment_finalizes_lifecycle(tmp_path):
         "append_checkpoint",
         "record_cleanup_evidence",
         "release_assignment",
+        "post_worker_completion_packet",  # budget-exhaustion backstop
     ]
 
     ckpt_call = [c for c in tools.calls if c[0] == "append_checkpoint"][0]

@@ -20,6 +20,11 @@ from den_hermes.work_complete_notifier import (
     _final_status_for_action,
     emit_work_complete_notification,
 )
+from den_hermes.budget_exhaustion_observer import (
+    BudgetExhaustionDeduper,
+    detect_budget_exhaustion,
+    emit_budget_exhaustion_signal,
+)
 
 
 class OrchestratorActionType(str, Enum):
@@ -395,7 +400,22 @@ class DenWorkflowAdapter:
         _ensure_den_did_not_reject(payload, context=f"worker completion for {run_id}")
         return payload
 
-    def mark_worker_failed(self, *, task_id: int, run_id: str, role: str, error: str) -> Mapping[str, Any]:
+    def mark_worker_failed(
+        self,
+        *,
+        task_id: int,
+        run_id: str,
+        role: str,
+        error: str,
+        failure_category: str = "spawned_hermes_orchestrator_worker_failed",
+        recovery_guidance: str | None = None,
+        dedupe_key: str | None = None,
+    ) -> Mapping[str, Any]:
+        if recovery_guidance is None:
+            recovery_guidance = (
+                "Inspect orchestrator state, spawned-Hermes logs, and completion "
+                "artifact evidence before retry."
+            )
         response = self.tools.mcp_den_post_worker_completion_packet(
             project_id=self.project_id,
             run_id=run_id,
@@ -404,9 +424,9 @@ class DenWorkflowAdapter:
             role=role,
             packet_type="worker_failure_packet",
             summary=error,
-            failure_category="spawned_hermes_orchestrator_worker_failed",
-            recovery_guidance="Inspect orchestrator state, spawned-Hermes logs, and completion artifact evidence before retry.",
-            dedupe_key=f"{run_id}:failed",
+            failure_category=failure_category,
+            recovery_guidance=recovery_guidance,
+            dedupe_key=dedupe_key or f"{run_id}:failed",
         )
         return _coerce_mapping_response(response)
 
@@ -605,6 +625,63 @@ def decide_next_action(adapter: DenWorkflowAdapter, *, task_id: int, max_attempt
         role=_role_for_action(action_type),
         details=details,
     )
+
+
+# ---------------------------------------------------------------------------
+# Budget-exhaustion backstop helper
+# ---------------------------------------------------------------------------
+
+# Module-level deduper to prevent repeated budget-exhaustion signals for the
+# same (project_id, task_id, run_id) across multiple drain cycles in one
+# bridge process.
+_budget_exhaustion_deduper = BudgetExhaustionDeduper()
+
+
+def _maybe_emit_budget_exhaustion(
+    adapter: DenWorkflowAdapter,
+    *,
+    worker_result: Any,
+    project_id: str,
+    task_id: int,
+    run_id: str,
+    role: str,
+    agent_identity: str,
+) -> None:
+    """Backstop: detect and signal budget exhaustion for a failed worker run.
+
+    This is called *after* existing failure handling (``mark_worker_failed``,
+    ``_finalize_pool_assignment``) so the standard failure signal is always
+    emitted first.  The budget-exhaustion observer adds a *second*, structured
+    failure packet specifically identifying the cause as budget exhaustion,
+    plus an optional user notification for operator roles.
+
+    Errors in the observer are logged and swallowed — this must never
+    interfere with the primary failure path.
+    """
+    try:
+        signal = detect_budget_exhaustion(
+            worker_result=worker_result,
+            project_id=project_id,
+            task_id=task_id,
+            run_id=run_id,
+            role=role,
+            agent_identity=agent_identity,
+        )
+        if signal is None:
+            return
+        emit_budget_exhaustion_signal(
+            adapter=adapter,
+            signal=signal,
+            deduper=_budget_exhaustion_deduper,
+        )
+    except Exception:
+        logger.warning(
+            "Budget-exhaustion observer failed for run %s role %s; "
+            "primary failure path continues.",
+            run_id,
+            role,
+            exc_info=True,
+        )
 
 
 def _finalize_pool_assignment(
@@ -837,6 +914,12 @@ def run_tracked_coder_path(
             adapter, assignment_id=assignment_id, run_id=run_id, role="coder",
             success=False, error=error, requires_assignment=assignment_id is not None,
         )
+        _maybe_emit_budget_exhaustion(
+            adapter, worker_result=worker,
+            project_id=adapter.project_id, task_id=task_id,
+            run_id=run_id, role="coder",
+            agent_identity=runtime.profile or "coder",
+        )
         return CoderPathResult(
             status="failed", run_id=run_id, artifact_path=artifact_path, error=error,
             assignment_finalized=assignment_id is not None,
@@ -1054,6 +1137,12 @@ def run_tracked_reviewer_path(
             adapter, assignment_id=assignment_id, run_id=run_id, role="reviewer",
             success=False, error=error, requires_assignment=assignment_id is not None,
         )
+        _maybe_emit_budget_exhaustion(
+            adapter, worker_result=worker,
+            project_id=adapter.project_id, task_id=task_id,
+            run_id=run_id, role="reviewer",
+            agent_identity=runtime.profile or "reviewer",
+        )
         return ReviewerPathResult(
             status="failed", run_id=run_id, review_request=review_request,
             artifact_path=artifact_path, error=error,
@@ -1255,6 +1344,12 @@ def run_tracked_gate_role_path(
         _finalize_pool_assignment(
             adapter, assignment_id=assignment_id, run_id=run_id, role=role,
             success=False, error=error, requires_assignment=assignment_id is not None,
+        )
+        _maybe_emit_budget_exhaustion(
+            adapter, worker_result=worker,
+            project_id=adapter.project_id, task_id=task_id,
+            run_id=run_id, role=role,
+            agent_identity=runtime.profile or role,
         )
         return GateRolePathResult(
             status="failed", run_id=run_id, role=role,

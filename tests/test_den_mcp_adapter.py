@@ -446,6 +446,37 @@ def test_den_mcp_adapter_posts_worker_completion_packets_for_completed_and_faile
     ]
 
 
+def test_den_mcp_adapter_allows_specific_worker_failure_category_and_dedupe_key():
+    tools = RecordingMcpTools()
+    adapter = make_adapter(tools)
+
+    adapter.mark_worker_failed(
+        task_id=1825,
+        run_id="operator-run",
+        role="runner",
+        error="Hermes iteration budget exhausted",
+        failure_category="tool_budget_exhausted",
+        recovery_guidance="Increase max_iterations or split scope.",
+        dedupe_key="operator-run:tool_budget_exhausted",
+    )
+
+    assert tools.calls[-1] == (
+        "post_worker_completion_packet",
+        {
+            "project_id": "den-hermes-bridge",
+            "run_id": "operator-run",
+            "requested_by": "den-hermes-runner",
+            "status": "failed",
+            "role": "runner",
+            "packet_type": "worker_failure_packet",
+            "summary": "Hermes iteration budget exhausted",
+            "failure_category": "tool_budget_exhausted",
+            "recovery_guidance": "Increase max_iterations or split scope.",
+            "dedupe_key": "operator-run:tool_budget_exhausted",
+        },
+    )
+
+
 def test_den_mcp_adapter_fails_closed_when_worker_completion_is_rejected():
     tools = RecordingMcpTools()
     tools.completion_response = {

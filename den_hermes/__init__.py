@@ -1,4 +1,12 @@
 """den-hermes bridge spike package."""
+from den_hermes.budget_exhaustion_observer import (
+    BudgetExhaustionDeduper,
+    BudgetExhaustionEmissionEvidence,
+    BudgetExhaustionSignal,
+    OPERATOR_NOTIFICATION_ROLES,
+    detect_budget_exhaustion,
+    emit_budget_exhaustion_signal,
+)
 from den_hermes.gopher import (
     DeliveryEvidence,
     EvidencePacket,
@@ -62,6 +70,9 @@ __all__ = [
     "AnalysisMode",
     "AssignmentPointer",
     "BenchmarkResult",
+    "BudgetExhaustionDeduper",
+    "BudgetExhaustionEmissionEvidence",
+    "BudgetExhaustionSignal",
     "CAPABILITY_ID",
     "CAPABILITY_VERSION",
     "CANONICAL_POLICY_DECISIONS",
@@ -84,6 +95,7 @@ __all__ = [
     "NoCapacityDecision",
     "NoCapacityDiagnostic",
     "NoCapacityRequestParams",
+    "OPERATOR_NOTIFICATION_ROLES",
     "PoolCleanupError",
     "PoolRuntimeError",
     "PoolRuntimeState",
@@ -101,6 +113,8 @@ __all__ = [
     "create_queued_request",
     "decide_from_core_record",
     "decide_no_capacity",
+    "detect_budget_exhaustion",
+    "emit_budget_exhaustion_signal",
     "execute_vision_analysis",
     "parse_model_output",
     "run_fake_analyzer",
