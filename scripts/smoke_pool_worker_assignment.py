@@ -83,7 +83,9 @@ class RoleSmokeResult:
     run_id: str
     assignment_id: str
     task_id: int
+    project_id: str
     initial_state: str
+    assignment_metadata: dict[str, Any] = field(default_factory=dict)
     acknowledged_state: str | None = None
     ack_checkpoint_type: str | None = None
     packet_type: str | None = None
@@ -140,19 +142,21 @@ def smoke_role(
 
     effective_run_id = run_id or f"t{task_id}-{role}-smoke-000000"
 
+    assignment_metadata = {
+        "smoke": True,
+        "provisioning": {
+            "source": "smoke_pool_worker_assignment.py",
+            "task_id": task_id,
+        },
+    }
+
     assignment = AssignmentPointer(
         assignment_id=f"t{task_id}-assign-{role}-smoke",
         task_id=task_id,
         run_id=effective_run_id,
         role=role,
         project_id=project_id,
-        metadata={
-            "smoke": True,
-            "provisioning": {
-                "source": "smoke_pool_worker_assignment.py",
-                "task_id": task_id,
-            },
-        },
+        metadata=assignment_metadata,
     )
 
     result = RoleSmokeResult(
@@ -161,7 +165,9 @@ def smoke_role(
         run_id=effective_run_id,
         assignment_id=assignment.assignment_id,
         task_id=task_id,
+        project_id=project_id,
         initial_state=PoolRuntimeState.PENDING.value,
+        assignment_metadata=assignment_metadata,
         packet_type=ROLE_PACKET_TYPES.get(role, f"{role}_packet"),
         capabilities=ROLE_CAPABILITY_TAGS.get(role, [role]),
         allowed_checkpoints=ROLE_CHECKPOINT_TYPES.get(role, ["assignment_ack", "blocked_needs_input"]),

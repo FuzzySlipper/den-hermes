@@ -19,11 +19,7 @@ from provision_pool_workers import (
     _emit_apply_payloads,
     build_pool_member,
 )
-from smoke_pool_worker_assignment import (
-    AssignmentPointer,
-    smoke_role,
-    RoleSmokeResult,
-)
+from smoke_pool_worker_assignment import main, smoke_role, RoleSmokeResult
 
 
 # ---------------------------------------------------------------------------
@@ -160,17 +156,47 @@ def test_smoke_role_metadata_nests_under_provisioning():
 
     assert isinstance(result, RoleSmokeResult)
     assert result.task_id == 1836
-
-    # The assignment metadata should have provisioning
-    # We reconstruct the assignment from the result to check metadata shape
-    from smoke_pool_worker_assignment import ROLE_POOL_MEMBER_PREFIXES
-
-    prefix = ROLE_POOL_MEMBER_PREFIXES.get("coder", "pool-coder")
-    pool_id = f"{prefix}-01"
-    assert result.pool_member_id == pool_id
+    assert result.project_id == "den-hermes-bridge"
+    assert result.assignment_metadata["smoke"] is True
+    assert result.assignment_metadata["provisioning"] == {
+        "source": "smoke_pool_worker_assignment.py",
+        "task_id": 1836,
+    }
+    assert "task_id" not in {
+        key: value
+        for key, value in result.assignment_metadata.items()
+        if key != "provisioning"
+    }
 
 
 def test_smoke_role_uses_cli_task_id():
     """smoke_role with explicit task_id uses that value."""
     result = smoke_role("reviewer", task_id=9999, project_id="den-core")
     assert result.task_id == 9999
+    assert result.project_id == "den-core"
+    assert result.assignment_metadata["provisioning"]["task_id"] == 9999
+
+
+def test_smoke_cli_accepts_task_and_project_args(capsys):
+    """CLI exposes task/project args and propagates them into JSON output."""
+    exit_code = main([
+        "--roles",
+        "validator",
+        "--task-id",
+        "1836",
+        "--project-id",
+        "den-core",
+        "--json",
+    ])
+    captured = capsys.readouterr()
+    parsed = json.loads(captured.out)
+
+    assert exit_code == 0
+    assert parsed["roles_passed"] == 1
+    result = parsed["results"][0]
+    assert result["task_id"] == 1836
+    assert result["project_id"] == "den-core"
+    assert result["assignment_metadata"]["provisioning"] == {
+        "source": "smoke_pool_worker_assignment.py",
+        "task_id": 1836,
+    }
