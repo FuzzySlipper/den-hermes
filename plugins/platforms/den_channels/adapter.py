@@ -602,6 +602,18 @@ class DenChannelsAdapter(BasePlatformAdapter):
             or os.getenv("DEN_CHANNELS_ADAPTER_INSTANCE_ID")
             or f"{socket.gethostname()}:{self.profile}:{self.role}:gateway"
         )
+        self.pool_member_id = str(
+            extra.get("pool_member_id")
+            or os.getenv("DEN_HERMES_POOL_MEMBER_ID")
+            or ""
+        ).strip() or None
+        self.agent_instance_id = str(
+            extra.get("agent_instance_id")
+            or os.getenv("DEN_HERMES_AGENT_INSTANCE_ID")
+            or os.getenv("DEN_CHANNELS_AGENT_INSTANCE_ID")
+            or (self.adapter_instance_id if self.pool_member_id else "")
+            or ""
+        ).strip() or None
         self.claim_interval_seconds = float(extra.get("claim_interval_seconds") or 2.0)
         self.claim_limit = max(1, _coerce_int(extra.get("claim_limit")) or 1)
         self.lease_seconds = max(1, _coerce_int(extra.get("lease_seconds")) or 300)
@@ -957,6 +969,41 @@ class DenChannelsAdapter(BasePlatformAdapter):
             "threadId": _coerce_int(_first(context.raw_delivery, "thread_id", "threadId")),
             "anchorMessageId": context.trigger_message_id,
         }
+        # Pool member identity for concrete slot targeting.
+        if self.pool_member_id:
+            payload["poolMemberId"] = self.pool_member_id
+        # Profile identity distinguishes the concrete adapter instance from
+        # the generic profile name (useful when multiple pool members share a
+        # single spawned-coder profile but have distinct slot identities).
+        payload["profileIdentity"] = self.profile
+        if self.agent_instance_id:
+            payload["agentInstanceId"] = self.agent_instance_id
+        # Merge the parsed metadata dict so target-work fields nested inside
+        # delivery metadata_json are visible alongside top-level delivery keys.
+        raw_meta = context.raw_delivery.get("metadata")
+        merged_source: dict[str, Any] = dict(context.raw_delivery)
+        if isinstance(raw_meta, dict):
+            for key, value in raw_meta.items():
+                if key not in merged_source or merged_source[key] is None:
+                    merged_source[key] = value
+        # Forward delivery target-work metadata so the worker-visible activity
+        # context can report concrete slot identity and target work.
+        for src_key, dst_key in (
+            ("pool_member_id", "poolMemberId"),
+            ("poolMemberId", "poolMemberId"),
+            ("agent_instance_id", "agentInstanceId"),
+            ("agentInstanceId", "agentInstanceId"),
+            ("worker_run_id", "workerRunId"),
+            ("workerRunId", "workerRunId"),
+            ("worker_role", "workerRole"),
+            ("workerRole", "workerRole"),
+            ("assignment_id", "assignmentId"),
+            ("targetAssignmentId", "assignmentId"),
+            ("target_assignment_id", "assignmentId"),
+        ):
+            value = _first(merged_source, src_key)
+            if value is not None:
+                payload[dst_key] = value
         if context.conversation_lane_id is not None:
             payload["conversationLaneId"] = context.conversation_lane_id
         _ACTIVITY_CONTEXT_VAR.set(payload)
@@ -989,7 +1036,7 @@ class DenChannelsAdapter(BasePlatformAdapter):
             ],
             "safe_pending_notifications": "status_only_no_mid_generation_injection",
         }
-        return {
+        binding: dict[str, Any] = {
             "adapter_kind": "hermes_profile",
             "adapter_instance_id": self.adapter_instance_id,
             "agent_identity": self.agent_identity,
@@ -999,6 +1046,11 @@ class DenChannelsAdapter(BasePlatformAdapter):
             "status": "active",
             "capabilities_json": json.dumps(capabilities, sort_keys=True),
         }
+        if self.pool_member_id:
+            binding["pool_member_id"] = self.pool_member_id
+        if self.agent_instance_id:
+            binding["agent_instance_id"] = self.agent_instance_id
+        return binding
 
     def _claim_payload(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -1012,6 +1064,10 @@ class DenChannelsAdapter(BasePlatformAdapter):
         }
         if self.project_id:
             payload["project_id"] = self.project_id
+        if self.pool_member_id:
+            payload["pool_member_id"] = self.pool_member_id
+        if self.agent_instance_id:
+            payload["agent_instance_id"] = self.agent_instance_id
         return payload
 
     async def _claim_loop(self) -> None:

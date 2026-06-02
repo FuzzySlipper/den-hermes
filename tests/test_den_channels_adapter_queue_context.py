@@ -1074,3 +1074,298 @@ def test_direct_agent_message_tool_schema_has_no_sourceKind_gateway_delivery() -
     assert schema["parameters"]["properties"]["member_identity"]["type"] == "string"
     assert "member_identity" in schema["parameters"].get("required", [])
     assert "parameters" in schema
+
+
+# ---------------------------------------------------------------------------
+# Pool-member-aware binding / claim / activity tests (#1876)
+# ---------------------------------------------------------------------------
+
+def _adapter_with_pool_member(
+    gateway: FakeGatewayClient,
+    channels: FakeChannelsClient,
+    *,
+    pool_member_id: str = "pool-coder-02",
+) -> DenChannelsAdapter:
+    """Build an adapter configured with a concrete pool member identity."""
+    return DenChannelsAdapter(
+        PlatformConfig(
+            enabled=True,
+            token="***",
+            extra={
+                "gateway_url": "http://192.168.1.10:18080",
+                "channels_url": "http://192.168.1.10:18080",
+                "project_id": "den-hermes-bridge",
+                "agent_identity": "spawned-coder",
+                "role": "coder",
+                "profile": "spawned-coder",
+                "adapter_instance_id": "hermes:den-k8:spawned-coder:pool-coder-02:live",
+                "pool_member_id": pool_member_id,
+                "start_claim_loop": False,
+                "token": "test-token",
+            },
+        ),
+        gateway_client=gateway,
+        channels_client=channels,
+    )
+
+
+@pytest.mark.asyncio
+async def test_binding_payload_includes_pool_member_id_when_configured() -> None:
+    """Adapter binding must advertise pool_member_id when configured."""
+    gateway = FakeGatewayClient()
+    channels = FakeChannelsClient()
+    adapter = _adapter_with_pool_member(gateway, channels)
+
+    assert await adapter.connect() is True
+    binding = gateway.bindings[-1]
+
+    assert binding["pool_member_id"] == "pool-coder-02"
+    assert binding["agent_instance_id"] == "hermes:den-k8:spawned-coder:pool-coder-02:live"
+    assert binding["adapter_instance_id"] == "hermes:den-k8:spawned-coder:pool-coder-02:live"
+    assert binding["agent_identity"] == "spawned-coder"
+    assert binding["profile"] == "spawned-coder"
+
+
+@pytest.mark.asyncio
+async def test_binding_payload_omits_pool_member_id_when_not_configured(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Generic spawned-coder binding must not include pool_member_id."""
+    monkeypatch.delenv("DEN_HERMES_POOL_MEMBER_ID", raising=False)
+    gateway = FakeGatewayClient()
+    channels = FakeChannelsClient()
+    adapter = _adapter(gateway, channels)
+
+    assert await adapter.connect() is True
+    binding = gateway.bindings[-1]
+
+    assert "pool_member_id" not in binding
+    assert "agent_instance_id" not in binding
+    assert binding["adapter_instance_id"] == "test-host:den-mcp-runner:runner:gateway"
+
+
+@pytest.mark.asyncio
+async def test_claim_payload_includes_pool_member_id_when_configured() -> None:
+    """Claim payload must include pool_member_id for concrete slot targeting."""
+    gateway = FakeGatewayClient()
+    channels = FakeChannelsClient()
+    adapter = _adapter_with_pool_member(gateway, channels)
+
+    payload = adapter._claim_payload()
+
+    assert payload["pool_member_id"] == "pool-coder-02"
+    assert payload["agent_instance_id"] == "hermes:den-k8:spawned-coder:pool-coder-02:live"
+    assert payload["adapter_instance_id"] == "hermes:den-k8:spawned-coder:pool-coder-02:live"
+    assert payload["agent_identity"] == "spawned-coder"
+
+
+@pytest.mark.asyncio
+async def test_claim_payload_omits_pool_member_id_when_not_configured(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Generic adapter claim must not include pool_member_id."""
+    monkeypatch.delenv("DEN_HERMES_POOL_MEMBER_ID", raising=False)
+    gateway = FakeGatewayClient()
+    channels = FakeChannelsClient()
+    adapter = _adapter(gateway, channels)
+
+    payload = adapter._claim_payload()
+
+    assert "pool_member_id" not in payload
+    assert "agent_instance_id" not in payload
+
+
+@pytest.mark.asyncio
+async def test_pool_member_id_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """pool_member_id must be readable from DEN_HERMES_POOL_MEMBER_ID env."""
+    monkeypatch.setenv("DEN_HERMES_POOL_MEMBER_ID", "pool-coder-03")
+    gateway = FakeGatewayClient()
+    channels = FakeChannelsClient()
+    adapter = DenChannelsAdapter(
+        PlatformConfig(
+            enabled=True,
+            token="***",
+            extra={
+                "gateway_url": "http://192.168.1.10:18080",
+                "channels_url": "http://192.168.1.10:18080",
+                "project_id": "den-hermes-bridge",
+                "agent_identity": "spawned-coder",
+                "role": "coder",
+                "profile": "spawned-coder",
+                "start_claim_loop": False,
+                "token": "test-token",
+            },
+        ),
+        gateway_client=gateway,
+        channels_client=channels,
+    )
+
+    assert adapter.pool_member_id == "pool-coder-03"
+
+    binding = adapter._binding_payload()
+    assert binding["pool_member_id"] == "pool-coder-03"
+    assert binding["agent_instance_id"].endswith(":spawned-coder:coder:gateway")
+
+    claim = adapter._claim_payload()
+    assert claim["pool_member_id"] == "pool-coder-03"
+    assert claim["agent_instance_id"] == binding["agent_instance_id"]
+
+
+@pytest.mark.asyncio
+async def test_activity_environment_includes_pool_member_id() -> None:
+    """Activity context must preserve poolMemberId for concrete slot targeting."""
+    gateway = FakeGatewayClient()
+    channels = FakeChannelsClient()
+    channels.messages = {
+        120: {"id": 120, "channelId": 42, "senderIdentity": "runner", "body": "work please"},
+    }
+    adapter = _adapter_with_pool_member(gateway, channels)
+    event = await adapter.delivery_to_event({
+        **_delivery(801, 120, attempt_id=1001),
+        "task_id": 1876,
+    })
+
+    await adapter.on_processing_start(event)
+    context = _adapter_module._activity_context()
+
+    assert context["poolMemberId"] == "pool-coder-02"
+    assert context["agentInstanceId"] == "hermes:den-k8:spawned-coder:pool-coder-02:live"
+    assert context["profileIdentity"] == "spawned-coder"
+    assert context["taskId"] == 1876
+    assert context["channelId"] == 42
+
+    await adapter.on_processing_complete(event, _adapter_module.ProcessingOutcome.FAILURE)
+    assert _adapter_module._activity_context() == {}
+
+
+@pytest.mark.asyncio
+async def test_activity_environment_omits_pool_member_id_when_not_configured(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Activity context must not include poolMemberId when no pool member is configured."""
+    monkeypatch.delenv("DEN_HERMES_POOL_MEMBER_ID", raising=False)
+    gateway = FakeGatewayClient()
+    channels = FakeChannelsClient()
+    channels.messages = {
+        121: {"id": 121, "channelId": 42, "senderIdentity": "runner", "body": "generic work"},
+    }
+    adapter = _adapter(gateway, channels)
+    event = await adapter.delivery_to_event(_delivery(802, 121, attempt_id=1002))
+
+    await adapter.on_processing_start(event)
+    context = _adapter_module._activity_context()
+
+    assert "poolMemberId" not in context
+    assert "agentInstanceId" not in context
+    # profileIdentity should still be set
+    assert context["profileIdentity"] == "den-mcp-runner"
+
+    await adapter.on_processing_complete(event, _adapter_module.ProcessingOutcome.FAILURE)
+
+
+@pytest.mark.asyncio
+async def test_activity_environment_preserves_target_work_metadata() -> None:
+    """Activity context must forward worker run/role/assignment from delivery metadata."""
+    gateway = FakeGatewayClient()
+    channels = FakeChannelsClient()
+    channels.messages = {
+        122: {"id": 122, "channelId": 42, "senderIdentity": "runner", "body": "targeted work"},
+    }
+    adapter = _adapter(gateway, channels)
+    event = await adapter.delivery_to_event({
+        **_delivery(803, 122, attempt_id=1003),
+        "task_id": 1876,
+        "worker_run_id": "dc-1876-20260602-coder",
+        "worker_role": "coder",
+        "assignment_id": 99,
+        "pool_member_id": "pool-coder-02",
+        "agent_instance_id": "hermes:den-k8:spawned-coder:pool-coder-02:live",
+    })
+
+    await adapter.on_processing_start(event)
+    context = _adapter_module._activity_context()
+
+    assert context["poolMemberId"] == "pool-coder-02"
+    assert context["agentInstanceId"] == "hermes:den-k8:spawned-coder:pool-coder-02:live"
+    assert context["workerRunId"] == "dc-1876-20260602-coder"
+    assert context["workerRole"] == "coder"
+    assert context["assignmentId"] == 99
+    assert context["taskId"] == 1876
+
+    await adapter.on_processing_complete(event, _adapter_module.ProcessingOutcome.FAILURE)
+
+
+@pytest.mark.asyncio
+async def test_activity_environment_preserves_target_work_from_metadata_json() -> None:
+    """Activity context must pick up worker metadata from nested metadata_json."""
+    gateway = FakeGatewayClient()
+    channels = FakeChannelsClient()
+    channels.messages = {
+        123: {"id": 123, "channelId": 42, "senderIdentity": "runner", "body": "nested meta"},
+    }
+    adapter = _adapter(gateway, channels)
+    event = await adapter.delivery_to_event({
+        **_delivery(804, 123, attempt_id=1004),
+        "metadata_json": json.dumps({
+            "channel_id": 42,
+            "channel_slug": "direct-agent-messages",
+            "workerRunId": "dc-1876-meta-run",
+            "workerRole": "reviewer",
+            "poolMemberId": "pool-reviewer-01",
+            "agentInstanceId": "hermes:den-k8:spawned-reviewer:pool-reviewer-01:live",
+            "targetAssignmentId": 42,
+        }),
+    })
+
+    await adapter.on_processing_start(event)
+    context = _adapter_module._activity_context()
+
+    assert context["poolMemberId"] == "pool-reviewer-01"
+    assert context["agentInstanceId"] == "hermes:den-k8:spawned-reviewer:pool-reviewer-01:live"
+    assert context["workerRunId"] == "dc-1876-meta-run"
+    assert context["workerRole"] == "reviewer"
+    assert context["assignmentId"] == 42
+
+    await adapter.on_processing_complete(event, _adapter_module.ProcessingOutcome.FAILURE)
+
+
+@pytest.mark.asyncio
+async def test_pool_member_adapter_full_flow_end_to_end() -> None:
+    """Pool-member-aware adapter must complete a full delivery -> send -> complete flow."""
+    gateway = FakeGatewayClient()
+    channels = FakeChannelsClient()
+    channels.messages = {
+        130: {"id": 130, "channelId": 42, "senderIdentity": "runner", "body": "pool task"},
+    }
+    adapter = _adapter_with_pool_member(gateway, channels)
+
+    assert await adapter.connect() is True
+
+    # Verify binding
+    binding = gateway.bindings[-1]
+    assert binding["pool_member_id"] == "pool-coder-02"
+    assert binding["agent_instance_id"] == "hermes:den-k8:spawned-coder:pool-coder-02:live"
+
+    # Process a delivery
+    event = await adapter.delivery_to_event({
+        **_delivery(900, 130, attempt_id=1100),
+        "task_id": 1876,
+        "worker_run_id": "dc-1876-20260602-coder",
+        "worker_role": "coder",
+        "assignment_id": 99,
+    })
+    await adapter.on_processing_start(event)
+
+    # Verify activity context has concrete identity
+    activity = _adapter_module._activity_context()
+    assert activity["poolMemberId"] == "pool-coder-02"
+    assert activity["agentInstanceId"] == "hermes:den-k8:spawned-coder:pool-coder-02:live"
+    assert activity["workerRunId"] == "dc-1876-20260602-coder"
+    assert activity["workerRole"] == "coder"
+    assert activity["assignmentId"] == 99
+
+    # Send final reply
+    result = await adapter.send(
+        event.source.chat_id,
+        "Pool-aware coder completed the task.",
+        metadata={"delivery_request_id": 900, "notify": True},
+    )
+
+    assert result.success is True
+    assert len(gateway.completed) == 1
+    assert gateway.completed[0][0] == 900
+    assert gateway.completed[0][1]["adapter_instance_id"] == "hermes:den-k8:spawned-coder:pool-coder-02:live"
