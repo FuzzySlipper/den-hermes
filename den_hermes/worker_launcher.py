@@ -83,6 +83,12 @@ def run_hermes_worker(
     )
     if project_id:
         env["DEN_PROJECT_ID"] = project_id
+    # Target project attribution (#1847): when the worker is doing work for a
+    # project other than the runtime/bridge project, pass the target project
+    # separately so the worker can attribute work correctly.
+    target_project_id = (env_overrides or {}).get("DEN_TARGET_PROJECT_ID") if env_overrides else None
+    if target_project_id:
+        env["DEN_TARGET_PROJECT_ID"] = target_project_id
     if activity_context:
         child_context = dict(activity_context)
         child_context["workerRunId"] = run_id

@@ -699,16 +699,29 @@ def _build_delivery_envelope(delivery: Mapping[str, Any], *, binding: Mapping[st
 
 
 def _reply_metadata(delivery: Mapping[str, Any], *, run_id: str | None) -> dict[str, Any]:
-    return {
+    target = _mapping(delivery.get("target"), "target")
+    source = _mapping(delivery.get("source"), "source")
+    metadata: dict[str, Any] = {
         "type": "den_channel_reply",
         "delivery_request_id": _required_int(delivery, "delivery_request_id"),
         "attempt_id": _optional_int(delivery.get("attempt_id")),
         "dedupe_key": _required_str(delivery, "dedupe_key"),
         "correlation_id": _optional_str(delivery.get("correlation_id")),
         "run_id": run_id,
-        "source": _sanitize_mapping(_mapping(delivery.get("source", {}), "source")),
-        "target": _sanitize_mapping(_mapping(delivery.get("target", {}), "target")),
+        "source": _sanitize_mapping(source),
+        "target": _sanitize_mapping(target),
     }
+    # Target-vs-runtime attribution (#1847): carry both target project
+    # (the work owner) and runtime project (the bridge) in metadata when
+    # they differ. The bridge is the sender, but the work belongs to the
+    # target project identified in the delivery.
+    target_project_id = _optional_str(target.get("project_id"))
+    if target_project_id:
+        metadata["target_project_id"] = target_project_id
+    source_project_id = _optional_str(source.get("project_id"))
+    if source_project_id and source_project_id != target_project_id:
+        metadata["runtime_project_id"] = source_project_id
+    return metadata
 
 
 def _target_project_id(delivery: Mapping[str, Any]) -> str:

@@ -244,11 +244,29 @@ class DenWorkflowAdapter:
     The MCP tools object is injected so unit tests can provide fakes and later
     tasks can wire the real Hermes/Den MCP tool surface without baking globals
     into the state machine.
+
+    Attribution boundary (#1847):
+    - ``project_id`` is the runtime/control project (the bridge/adapter project).
+      Used for pool-level queries: leases, assignments, residency, notifications.
+    - ``target_project_id`` is the project owning the work being done. When set,
+      task-scoped operations (completion packets, worker runs, context packets,
+      review requests) use this instead of ``project_id``. When unset (None),
+      defaults to ``project_id`` for backward compatibility.
     """
 
     tools: Any
     project_id: str
     requested_by: str
+    target_project_id: str | None = None
+
+    @property
+    def work_project_id(self) -> str:
+        """Project ID for task-scoped (work attribution) MCP calls.
+
+        Returns target_project_id when set (cross-project work), otherwise
+        falls back to the runtime/control project_id.
+        """
+        return self.target_project_id or self.project_id
 
     def get_task_workflow_summary(self, *, task_id: int) -> Mapping[str, Any]:
         response = self.tools.mcp_den_get_task_workflow_summary(task_id=task_id)
@@ -263,7 +281,7 @@ class DenWorkflowAdapter:
         return _coerce_mapping_response(response)
 
     def get_latest_worker_completion(self, *, task_id: int, run_id: str, role: str | None = None) -> Mapping[str, Any]:
-        args: dict[str, Any] = {"project_id": self.project_id, "task_id": task_id, "run_id": run_id}
+        args: dict[str, Any] = {"project_id": self.work_project_id, "task_id": task_id, "run_id": run_id}
         if role is not None:
             args["role"] = role
         response = self.tools.mcp_den_get_latest_worker_completion(**args)
@@ -280,7 +298,7 @@ class DenWorkflowAdapter:
         notes: str | None = None,
     ) -> Mapping[str, Any]:
         args: dict[str, Any] = {
-            "project_id": self.project_id,
+            "project_id": self.work_project_id,
             "task_id": task_id,
             "requested_by": self.requested_by,
         }
@@ -306,7 +324,7 @@ class DenWorkflowAdapter:
         base_commit: str | None = None,
     ) -> Mapping[str, Any]:
         args: dict[str, Any] = {
-            "project_id": self.project_id,
+            "project_id": self.work_project_id,
             "task_id": task_id,
             "requested_by": self.requested_by,
             "branch": branch,
@@ -331,7 +349,7 @@ class DenWorkflowAdapter:
         notes: str | None = None,
     ) -> Mapping[str, Any]:
         args: dict[str, Any] = {
-            "project_id": self.project_id,
+            "project_id": self.work_project_id,
             "task_id": task_id,
             "requested_by": self.requested_by,
             "branch": branch,
@@ -361,7 +379,7 @@ class DenWorkflowAdapter:
         tool_name = _prepare_packet_tool_for_role(role)
         prepare_tool = getattr(self.tools, tool_name)
         args: dict[str, Any] = {
-            "project_id": self.project_id,
+            "project_id": self.work_project_id,
             "task_id": task_id,
             "requested_by": self.requested_by,
         }
@@ -382,7 +400,7 @@ class DenWorkflowAdapter:
         if "toolsets" in normalized:
             normalized["toolsets"] = _csv_or_none(normalized["toolsets"])
         args = {
-            "project_id": self.project_id,
+            "project_id": self.work_project_id,
             "requested_by": self.requested_by,
             "substrate": "spawned_hermes",
             **normalized,
@@ -394,18 +412,23 @@ class DenWorkflowAdapter:
 
     def mark_worker_started(self, *, task_id: int, run_id: str, role: str) -> Mapping[str, Any]:
         response = self.tools.mcp_den_send_message(
-            project_id=self.project_id,
+            project_id=self.work_project_id,
             sender=self.requested_by,
             task_id=task_id,
             content=f"Spawned-Hermes {role} worker `{run_id}` started by orchestrator.",
-            metadata={"type": "spawned_hermes_orchestrator_worker_started", "run_id": run_id, "role": role},
+            metadata={
+                "type": "spawned_hermes_orchestrator_worker_started",
+                "run_id": run_id,
+                "role": role,
+                "runtime_project_id": self.project_id,
+            },
             intent="handoff",
         )
         return _coerce_mapping_response(response)
 
     def mark_worker_completed(self, *, task_id: int, run_id: str, role: str, artifact: Mapping[str, Any]) -> Mapping[str, Any]:
         args: dict[str, Any] = {
-            "project_id": self.project_id,
+            "project_id": self.work_project_id,
             "run_id": run_id,
             "requested_by": self.requested_by,
             "status": str(artifact.get("status", "completed")),
@@ -455,7 +478,7 @@ class DenWorkflowAdapter:
                 "artifact evidence before retry."
             )
         response = self.tools.mcp_den_post_worker_completion_packet(
-            project_id=self.project_id,
+            project_id=self.work_project_id,
             run_id=run_id,
             requested_by=self.requested_by,
             status="failed",
@@ -470,7 +493,7 @@ class DenWorkflowAdapter:
 
     def get_worker_run_status(self, *, task_id: int, run_id: str) -> Mapping[str, Any]:
         response = self.tools.mcp_den_get_worker_run_status(
-            project_id=self.project_id,
+            project_id=self.work_project_id,
             task_id=task_id,
             run_id=run_id,
         )
@@ -674,12 +697,14 @@ class DenWorkflowAdapter:
         urgency: str = "normal",
     ) -> Mapping[str, Any]:
         """Emit a user-facing notification via Core ``send_user_notification``."""
+        enriched_metadata = dict(metadata)
+        enriched_metadata["runtime_project_id"] = self.project_id
         response = self.tools.mcp_den_send_user_notification(
-            project_id=self.project_id,
+            project_id=self.work_project_id,
             sender=self.requested_by,
             content=content,
             task_id=task_id,
-            metadata=dict(metadata),
+            metadata=enriched_metadata,
             urgency=urgency,
         )
         return _coerce_mapping_response(response)
@@ -738,7 +763,7 @@ class DenWorkflowAdapter:
         thread_id = _review_thread_id(review_request)
         reviewer = f"{self.requested_by}-reviewer"
         findings_response = self.tools.mcp_den_post_review_findings(
-            project_id=self.project_id,
+            project_id=self.work_project_id,
             task_id=task_id,
             review_round_id=review_round_id,
             sender=reviewer,
@@ -2109,6 +2134,8 @@ def _child_activity_context(
         "workerRole": role,
     }
     for child_key, *source_keys in (
+        ("targetProjectId", "targetProjectId", "target_project_id"),
+        ("runtimeProjectId", "runtimeProjectId", "runtime_project_id"),
         ("projectId", "projectId", "project_id"),
         ("taskId", "taskId", "task_id"),
         ("threadId", "threadId", "thread_id"),
@@ -2364,13 +2391,17 @@ def enrich_final_status(
     review_round_id: int | None = None,
     packet_message_id: int | None = None,
     cleanup_released: bool = False,
+    target_project_id: str | None = None,
 ) -> dict[str, Any]:
     """Build a final status dict with concrete evidence refs/IDs.
 
     All parameters are explicit — no closure over outer scope.
     ``assignment_id`` is the concrete integer when available, not a boolean.
+
+    Attribution (#1847): ``project_id`` is the runtime/control project.
+    ``target_project_id`` is the work-owning project when it differs.
     """
-    return {
+    status: dict[str, Any] = {
         "project_id": project_id,
         "task_id": task_id,
         "run_id": run_id,
@@ -2390,6 +2421,10 @@ def enrich_final_status(
             [{"kind": "assignment", "assignment_id": assignment_id}] if assignment_id else []
         ),
     }
+    if target_project_id and target_project_id != project_id:
+        status["target_project_id"] = target_project_id
+        status["runtime_project_id"] = project_id
+    return status
 
 
 def _ensure_den_did_not_reject(payload: Mapping[str, Any], *, context: str) -> None:
