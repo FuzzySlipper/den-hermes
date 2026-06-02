@@ -360,9 +360,101 @@ class _DeliveryContext:
     original_source_kind: str
     original_source_id: str
     raw_delivery: dict[str, Any]
+    conversation_lane_id: Optional[str] = None
+    """Explicit Den conversation lane id carried in delivery metadata.
+
+    When present, this overrides the default ``project:<id>:channel:<id>``
+    chat_id used for session key construction, allowing Den Core/Channels/
+    Gateway to control Hermes session continuity independently of the raw
+    source channel identity.  See ``docs/den-channels-session-lanes-1871.md``
+    for the lane-selection precedence contract.
+    """
 
 
 _DIRECT_AGENT_CONFIG_DEFAULTS: dict[str, str] = {}
+
+
+def _resolve_conversation_lane(
+    delivery: dict[str, Any],
+    metadata: dict[str, Any],
+) -> Optional[str]:
+    """Resolve an explicit conversation lane id from delivery metadata.
+
+    Returns a lane id string to use as the Hermes session ``chat_id``, or
+    ``None`` to fall back to the default ``project:<id>:channel:<id>`` key.
+
+    Lane-selection precedence (#1871):
+
+      1. ``conversationLaneId`` / ``hermesSessionKey`` — explicit Den-owned
+         lane id provided by Core/Channels/Gateway.
+      2. ``target_task_id`` / ``targetTaskId`` — target-task-scoped lane.
+      3. ``assignment_id`` / ``targetAssignmentId`` — assignment-scoped lane.
+      4. ``worker_run_id`` / ``workerRunId`` — worker-run-scoped lane.
+      5. ``None`` — fall back to source channel identity.
+
+    Levels 2-4 construct a synthetic lane id of the form
+    ``lane:<project>:task:<id>``, ``lane:<project>:assignment:<id>``, or
+    ``lane:<project>:run:<id>`` respectively, where ``<project>`` comes from
+    the delivery's ``project_id``.
+    """
+    # Level 1: Explicit lane id from Den Core/Channels/Gateway.
+    explicit = _first(
+        metadata,
+        "conversationLaneId",
+        "conversation_lane_id",
+        "hermesSessionKey",
+        "hermes_session_key",
+    )
+    if explicit is not None and str(explicit).strip():
+        return f"lane:{str(explicit).strip()}"
+
+    project_id = str(
+        _first(delivery, "project_id", "projectId", default="") or ""
+    )
+
+    # Level 2: Target-task-scoped lane.
+    target_task_id = _first(
+        metadata,
+        "target_task_id",
+        "targetTaskId",
+    ) or _first(
+        delivery,
+        "target_task_id",
+        "targetTaskId",
+    )
+    if target_task_id is not None:
+        return f"lane:{project_id}:task:{target_task_id}"
+
+    # Level 3: Assignment-scoped lane.
+    assignment_id = _first(
+        metadata,
+        "assignment_id",
+        "targetAssignmentId",
+        "target_assignment_id",
+    ) or _first(
+        delivery,
+        "assignment_id",
+        "targetAssignmentId",
+        "target_assignment_id",
+    )
+    if assignment_id is not None:
+        return f"lane:{project_id}:assignment:{assignment_id}"
+
+    # Level 4: Worker-run-scoped lane.
+    worker_run_id = _first(
+        metadata,
+        "worker_run_id",
+        "workerRunId",
+    ) or _first(
+        delivery,
+        "worker_run_id",
+        "workerRunId",
+    )
+    if worker_run_id is not None:
+        return f"lane:{project_id}:run:{worker_run_id}"
+
+    # Level 5: No explicit lane; fall back to source channel.
+    return None
 
 
 def _remember_direct_agent_config(
@@ -731,9 +823,28 @@ class DenChannelsAdapter(BasePlatformAdapter):
         )
         body = str(_first(message, "body", "text", "content", default=_first(delivery, "context_summary", "contextSummary", default="")) or "")
         chat_name = _first(metadata, "channel_slug", "channelSlug", "channel_name", "channelName")
-        chat_type = "thread" if thread_root is not None else "channel"
-        chat_id = f"project:{project_id}:channel:{channel_id}"
-        thread_id = f"thread:{thread_root}" if thread_root is not None else None
+
+        # --- Session lane selection (#1871) ---
+        # Resolve the conversation lane identity from delivery metadata.
+        # Precedence: explicit conversationLaneId/hermesSessionKey > target-task
+        # lane > target-assignment lane > worker-run lane > source channel.
+        conversation_lane_id = _resolve_conversation_lane(delivery, metadata)
+        raw_chat_id = f"project:{project_id}:channel:{channel_id}"
+
+        if conversation_lane_id is not None:
+            # Use the explicit lane id as the Hermes session key namespace.
+            # Thread qualification is preserved only when the explicit lane
+            # does not already embed thread context.
+            chat_type = "thread" if thread_root is not None else "channel"
+            chat_id = conversation_lane_id
+            thread_id = f"thread:{thread_root}" if thread_root is not None else None
+        else:
+            chat_type = "thread" if thread_root is not None else "channel"
+            chat_id = raw_chat_id
+            thread_id = f"thread:{thread_root}" if thread_root is not None else None
+
+        # user_id is intentionally omitted: sender identity is separate from
+        # lane identity.  user_name is set for display prefix only.
         source = self.build_source(
             chat_id=chat_id,
             chat_name=str(chat_name) if chat_name else None,
@@ -754,6 +865,8 @@ class DenChannelsAdapter(BasePlatformAdapter):
                 "channel_message": message,
                 "channel_id": channel_id,
                 "project_id": project_id,
+                "conversation_lane_id": conversation_lane_id,
+                "raw_chat_id": raw_chat_id,
             },
             message_id=str(trigger_message_id or source_id),
             reply_to_message_id=str(thread_root) if thread_root is not None else None,
@@ -787,6 +900,7 @@ class DenChannelsAdapter(BasePlatformAdapter):
             return None
         trigger_message_id = _coerce_int(_first(message, "id", "messageId", default=getattr(event, "message_id", None)))
         thread_root = _coerce_int(_first(message, "threadRootMessageId", "thread_root_message_id"))
+        conversation_lane_id = raw.get("conversation_lane_id")
         return _DeliveryContext(
             delivery_request_id=delivery_id,
             attempt_id=_coerce_int(_first(raw, "attempt_id", "attemptId")),
@@ -799,6 +913,7 @@ class DenChannelsAdapter(BasePlatformAdapter):
             original_source_kind=str(_first(raw, "source_kind", "sourceKind", default="") or ""),
             original_source_id=str(_first(raw, "source_id", "sourceId", default="") or ""),
             raw_delivery=raw,
+            conversation_lane_id=str(conversation_lane_id) if conversation_lane_id is not None else None,
         )
 
     async def on_processing_start(self, event: MessageEvent) -> None:
@@ -842,6 +957,8 @@ class DenChannelsAdapter(BasePlatformAdapter):
             "threadId": _coerce_int(_first(context.raw_delivery, "thread_id", "threadId")),
             "anchorMessageId": context.trigger_message_id,
         }
+        if context.conversation_lane_id is not None:
+            payload["conversationLaneId"] = context.conversation_lane_id
         _ACTIVITY_CONTEXT_VAR.set(payload)
         with _ACTIVITY_LOCK:
             _ACTIVITY_STATES.pop(_activity_state_key(payload), None)
@@ -996,8 +1113,25 @@ class DenChannelsAdapter(BasePlatformAdapter):
         chat_id = f"project:{context.project_id}:channel:{context.channel_id}"
         if self._contexts_by_session.get(context.session_key) is context:
             self._contexts_by_session.pop(context.session_key, None)
+        # Clear raw channel id mapping (used by non-lane contexts)
         if self._contexts_by_chat.get(chat_id) is context:
             self._contexts_by_chat.pop(chat_id, None)
+        # Clear explicit lane mapping (when conversation_lane_id was used as chat_id)
+        if context.conversation_lane_id is not None:
+            lane_chat_id = context.conversation_lane_id
+            if self._contexts_by_chat.get(lane_chat_id) is context:
+                self._contexts_by_chat.pop(lane_chat_id, None)
+            lane_channel_key = self._lane_key(lane_chat_id, None)
+            if self._contexts_by_lane.get(lane_channel_key) is context:
+                self._contexts_by_lane.pop(lane_channel_key, None)
+            lane_thread_key = self._lane_key(
+                lane_chat_id,
+                f"thread:{context.thread_root_message_id}"
+                if context.thread_root_message_id is not None
+                else None,
+            )
+            if self._contexts_by_lane.get(lane_thread_key) is context:
+                self._contexts_by_lane.pop(lane_thread_key, None)
         channel_key = self._lane_key(chat_id, None)
         if self._contexts_by_lane.get(channel_key) is context:
             self._contexts_by_lane.pop(channel_key, None)
