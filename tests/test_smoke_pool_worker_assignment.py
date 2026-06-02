@@ -1,7 +1,7 @@
 """Tests for the pool-worker assignment smoke helper.
 
-Tests the deterministic PoolWorkerRuntime smoke for all four live roles:
-reviewer, validator, drift_checker, packet_auditor.
+Tests the deterministic PoolWorkerRuntime smoke for all five live task-worker roles:
+coder, reviewer, validator, drift_checker, packet_auditor.
 
 All tests are fully deterministic: no network I/O, no Den API calls.
 """
@@ -28,6 +28,14 @@ from scripts.smoke_pool_worker_assignment import (
 
 
 class TestSmokeRole:
+    def test_coder_smoke_passes(self):
+        result = smoke_role("coder")
+        assert result.success is True
+        assert result.role == "coder"
+        assert result.pool_member_id == "pool-coder-01"
+        assert result.packet_type == "implementation_packet"
+        assert result.capabilities == ["implementation", "code_generation"]
+
     def test_reviewer_smoke_passes(self):
         result = smoke_role("reviewer")
         assert result.success is True
@@ -61,6 +69,12 @@ class TestSmokeRole:
         assert result.pool_member_id == "pool-packet-auditor-01"
         assert result.packet_type == "packet_audit_packet"
 
+    def test_slot_number_selects_concrete_member(self):
+        result = smoke_role("reviewer", slot_number=5)
+        assert result.success is True
+        assert result.pool_member_id == "pool-reviewer-05"
+        assert "slot05" in result.run_id
+
     def test_unknown_role_returns_error(self):
         result = smoke_role("nonexistent_role")
         assert result.success is False
@@ -71,7 +85,7 @@ class TestSmokeRole:
         assert result.run_id == "custom-run-id-12345"
         assert result.success is True
 
-    @pytest.mark.parametrize("role", ["reviewer", "validator", "drift_checker", "packet_auditor"])
+    @pytest.mark.parametrize("role", ["coder", "reviewer", "validator", "drift_checker", "packet_auditor"])
     def test_all_live_roles_pass(self, role):
         result = smoke_role(role)
         assert result.success is True
@@ -88,10 +102,10 @@ class TestSmokeRole:
 class TestRunSmoke:
     def test_all_live_roles(self):
         report = run_smoke()
-        assert report.roles_total == 4
-        assert report.roles_passed == 4
+        assert report.roles_total == 5
+        assert report.roles_passed == 5
         assert report.roles_failed == 0
-        assert len(report.roles_smoked) == 4
+        assert len(report.roles_smoked) == 5
         assert len(report.errors) == 0
 
     def test_custom_roles(self):
@@ -126,11 +140,12 @@ class TestFormatSummary:
         report = run_smoke()
         summary = format_summary(report)
         assert "PASS" in summary
+        assert "pool-coder-01" in summary
         assert "pool-reviewer-01" in summary
         assert "pool-validator-01" in summary
         assert "pool-drift-checker-01" in summary
         assert "pool-packet-auditor-01" in summary
-        assert "Roles passed: 4" in summary
+        assert "Roles passed: 5" in summary
         assert "Roles failed: 0" in summary
 
     def test_format_with_errors(self):

@@ -6,7 +6,7 @@ Reads and validates the central runtime registry at
 ``--registry`` path), then produces a pool-member registration matrix
 for the live role-worker lanes plus the pooled project-orchestrator lane:
 
-    reviewer, validator, drift_checker, packet_auditor, project_orchestrator
+    coder, reviewer, validator, drift_checker, packet_auditor, project_orchestrator
 
 The script:
 
@@ -19,6 +19,7 @@ The script:
    - worker_identity / pool_member_id
    - profile_identity
    - worker_role
+   - slot_number / desired_role_capacity
    - agent_instance_id template
    - capability tags
    - status
@@ -31,6 +32,7 @@ Usage:
     python scripts/provision_pool_workers.py                 # dry-run default
     python scripts/provision_pool_workers.py --registry /path/to/runtimes.yaml
     python scripts/provision_pool_workers.py --apply          # emit JSON payloads
+    python scripts/provision_pool_workers.py --slot-counts coder=5,reviewer=5,validator=3,drift_checker=3,packet_auditor=3,project_orchestrator=3
 
 Exit codes:
     0 – all roles verified and ready for provisioning.
@@ -58,7 +60,20 @@ except ImportError:
 # Constants
 # ---------------------------------------------------------------------------
 
-LIVE_ROLES = ("reviewer", "validator", "drift_checker", "packet_auditor", "project_orchestrator")
+LIVE_ROLES = ("coder", "reviewer", "validator", "drift_checker", "packet_auditor", "project_orchestrator")
+
+# Bounded operator-approved capacity target (#1883): all roles have at least
+# three concrete slots, while the higher-demand coder/reviewer roles default
+# to five.  These are concrete Core pool-member rows that share the role
+# profile_identity; they are not duplicated Hermes profile directories.
+DEFAULT_ROLE_SLOT_COUNTS: dict[str, int] = {
+    "coder": 5,
+    "reviewer": 5,
+    "validator": 3,
+    "drift_checker": 3,
+    "packet_auditor": 3,
+    "project_orchestrator": 3,
+}
 
 # Spawned profile prefix — all live roles must use this prefix.
 SPAWNED_PROFILE_PREFIX = "spawned-"
@@ -85,6 +100,7 @@ DEFAULT_REGISTRY = Path("/home/agents/runtime/spawned-hermes-runtimes.yaml")
 
 # Pool member ID prefix for each role.
 POOL_MEMBER_PREFIXES: dict[str, str] = {
+    "coder": "pool-coder",
     "reviewer": "pool-reviewer",
     "validator": "pool-validator",
     "drift_checker": "pool-drift-checker",
@@ -117,6 +133,8 @@ class ResolvedPoolMember:
     worker_identity: str  # pool member ID
     agent_instance_id_template: str
     pool_member_id: str
+    slot_number: int
+    desired_role_capacity: int
     runtime_id: str
     provider: str
     model: str
@@ -243,10 +261,17 @@ def scan_for_secrets(data: Any, path: str = "", results: list[str] | None = None
 def build_pool_member(
     role: str,
     runtime: dict[str, Any],
+    *,
+    slot_number: int = 1,
+    desired_role_capacity: int | None = None,
 ) -> ResolvedPoolMember:
     """Build a single ResolvedPoolMember from resolved runtime config."""
+    if slot_number < 1:
+        raise ValueError(f"slot_number must be >= 1, got {slot_number!r}")
+
     prefix = POOL_MEMBER_PREFIXES.get(role, f"pool-{role}")
-    pool_member_id = f"{prefix}-01"
+    pool_member_id = f"{prefix}-{slot_number:02d}"
+    role_capacity = desired_role_capacity or DEFAULT_ROLE_SLOT_COUNTS.get(role, 1)
     capabilities = ROLE_CAPABILITIES.get(role, [role])
     agent_instance_template = (
         f"hermes:den-k8plus:{runtime['profile']}:{pool_member_id}:{{id_suffix}}"
@@ -258,6 +283,8 @@ def build_pool_member(
         worker_identity=pool_member_id,
         pool_member_id=pool_member_id,
         agent_instance_id_template=agent_instance_template,
+        slot_number=slot_number,
+        desired_role_capacity=role_capacity,
         runtime_id=runtime["runtime_id"],
         provider=runtime["provider"],
         model=runtime["model"],
@@ -322,11 +349,43 @@ def compute_fingerprint(registry_path: Path) -> str:
     return hashlib.sha256(raw).hexdigest()[:16]
 
 
+def parse_slot_counts(spec: str | None) -> dict[str, int]:
+    """Parse ``role=count`` capacity overrides for provisioning.
+
+    ``None`` or an empty string returns the bounded default #1883 capacity
+    target.  Unknown roles are rejected so typos cannot silently reduce or
+    create hidden capacity.
+    """
+    counts = dict(DEFAULT_ROLE_SLOT_COUNTS)
+    if spec is None or not spec.strip():
+        return counts
+
+    known_roles = set(LIVE_ROLES)
+    for item in spec.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if "=" not in item:
+            raise ValueError(f"Invalid slot-count override {item!r}; expected role=count")
+        role, raw_count = (part.strip() for part in item.split("=", 1))
+        if role not in known_roles:
+            raise ValueError(f"Unknown role in slot-count override: {role!r}")
+        try:
+            count = int(raw_count)
+        except ValueError as exc:
+            raise ValueError(f"Invalid slot count for role {role!r}: {raw_count!r}") from exc
+        if count < 1:
+            raise ValueError(f"Slot count for role {role!r} must be >= 1, got {count}")
+        counts[role] = count
+    return counts
+
+
 def run_provision(
     registry_path: Path,
     *,
     apply_mode: bool = False,
     roles: Sequence[str] | None = None,
+    slot_counts: dict[str, int] | None = None,
 ) -> ProvisioningResult:
     """Run the provisioning dry-run (or apply) and return structured result."""
     result = ProvisioningResult(
@@ -350,6 +409,7 @@ def run_provision(
     defaults = registry.get("defaults", {})
     roles_block = registry.get("roles", {})
     target_roles = list(roles) if roles else list(LIVE_ROLES)
+    effective_slot_counts = slot_counts or dict(DEFAULT_ROLE_SLOT_COUNTS)
 
     # 2. Scan for secrets in registry config
     secrets = scan_for_secrets(registry)
@@ -377,9 +437,18 @@ def run_provision(
                 result.members.append(member)
                 continue
 
-            # 3b. Build pool member
-            member = build_pool_member(role, runtime)
-            result.members.append(member)
+            # 3b. Build concrete pool-member slots for the role.  Extra slots
+            # share the same profile_identity; capacity is represented by Core
+            # rows/leases, not profile-directory copies.
+            role_slot_count = effective_slot_counts.get(role, 1)
+            for slot_number in range(1, role_slot_count + 1):
+                member = build_pool_member(
+                    role,
+                    runtime,
+                    slot_number=slot_number,
+                    desired_role_capacity=role_slot_count,
+                )
+                result.members.append(member)
             result.roles_resolved += 1
 
         except RuntimeError as exc:
@@ -418,6 +487,8 @@ def _emit_apply_payloads(result: ProvisioningResult) -> None:
                 "capabilities": member.capabilities,
                 "timeout_seconds": member.timeout_seconds,
                 "status": member.status,
+                "slot_number": member.slot_number,
+                "desired_role_capacity": member.desired_role_capacity,
                 "agent_instance_id_template": member.agent_instance_id_template,
                 "provisioning": {
                     "source": member.provisioning_source,
@@ -438,13 +509,14 @@ def format_matrix(result: ProvisioningResult) -> str:
         f"Fingerprint: {result.registry_fingerprint}",
         f"Credential guard: {'PASS' if result.credential_guard_ok else 'FAIL'}",
         "",
-        f"{'ROLE':<18} {'POOL MEMBER':<22} {'PROFILE':<22} {'PROVIDER':<16} {'MODEL':<20} {'STATUS':<10} CAPABILITIES",
-        f"{'----':<18} {'-----------':<22} {'-------':<22} {'--------':<16} {'-----':<20} {'------':<10} ------------",
+        f"{'ROLE':<18} {'POOL MEMBER':<22} {'SLOT':<9} {'PROFILE':<22} {'PROVIDER':<16} {'MODEL':<20} {'STATUS':<10} CAPABILITIES",
+        f"{'----':<18} {'-----------':<22} {'----':<9} {'-------':<22} {'--------':<16} {'-----':<20} {'------':<10} ------------",
     ]
     for member in result.members:
         caps = ", ".join(member.capabilities)
         lines.append(
             f"{member.worker_role:<18} {member.pool_member_id:<22} "
+            f"{member.slot_number:>2}/{member.desired_role_capacity:<6} "
             f"{member.profile_identity:<22} {member.provider:<16} "
             f"{member.model:<20} {member.status:<10} {caps}"
         )
@@ -497,6 +569,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Emit JSON upsert payloads for Den MCP/Core (default: dry-run only)",
     )
     parser.add_argument(
+        "--slot-counts",
+        default=None,
+        help=(
+            "Comma-separated role=count capacity overrides. Default #1883 target: "
+            "coder=5,reviewer=5,validator=3,drift_checker=3,packet_auditor=3,project_orchestrator=3"
+        ),
+    )
+    parser.add_argument(
         "--json",
         action="store_true",
         help="Output machine-readable JSON instead of human-readable table",
@@ -514,6 +594,11 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     args = parser.parse_args(argv)
     roles = [r.strip() for r in args.roles.split(",") if r.strip()]
+    try:
+        slot_counts = parse_slot_counts(args.slot_counts)
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
 
     # Resolve registry path
     registry_path = Path(args.registry) if args.registry else DEFAULT_REGISTRY
@@ -523,6 +608,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         registry_path,
         apply_mode=args.apply,
         roles=roles,
+        slot_counts=slot_counts,
     )
 
     # Output
@@ -534,6 +620,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "credential_guard_ok": result.credential_guard_ok,
             "roles_resolved": result.roles_resolved,
             "roles_failed": result.roles_failed,
+            "slot_counts": {role: slot_counts.get(role, 1) for role in roles},
             "members": [asdict(m) for m in result.members],
             "errors": result.errors,
         }

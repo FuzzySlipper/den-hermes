@@ -35,6 +35,8 @@ def test_resolved_pool_member_has_no_top_level_task_id_repo_source():
         worker_identity="pool-coder-01",
         agent_instance_id_template="hermes:den-k8:spawned-coder:pool-coder-01:{id}",
         pool_member_id="pool-coder-01",
+        slot_number=1,
+        desired_role_capacity=5,
         runtime_id="coder-primary",
         provider="openrouter",
         model="model-coder",
@@ -58,6 +60,8 @@ def test_resolved_pool_member_provisioning_fields_exist():
         worker_identity="pool-reviewer-01",
         agent_instance_id_template="x",
         pool_member_id="pool-reviewer-01",
+        slot_number=1,
+        desired_role_capacity=5,
         runtime_id="rev",
         provider="p",
         model="m",
@@ -69,6 +73,8 @@ def test_resolved_pool_member_provisioning_fields_exist():
 
     assert member.provisioning_source == "task1812_prep"
     assert member.provisioning_repo == "den-hermes"
+    assert member.slot_number == 1
+    assert member.desired_role_capacity == 5
 
 
 # ---------------------------------------------------------------------------
@@ -107,6 +113,8 @@ def test_emit_apply_payloads_has_provisioning_object():
         worker_identity="pool-coder-01",
         agent_instance_id_template="x",
         pool_member_id="pool-coder-01",
+        slot_number=1,
+        desired_role_capacity=5,
         runtime_id="c",
         provider="p",
         model="m",

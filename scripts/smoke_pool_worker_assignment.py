@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """No-mutation smoke helper: demonstrates assignment-pointer processing and
-acknowledgment for the four live pool-worker roles using the existing
+acknowledgment for the five live task-worker roles using the existing
 PoolWorkerRuntime state machine.
 
 This script is **fully deterministic**: no network I/O, no Den API calls,
@@ -27,9 +27,14 @@ import argparse
 import json
 import sys
 from dataclasses import dataclass, field, asdict
+from pathlib import Path
 from typing import Any, Sequence
 
-# Parent-relative import works when PYTHONPATH is set.
+# Make direct script execution work without requiring PYTHONPATH=.
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 from den_hermes.pool_runtime import (
     AssignmentPointer,
     PoolRuntimeState,
@@ -41,6 +46,7 @@ from den_hermes.pool_runtime import (
 # ---------------------------------------------------------------------------
 
 ROLE_PACKET_TYPES: dict[str, str] = {
+    "coder": "implementation_packet",
     "reviewer": "review_findings_packet",
     "validator": "validation_packet",
     "drift_checker": "drift_check_packet",
@@ -48,6 +54,7 @@ ROLE_PACKET_TYPES: dict[str, str] = {
 }
 
 ROLE_CAPABILITY_TAGS: dict[str, list[str]] = {
+    "coder": ["implementation", "code_generation"],
     "reviewer": ["review", "code_audit"],
     "validator": ["validation", "test_verification"],
     "drift_checker": ["drift_detection", "consistency_check"],
@@ -55,6 +62,7 @@ ROLE_CAPABILITY_TAGS: dict[str, list[str]] = {
 }
 
 ROLE_CHECKPOINT_TYPES: dict[str, list[str]] = {
+    "coder": ["assignment_ack", "interpretation_checkpoint", "plan_checkpoint", "blocked_needs_input"],
     "reviewer": ["assignment_ack", "blocked_needs_input"],
     "validator": ["assignment_ack", "blocked_needs_input"],
     "drift_checker": ["assignment_ack", "blocked_needs_input"],
@@ -62,6 +70,7 @@ ROLE_CHECKPOINT_TYPES: dict[str, list[str]] = {
 }
 
 ROLE_POOL_MEMBER_PREFIXES: dict[str, str] = {
+    "coder": "pool-coder",
     "reviewer": "pool-reviewer",
     "validator": "pool-validator",
     "drift_checker": "pool-drift-checker",
@@ -121,6 +130,7 @@ def smoke_role(
     task_id: int = 1784,
     project_id: str = "den-hermes-bridge",
     run_id: str | None = None,
+    slot_number: int = 1,
 ) -> RoleSmokeResult:
     """Run a no-mutation smoke for a single pool-worker role.
 
@@ -137,10 +147,26 @@ def smoke_role(
     Returns a RoleSmokeResult with handles that Runner can connect to
     Core/assignment records during live application.
     """
-    prefix = ROLE_POOL_MEMBER_PREFIXES.get(role, f"pool-{role}")
-    pool_member_id = f"{prefix}-01"
+    if role not in ROLE_PACKET_TYPES:
+        return RoleSmokeResult(
+            role=role,
+            pool_member_id="",
+            run_id=run_id or f"t{task_id}-{role}-slot{slot_number:02d}-smoke-000000",
+            assignment_id="",
+            task_id=task_id,
+            project_id=project_id,
+            initial_state=PoolRuntimeState.PENDING.value,
+            error=f"Unknown role: {role!r}",
+            success=False,
+        )
 
-    effective_run_id = run_id or f"t{task_id}-{role}-smoke-000000"
+    if slot_number < 1:
+        raise ValueError(f"slot_number must be >= 1, got {slot_number!r}")
+
+    prefix = ROLE_POOL_MEMBER_PREFIXES.get(role, f"pool-{role}")
+    pool_member_id = f"{prefix}-{slot_number:02d}"
+
+    effective_run_id = run_id or f"t{task_id}-{role}-slot{slot_number:02d}-smoke-000000"
 
     assignment_metadata = {
         "smoke": True,
@@ -224,6 +250,7 @@ def run_smoke(
     task_id: int = 1784,
     project_id: str = "den-hermes-bridge",
     run_id: str | None = None,
+    slot_number: int = 1,
 ) -> SmokeReport:
     """Run smoke for all specified roles."""
     if roles is None:
@@ -243,6 +270,7 @@ def run_smoke(
             task_id=task_id,
             project_id=project_id,
             run_id=run_id,
+            slot_number=slot_number,
         )
         report.roles_smoked.append(result)
         if result.success:
@@ -302,7 +330,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--roles",
         default=",".join(ROLE_PACKET_TYPES.keys()),
-        help="Comma-separated roles to smoke (default: all four live roles)",
+        help="Comma-separated roles to smoke (default: all five live task-worker roles)",
     )
     parser.add_argument(
         "--json",
@@ -321,6 +349,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Task ID for smoke assignments (default: 1784)",
     )
     parser.add_argument(
+        "--slot-number",
+        default=1,
+        type=int,
+        help="Concrete pool slot number to smoke (default: 1)",
+    )
+    parser.add_argument(
         "--project-id",
         default="den-hermes-bridge",
         help="Project ID for smoke assignments (default: den-hermes-bridge)",
@@ -334,6 +368,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         task_id=args.task_id,
         project_id=args.project_id,
         run_id=args.run_id,
+        slot_number=args.slot_number,
     )
 
     if args.json:

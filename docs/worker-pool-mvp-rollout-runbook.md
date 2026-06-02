@@ -615,11 +615,18 @@ for den-core #1685:
 }
 ```
 
-## 7. Live pool worker provisioning (task #1784)
+## 7. Live pool worker provisioning (tasks #1784/#1883)
 
-The live pool worker provisioning step registers concrete pool members for
-the four roles: **reviewer**, **validator**, **drift_checker**, and
-**packet_auditor**. (Coder is already operational from prior work.)
+The live pool worker provisioning step registers concrete pool-member slots
+for all live roles. The default bounded #1883 target is **five** slots for the
+high-demand **coder** and **reviewer** roles, and **three** slots for every
+other live role: **validator**, **drift_checker**, **packet_auditor**, and
+**project_orchestrator**.
+
+This is an operator-approved expansion path, not autoscaling. `all_busy` means
+queue/backoff/retry by default; operators may run this provisioning path to add
+bounded audited slots. New slots reuse the existing shared `spawned-*` profile
+identity and must not create duplicate Hermes profile directories.
 
 ### 7.1 Role profile matrix
 
@@ -628,23 +635,25 @@ All live roles use **shared spawned-Hermes profiles** (`spawned-*`) — never
 identity comes from `pool_member_id` / `agent_instance_id`, not from
 duplicate profile names.  See `docs/spawned-role-pool-member-identity.md`.
 
-| Role | Profile identity | Pool member ID | Den core role | Packet type | Runtime ID |
+| Role | Profile identity | Default pool member IDs | Den core role | Packet type | Runtime ID |
 |---|---|---|---|---|---|
-| Reviewer | `spawned-reviewer` | `pool-reviewer-01` | `reviewer` | `review_findings_packet` | `reviewer-primary` |
-| Validator | `spawned-validator` | `pool-validator-01` | `validator` | `validation_packet` | `validator-primary` |
-| Drift Checker | `spawned-drift-checker` | `pool-drift-checker-01` | `drift_checker` | `drift_check_packet` | `drift-checker-primary` |
-| Packet Auditor | `spawned-packet-auditor` | `pool-packet-auditor-01` | `packet_auditor` | `packet_audit_packet` | `packet-auditor-primary` |
+| Coder | `spawned-coder` | `pool-coder-01` … `pool-coder-05` | `coder` | `implementation_packet` | `coder-primary` |
+| Reviewer | `spawned-reviewer` | `pool-reviewer-01` … `pool-reviewer-05` | `reviewer` | `review_findings_packet` | `reviewer-primary` |
+| Validator | `spawned-validator` | `pool-validator-01` … `pool-validator-03` | `validator` | `validation_packet` | `validator-primary` |
+| Drift Checker | `spawned-drift-checker` | `pool-drift-checker-01` … `pool-drift-checker-03` | `drift_checker` | `drift_check_packet` | `drift-checker-primary` |
+| Packet Auditor | `spawned-packet-auditor` | `pool-packet-auditor-01` … `pool-packet-auditor-03` | `packet_auditor` | `packet_audit_packet` | `packet-auditor-primary` |
+| Project Orchestrator | `spawned-orchestrator` | `pool-orchestrator-01` … `pool-orchestrator-03` | `project_orchestrator` | `orchestration_packet` | `project-orchestrator-primary` |
 
 ### 7.2 Preconditions
 
 Before running live provisioning:
 
 - [ ] Central registry at `/home/agents/runtime/spawned-hermes-runtimes.yaml`
-  has the four roles configured with `spawned-*` profiles (not
+  has all six live roles configured with `spawned-*` profiles (not
   `den-hermes-runner`).
-- [ ] Hermes profiles `spawned-reviewer`, `spawned-validator`,
-  `spawned-drift-checker`, and `spawned-packet-auditor` exist and pass
-  preflight.
+- [ ] Hermes profiles `spawned-coder`, `spawned-reviewer`,
+  `spawned-validator`, `spawned-drift-checker`, `spawned-packet-auditor`,
+  and `spawned-orchestrator` exist and pass preflight.
 - [ ] The provisioning script is committed: `scripts/provision_pool_workers.py`.
 - [ ] Smoke helper is committed: `scripts/smoke_pool_worker_assignment.py`.
 - [ ] Runner has Den MCP/Core access to upsert pool members (if using
@@ -655,11 +664,11 @@ Before running live provisioning:
 #### Step P1: Validate the runtime registry
 
 ```bash
-# Validate all five canonical roles resolve correctly
-python -m den_hermes.runtime_ops validate --registry /home/agents/runtime/spawned-hermes-runtimes.yaml
+# Validate all six canonical live roles resolve correctly
+python -m den_hermes.runtime_ops --registry /home/agents/runtime/spawned-hermes-runtimes.yaml validate
 
 # Show the full runtime matrix
-python -m den_hermes.runtime_ops matrix --registry /home/agents/runtime/spawned-hermes-runtimes.yaml
+python -m den_hermes.runtime_ops --registry /home/agents/runtime/spawned-hermes-runtimes.yaml matrix
 ```
 
 Expected output includes all roles with `spawned-*` profiles.  If any
@@ -668,14 +677,18 @@ role shows `den-hermes-runner`, stop and update the registry first.
 #### Step P2: Run the provisioning dry-run
 
 ```bash
-# Dry-run against the central registry (default path)
+# Dry-run against the central registry (default path) using the #1883 target:
+# coder=5, reviewer=5, all other live roles=3
 python scripts/provision_pool_workers.py
 
 # Or specify a registry path explicitly
 python scripts/provision_pool_workers.py --registry /home/agents/runtime/spawned-hermes-runtimes.yaml
 
-# Specific roles only
-python scripts/provision_pool_workers.py --roles reviewer,validator
+# Specific roles only still use each role's default slot target
+python scripts/provision_pool_workers.py --roles coder,reviewer
+
+# Operator-approved override for a bounded expansion/reduction
+python scripts/provision_pool_workers.py --slot-counts coder=6,reviewer=5,validator=3,drift_checker=3,packet_auditor=3,project_orchestrator=3
 
 # JSON output for programmatic consumption
 python scripts/provision_pool_workers.py --json
@@ -683,11 +696,17 @@ python scripts/provision_pool_workers.py --json
 
 The dry-run validates:
 - Registry schema and required roles.
-- All four live roles use `spawned-*` profiles.
+- All six live roles use `spawned-*` profiles.
+- New slot rows share the role `profile_identity`; no duplicate Hermes
+  profile directories are created for `pool-coder-03`, `pool-reviewer-05`, etc.
 - No `den-hermes-runner` or other forbidden profiles leak through.
 - No secret-like values (API keys, tokens) are present in the registry.
 
-Expected outcome: `Resolved: 4 roles  Failed: 0 roles`.
+Expected default outcome: `Resolved: 6 roles  Failed: 0 roles`, with 22
+concrete pool-member slots:
+`pool-coder-01..05`, `pool-reviewer-01..05`, `pool-validator-01..03`,
+`pool-drift-checker-01..03`, `pool-packet-auditor-01..03`, and
+`pool-orchestrator-01..03`.
 
 #### Step P3: Credential/config guard check
 
@@ -704,27 +723,29 @@ proceeding.
 #### Step P4: Run the assignment smoke helper
 
 ```bash
-# Smokes all four live roles (in-memory, no mutations)
+# Smokes all five task-worker roles (in-memory, no mutations).
+# Project-orchestrator slots use the project-duration lease smoke pattern above,
+# not AssignmentPointer/PoolWorkerRuntime task-worker smoke.
 python scripts/smoke_pool_worker_assignment.py
 
 # JSON output with handles
 python scripts/smoke_pool_worker_assignment.py --json
 
 # Specific roles
-python scripts/smoke_pool_worker_assignment.py --roles reviewer,validator
+python scripts/smoke_pool_worker_assignment.py --roles coder,reviewer,validator
 
-# Custom run-id for tracing
-python scripts/smoke_pool_worker_assignment.py --run-id t1784-provision-smoke-20260530
+# Custom run-id and concrete slot for tracing a non-01 lane
+python scripts/smoke_pool_worker_assignment.py --run-id t1883-provision-smoke-20260602 --slot-number 3
 ```
 
 The smoke helper tests:
-- Assignment pointer validation (all four roles).
+- Assignment pointer validation (all five task-worker roles).
 - PoolWorkerRuntime creation from `PENDING` state.
 - `acknowledge()` transition to `ACKNOWLEDGED`.
 - Role-specific packet type expectations.
-- Pool member identity conventions (`pool-{role}-01`).
+- Pool member identity conventions (`pool-{role}-NN`).
 
-Expected outcome: `Roles passed: 4  Roles failed: 0`.
+Expected outcome: `Roles passed: 5  Roles failed: 0`.
 
 #### Step P5: Core readback test
 
@@ -737,11 +758,12 @@ output (or from the `--run-id` override) to check:
 python scripts/smoke_pool_worker_assignment.py --run-id t1784-provision-validation
 
 # Expected smoke output (abbreviated):
-# POOL MEMBER          | STATE            | PACKET TYPE                   | STATUS    | RUN_ID
-# pool-reviewer-01     | acknowledged     | review_findings_packet        | PASS      | t1784-provision-validation
-# pool-validator-01    | acknowledged     | validation_packet             | PASS      | t1784-provision-validation
-# pool-drift-checker-01| acknowledged     | drift_check_packet            | PASS      | t1784-provision-validation
-# pool-packet-auditor-01| acknowledged    | packet_audit_packet           | PASS      | t1784-provision-validation
+# POOL MEMBER           | STATE            | PACKET TYPE                   | STATUS    | RUN_ID
+# pool-coder-01         | acknowledged     | implementation_packet         | PASS      | t1784-provision-validation
+# pool-reviewer-01      | acknowledged     | review_findings_packet        | PASS      | t1784-provision-validation
+# pool-validator-01     | acknowledged     | validation_packet             | PASS      | t1784-provision-validation
+# pool-drift-checker-01 | acknowledged     | drift_check_packet            | PASS      | t1784-provision-validation
+# pool-packet-auditor-01| acknowledged     | packet_audit_packet           | PASS      | t1784-provision-validation
 ```
 
 #### Step P6: Core upsert (apply mode)
@@ -778,23 +800,33 @@ presence (Channels membership).  Each member should be keyed by
   "channel": "#worker-pool",
   "presence": [
     {
-      "pool_member_id": "pool-reviewer-01",
+      "pool_member_id": "pool-coder-01",
+      "agent_identity": "spawned-coder",
+      "status": "available"
+    },
+    {
+      "pool_member_id": "pool-reviewer-05",
       "agent_identity": "spawned-reviewer",
       "status": "available"
     },
     {
-      "pool_member_id": "pool-validator-01",
+      "pool_member_id": "pool-validator-03",
       "agent_identity": "spawned-validator",
       "status": "available"
     },
     {
-      "pool_member_id": "pool-drift-checker-01",
+      "pool_member_id": "pool-drift-checker-03",
       "agent_identity": "spawned-drift-checker",
       "status": "available"
     },
     {
-      "pool_member_id": "pool-packet-auditor-01",
+      "pool_member_id": "pool-packet-auditor-03",
       "agent_identity": "spawned-packet-auditor",
+      "status": "available"
+    },
+    {
+      "pool_member_id": "pool-orchestrator-03",
+      "agent_identity": "spawned-orchestrator",
       "status": "available"
     }
   ]

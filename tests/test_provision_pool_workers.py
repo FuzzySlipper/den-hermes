@@ -20,6 +20,7 @@ import pytest
 
 from scripts.provision_pool_workers import (
     LIVE_ROLES,
+    DEFAULT_ROLE_SLOT_COUNTS,
     FORBIDDEN_PROFILES,
     SPAWNED_PROFILE_PREFIX,
     POOL_MEMBER_PREFIXES,
@@ -28,6 +29,7 @@ from scripts.provision_pool_workers import (
     compute_fingerprint,
     format_matrix,
     load_registry,
+    parse_slot_counts,
     resolve_role_runtime,
     run_provision,
     scan_for_secrets,
@@ -150,6 +152,14 @@ class TestResolveRoleRuntime:
     def registry(self) -> dict[str, Any]:
         return load_registry(SAMPLE_REGISTRY)
 
+    def test_resolves_coder(self, registry):
+        runtime = resolve_role_runtime(
+            "coder", registry, registry["defaults"], registry["roles"]
+        )
+        assert runtime["role"] == "coder"
+        assert runtime["profile"] == "spawned-coder"
+        assert runtime["model"] == "glm-5.1"
+
     def test_resolves_reviewer(self, registry):
         runtime = resolve_role_runtime(
             "reviewer", registry, registry["defaults"], registry["roles"]
@@ -251,6 +261,37 @@ class TestBuildPoolMember:
             assert member.status == "ready"
 
 
+
+
+# ---------------------------------------------------------------------------
+# parse_slot_counts
+# ---------------------------------------------------------------------------
+
+
+class TestParseSlotCounts:
+    def test_default_slot_counts_match_capacity_target(self):
+        counts = parse_slot_counts(None)
+        assert counts["coder"] == 5
+        assert counts["reviewer"] == 5
+        assert counts["validator"] == 3
+        assert counts["drift_checker"] == 3
+        assert counts["packet_auditor"] == 3
+        assert counts["project_orchestrator"] == 3
+
+    def test_slot_count_overrides(self):
+        counts = parse_slot_counts("coder=6,validator=4")
+        assert counts["coder"] == 6
+        assert counts["reviewer"] == 5
+        assert counts["validator"] == 4
+
+    def test_unknown_slot_count_role_rejected(self):
+        with pytest.raises(ValueError, match="Unknown role"):
+            parse_slot_counts("ghost=2")
+
+    def test_zero_slot_count_rejected(self):
+        with pytest.raises(ValueError, match=">= 1"):
+            parse_slot_counts("coder=0")
+
 # ---------------------------------------------------------------------------
 # run_provision
 # ---------------------------------------------------------------------------
@@ -259,10 +300,26 @@ class TestBuildPoolMember:
 class TestRunProvision:
     def test_dry_run_all_roles_passes(self, registry_path):
         result = run_provision(registry_path, apply_mode=False)
-        assert result.roles_resolved == 5
+        assert result.roles_resolved == 6
         assert result.roles_failed == 0
-        assert len(result.members) == 5
+        assert len(result.members) == sum(DEFAULT_ROLE_SLOT_COUNTS.values())
         assert result.credential_guard_ok is True
+
+    def test_dry_run_respects_slot_count_overrides(self, registry_path):
+        result = run_provision(
+            registry_path,
+            roles=["coder", "reviewer"],
+            slot_counts={"coder": 2, "reviewer": 3},
+        )
+        assert result.roles_resolved == 2
+        assert [member.pool_member_id for member in result.members] == [
+            "pool-coder-01",
+            "pool-coder-02",
+            "pool-reviewer-01",
+            "pool-reviewer-02",
+            "pool-reviewer-03",
+        ]
+        assert all(member.profile_identity in {"spawned-coder", "spawned-reviewer"} for member in result.members)
 
     def test_dry_run_verifies_spawned_profiles(self, registry_path):
         result = run_provision(registry_path)
@@ -296,8 +353,8 @@ class TestRunProvision:
         result = run_provision(registry_path, apply_mode=True)
         captured = capsys.readouterr()
         assert "DEN_MCP_UPSERT" in captured.out
-        # Should have 5 JSON payloads (one per live role/lane)
-        assert captured.out.count("DEN_MCP_UPSERT") == 5
+        # Should have one JSON payload per concrete slot.
+        assert captured.out.count("DEN_MCP_UPSERT") == sum(DEFAULT_ROLE_SLOT_COUNTS.values())
 
 
 # ---------------------------------------------------------------------------
@@ -309,17 +366,20 @@ class TestFormatMatrix:
     def test_matrix_includes_all_roles(self, registry_path):
         result = run_provision(registry_path)
         matrix = format_matrix(result)
+        assert "coder" in matrix
         assert "reviewer" in matrix
         assert "validator" in matrix
         assert "drift_checker" in matrix
         assert "packet_auditor" in matrix
         assert "Pool Worker Provisioning Matrix" in matrix
+        assert "pool-coder-05" in matrix
+        assert "pool-reviewer-05" in matrix
         assert "pool-reviewer-01" in matrix
-        assert "pool-validator-01" in matrix
+        assert "pool-validator-03" in matrix
         assert "pool-drift-checker-01" in matrix
-        assert "pool-packet-auditor-01" in matrix
+        assert "pool-packet-auditor-03" in matrix
         assert "project_orchestrator" in matrix
-        assert "pool-orchestrator-01" in matrix
+        assert "pool-orchestrator-03" in matrix
 
     def test_matrix_reports_errors(self, registry_path):
         # Force an error by passing an empty roles list
