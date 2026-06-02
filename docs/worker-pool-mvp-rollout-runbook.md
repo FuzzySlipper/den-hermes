@@ -78,7 +78,24 @@ Use worker pool when:
 - Gateway delivery + Channels wake infrastructure is in place.
 - The checkpoint protocol is required for governance.
 
-### 2.4 Decision flowchart
+### 2.4 Target-work vs runtime/control attribution
+
+Worker-pool records should default to Den-facing work identity before Hermes
+runtime implementation details:
+
+- `target_project_id`, `task_id`, `assignment_id`, `run_id`, `role`, and
+  `pool_member_id` identify the work being served and belong in the default
+  operator-visible trace.
+- `runtime_project_id`, control channel id, Hermes profile, provider/model,
+  session key, and bridge instance identify the transport/runtime and belong in
+  metadata or diagnostics unless the operator is explicitly debugging runtime
+  delivery.
+- The shared `den-hermes-bridge` control channel is not the job site. A pooled
+  worker can be reached through Bridge while doing work for `goblinbench`,
+  `den-channels`, or any other target project; default grouping should make the
+  target project/task/run obvious.
+
+### 2.5 Decision flowchart
 
 ```
 Is the work synchronous and short-lived (<30s)?

@@ -20,8 +20,13 @@ workflows managed by the Den orchestrator bridge. Each role entry defines:
 ## 2. Role profile identity conventions
 
 Every spawned-Hermes worker role uses a **shared Hermes profile**. The
-profile identity is a grouping handle; concrete instance selection uses
-`pool_member_id` or `agent_instance_id`.
+profile identity is a runtime grouping handle; concrete instance selection uses
+`pool_member_id` or `agent_instance_id`. Operator-facing work evidence should
+lead with Den work identity (`target_project_id`, `task_id`, `assignment_id`,
+`run_id`, `worker_role`, `pool_member_id`) and then expose Hermes profile,
+provider/model, session, and control-channel details as runtime diagnostics.
+The Bridge/control project is the bus depot, not proof that the target work
+belongs to `den-hermes-bridge`.
 
 | Role | `profile_identity` | `worker_role` (Den value) | Canonical Den role |
 |---|---|---|---|

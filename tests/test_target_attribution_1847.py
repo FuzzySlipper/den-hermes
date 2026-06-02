@@ -25,6 +25,7 @@ from den_hermes.channels_bridge import (
 )
 from den_hermes.orchestrator import (
     DenWorkflowAdapter,
+    build_mcp_adapter,
     enrich_final_status,
 )
 from den_hermes.worker_launcher import run_hermes_worker
@@ -205,6 +206,19 @@ class TestDenWorkflowAdapterTargetAttribution:
         assert call["tool"] == "get_latest_worker_completion"
         assert call["project_id"] == "goblinbench"
 
+    def test_determine_next_action_uses_target_project(self):
+        tools = FakeTools()
+        adapter = DenWorkflowAdapter(
+            tools=tools,
+            project_id="den-hermes-bridge",
+            requested_by="test-runner",
+            target_project_id="goblinbench",
+        )
+        adapter.determine_orchestrator_next_action(task_id=42)
+        call = tools.calls[0]
+        assert call["tool"] == "determine_orchestrator_next_action"
+        assert call["project_id"] == "goblinbench"
+
     def test_get_worker_run_status_uses_target_project(self):
         tools = FakeTools()
         adapter = DenWorkflowAdapter(
@@ -311,6 +325,18 @@ class TestDenWorkflowAdapterTargetAttribution:
         adapter.mark_worker_started(task_id=42, run_id="run-1", role="coder")
         call = tools.calls[0]
         assert call["project_id"] == "den-hermes-bridge"
+
+    @patch.dict(os.environ, {"DEN_HERMES_MCP_URL": "http://mcp.local/mcp"}, clear=False)
+    @patch("den_hermes.orchestrator.McpHttpTools")
+    def test_build_mcp_adapter_accepts_target_project(self, mock_tools):
+        adapter = build_mcp_adapter(
+            project_id="den-hermes-bridge",
+            requested_by="test-runner",
+            target_project_id="goblinbench",
+        )
+        assert adapter.project_id == "den-hermes-bridge"
+        assert adapter.target_project_id == "goblinbench"
+        assert adapter.work_project_id == "goblinbench"
 
 
 # ---------------------------------------------------------------------------
@@ -440,14 +466,20 @@ class TestWorkerLauncherTargetProject:
                 project_id="den-hermes-bridge",
                 prompt="test prompt",
                 expected_artifact=str(artifact_path),
-                env_overrides={"DEN_TARGET_PROJECT_ID": "goblinbench"},
+                env_overrides={
+                    "DEN_TARGET_PROJECT_ID": "goblinbench",
+                    "DEN_RUNTIME_PROJECT_ID": "den-hermes-bridge",
+                    "DEN_TARGET_TASK_ID": "42",
+                },
             )
 
             call_kwargs = mock_run.call_args
             env = call_kwargs.kwargs.get("env") or call_kwargs[1].get("env")
             assert env is not None
             assert env.get("DEN_PROJECT_ID") == "den-hermes-bridge"
+            assert env.get("DEN_RUNTIME_PROJECT_ID") == "den-hermes-bridge"
             assert env.get("DEN_TARGET_PROJECT_ID") == "goblinbench"
+            assert env.get("DEN_TARGET_TASK_ID") == "42"
 
     @patch("den_hermes.worker_launcher.subprocess.run")
     @patch("den_hermes.worker_launcher._validate_artifact_identity", return_value=None)
@@ -659,3 +691,28 @@ class TestActivityContextAttribution:
         assert result.get("projectId") == "den-hermes-bridge"
         # targetProjectId should not be present (no target in parent)
         assert "targetProjectId" not in result
+
+    def test_child_context_can_fill_target_from_env_overrides(self):
+        from den_hermes.orchestrator import _child_activity_context
+
+        parent_context = {
+            "gatewayUrl": "http://gateway",
+            "channelId": "5",
+            "displayBlockId": "100",
+            "projectId": "den-hermes-bridge",
+        }
+        result = _child_activity_context(
+            role="coder",
+            run_id="run-1",
+            agent_identity="pool-coder-01",
+            explicit_context=parent_context,
+            env_overrides={
+                "DEN_TARGET_PROJECT_ID": "goblinbench",
+                "DEN_RUNTIME_PROJECT_ID": "den-hermes-bridge",
+                "DEN_TARGET_TASK_ID": "42",
+            },
+        )
+        assert result is not None
+        assert result.get("targetProjectId") == "goblinbench"
+        assert result.get("runtimeProjectId") == "den-hermes-bridge"
+        assert result.get("taskId") == "42"

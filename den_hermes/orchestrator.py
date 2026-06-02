@@ -274,7 +274,7 @@ class DenWorkflowAdapter:
 
     def determine_orchestrator_next_action(self, *, task_id: int, max_attempts: int = 3) -> Mapping[str, Any]:
         response = self.tools.mcp_den_determine_orchestrator_next_action(
-            project_id=self.project_id,
+            project_id=self.work_project_id,
             task_id=task_id,
             max_attempts=max_attempts,
         )
@@ -1017,6 +1017,8 @@ def run_tracked_coder_path(
     blocks the assignment on missing pool identity or role/profile mismatch.
     """
 
+    worker_env_overrides = _worker_env_overrides(adapter=adapter, task_id=task_id, env_overrides=env_overrides)
+
     try:
         packet = adapter.prepare_coder_context_packet(
             task_id=task_id,
@@ -1102,13 +1104,14 @@ def run_tracked_coder_path(
         profile=runtime.profile,
         toolsets=list(runtime.toolsets) if not pool_mode else None,
         cwd=cwd if cwd is not None else runtime.workdir,
-        env_overrides=env_overrides,
+        project_id=adapter.project_id,
+        env_overrides=worker_env_overrides,
         activity_context=_child_activity_context(
             role="coder",
             run_id=run_id,
             agent_identity=runtime.profile or "coder",
             explicit_context=activity_context,
-            env_overrides=env_overrides,
+            env_overrides=worker_env_overrides,
         ),
         timeout_seconds=runtime.timeout_seconds,
     )
@@ -1210,6 +1213,8 @@ def run_tracked_reviewer_path(
     are suppressed (the pool gateway's profile is the runtime authority),
     and pool runtime identity is verified before launch.
     """
+
+    worker_env_overrides = _worker_env_overrides(adapter=adapter, task_id=task_id, env_overrides=env_overrides)
 
     missing = [field for field in ("branch", "head_commit", "tests_run") if not coder_artifact.get(field)]
     if missing:
@@ -1325,13 +1330,14 @@ def run_tracked_reviewer_path(
         profile=runtime.profile,
         toolsets=list(runtime.toolsets) if not pool_mode else None,
         cwd=cwd if cwd is not None else runtime.workdir,
-        env_overrides=env_overrides,
+        project_id=adapter.project_id,
+        env_overrides=worker_env_overrides,
         activity_context=_child_activity_context(
             role="reviewer",
             run_id=run_id,
             agent_identity=runtime.profile or "reviewer",
             explicit_context=activity_context,
-            env_overrides=env_overrides,
+            env_overrides=worker_env_overrides,
         ),
         timeout_seconds=runtime.timeout_seconds,
     )
@@ -1437,6 +1443,8 @@ def run_tracked_gate_role_path(
     and pool runtime identity is verified before launch.
     """
 
+    worker_env_overrides = _worker_env_overrides(adapter=adapter, task_id=task_id, env_overrides=env_overrides)
+
     if role not in {"validator", "drift_checker", "packet_auditor"}:
         return GateRolePathResult(status="failed", run_id=run_id, role=role, error=f"Unsupported gate role: {role}")
     try:
@@ -1533,13 +1541,14 @@ def run_tracked_gate_role_path(
         profile=runtime.profile,
         toolsets=list(runtime.toolsets) if not pool_mode else None,
         cwd=cwd if cwd is not None else runtime.workdir,
-        env_overrides=env_overrides,
+        project_id=adapter.project_id,
+        env_overrides=worker_env_overrides,
         activity_context=_child_activity_context(
             role=role,
             run_id=run_id,
             agent_identity=runtime.profile or role,
             explicit_context=activity_context,
-            env_overrides=env_overrides,
+            env_overrides=worker_env_overrides,
         ),
         timeout_seconds=runtime.timeout_seconds,
     )
@@ -1677,7 +1686,12 @@ def handle_review_outcome(
     )
 
 
-def build_mcp_adapter(*, project_id: str, requested_by: str) -> DenWorkflowAdapter:
+def build_mcp_adapter(
+    *,
+    project_id: str,
+    requested_by: str,
+    target_project_id: str | None = None,
+) -> DenWorkflowAdapter:
     """Build a Den MCP-backed adapter for live orchestrator runs."""
 
     url = os.environ.get("DEN_HERMES_MCP_URL") or os.environ.get("DEN_MCP_URL")
@@ -1688,6 +1702,7 @@ def build_mcp_adapter(*, project_id: str, requested_by: str) -> DenWorkflowAdapt
         tools=McpHttpTools(url, timeout_seconds=timeout),
         project_id=project_id,
         requested_by=requested_by,
+        target_project_id=target_project_id or os.environ.get("DEN_TARGET_PROJECT_ID") or None,
     )
 
 
@@ -1891,6 +1906,11 @@ def lease_aware_stop(
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Evaluate the next Den spawned-Hermes orchestrator action.")
     parser.add_argument("--project-id", required=True)
+    parser.add_argument(
+        "--target-project-id",
+        default=None,
+        help="Work-owning project for task-scoped operations; --project-id remains the runtime/control project.",
+    )
     parser.add_argument("--task-id", type=int, required=True)
     parser.add_argument("--requested-by", default="den-hermes-runner")
     parser.add_argument("--max-attempts", type=int, default=3)
@@ -1899,7 +1919,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--stop-reason", default=None, help="Reason for stop request (operator-facing)")
     args = parser.parse_args(argv)
 
-    adapter = build_mcp_adapter(project_id=args.project_id, requested_by=args.requested_by)
+    adapter_args = {
+        "project_id": args.project_id,
+        "requested_by": args.requested_by,
+    }
+    if args.target_project_id:
+        adapter_args["target_project_id"] = args.target_project_id
+    adapter = build_mcp_adapter(**adapter_args)
 
     # Lease-aware stop path: drain active leases, clean up stuck children, free pool member
     if args.stop:
@@ -2080,6 +2106,28 @@ def _selected_runtime_registry_path(runtime_registry_path: str | Path | None) ->
 _ACTIVITY_CONTEXT_ENV = "DEN_CHANNELS_ACTIVITY_CONTEXT"
 
 
+def _worker_env_overrides(
+    *,
+    adapter: DenWorkflowAdapter,
+    task_id: int,
+    env_overrides: Mapping[str, str] | None = None,
+) -> dict[str, str] | None:
+    """Return worker env overrides with explicit runtime/target attribution.
+
+    ``DEN_PROJECT_ID`` is supplied to ``run_hermes_worker`` as the runtime
+    project. These companion env vars let child workers and activity metadata
+    preserve the work-owning target project/task without confusing it with the
+    bridge/control project.
+    """
+
+    merged = dict(env_overrides or {})
+    merged.setdefault("DEN_RUNTIME_PROJECT_ID", adapter.project_id)
+    merged.setdefault("DEN_TARGET_TASK_ID", str(task_id))
+    if adapter.target_project_id:
+        merged.setdefault("DEN_TARGET_PROJECT_ID", adapter.target_project_id)
+    return merged or None
+
+
 def _json_obj(value: Any) -> dict[str, Any]:
     if isinstance(value, Mapping):
         return dict(value)
@@ -2146,6 +2194,13 @@ def _child_activity_context(
             if parent.get(source_key) not in {None, ""}:
                 context[child_key] = parent[source_key]
                 break
+    if env_overrides:
+        if env_overrides.get("DEN_TARGET_PROJECT_ID") and not context.get("targetProjectId"):
+            context["targetProjectId"] = env_overrides["DEN_TARGET_PROJECT_ID"]
+        if env_overrides.get("DEN_RUNTIME_PROJECT_ID") and not context.get("runtimeProjectId"):
+            context["runtimeProjectId"] = env_overrides["DEN_RUNTIME_PROJECT_ID"]
+        if env_overrides.get("DEN_TARGET_TASK_ID") and not context.get("taskId"):
+            context["taskId"] = env_overrides["DEN_TARGET_TASK_ID"]
     return {key: value for key, value in context.items() if value not in {None, ""}}
 
 
