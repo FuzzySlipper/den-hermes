@@ -100,7 +100,7 @@ For Den worker semantics, the key limitation is not intelligence; it is lifecycl
 
 `delegate_task` is synchronous inside the parent run. Its own model-facing description states the durable-work warning explicitly: if the parent is interrupted, stopped, or reset, children are cancelled/interrupted and cannot continue in the background. Intermediate child tool results do not enter parent context; only the final summary arrives.
 
-Those properties are good for local reasoning fan-out, but they do not match the current Den Pi worker contract where worker runs are durable Den records with status, packet refs, cleanup, rerun/abort, and operator-observable lifecycle independent of the orchestrator turn.
+Those properties are good for local reasoning fan-out, but they do not match the current Den tracked-worker contract where worker runs are durable Den records with status, packet refs, cleanup, rerun/abort, and operator-observable lifecycle independent of the orchestrator turn.
 
 ## Lessons from Den Pi and oh-my-hermes
 
@@ -221,7 +221,7 @@ or a more structured local runner invokes Hermes with a state-file or prompt-pac
 - can run in background with OS process lifecycle;
 - durable Den worker run records can map to process/session IDs;
 - easier to abort/rerun/cleanup than in-process `delegate_task`;
-- closer to current Pi worker semantics without Docker/tmux/Pi;
+- closer to current tracked-worker semantics without Docker/tmux/Pi;
 - child has a full Hermes profile/process, so tool permissions can be role/profile-specific.
 
 **Cons:**

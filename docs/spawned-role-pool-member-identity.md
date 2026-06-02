@@ -20,7 +20,7 @@ runtime registry and break the role/source-of-truth contract.
 |---|---|---|---|
 | `profile_identity` | Shared display/capability field | `spawned-coder` | One per role |
 | `worker_identity` | Concrete pool member | `pool-coder-01` | One per instance |
-| `agent_instance_id` / `adapter_instance_id` | System-level binding instance | `hermes:den-k8:spawned-coder:wake-a1b2c3` | One per process/lifecycle |
+| `agent_instance_id` / `adapter_instance_id` | System-level binding instance | `hermes:den-k8plus:spawned-coder:wake-a1b2c3` | One per process/lifecycle |
 
 - **`profile_identity`** corresponds to the Hermes profile name in the
   runtime registry.  It is the `agent_identity` in Den Channels memberships
@@ -78,10 +78,10 @@ When the Bridge wakes a worker:
 Profile:           spawned-coder
 Agent identity:    spawned-coder
 Pool member ID:    pool-coder-01
-Instance ID:       hermes:den-k8:spawned-coder:wake-abc123
+Instance ID:       hermes:den-k8plus:spawned-coder:wake-abc123
 
 Core binding:
-  { "instance_id": "hermes:den-k8:spawned-coder:wake-abc123",
+  { "instance_id": "hermes:den-k8plus:spawned-coder:wake-abc123",
     "agent_identity": "spawned-coder",
     "role": "coder",
     "pool_member_id": "pool-coder-01",

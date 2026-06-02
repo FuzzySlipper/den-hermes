@@ -249,7 +249,7 @@ def build_pool_member(
     pool_member_id = f"{prefix}-01"
     capabilities = ROLE_CAPABILITIES.get(role, [role])
     agent_instance_template = (
-        f"hermes:den-k8:{runtime['profile']}:{pool_member_id}:{{id_suffix}}"
+        f"hermes:den-k8plus:{runtime['profile']}:{pool_member_id}:{{id_suffix}}"
     )
 
     return ResolvedPoolMember(

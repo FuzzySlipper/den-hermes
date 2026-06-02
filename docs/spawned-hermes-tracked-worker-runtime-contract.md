@@ -206,14 +206,14 @@ Den should own durable records and invariants:
 - store identity, launch metadata, and status projection;
 - provide update/status/abort/cleanup/rerun tools for local spawned runs where possible;
 - reject completion packets for missing or mismatched runs;
-- expose latest completion and worker status consistently with Pi worker runs;
+- expose latest completion and worker status consistently with tracked worker runs across substrates;
 - maintain audit trail for registration, status changes, completion packets, and cleanup.
 
 Likely MCP/API additions or generalizations:
 
 - `mcp_den_register_worker_run` or `mcp_den_register_spawned_hermes_worker_run`;
 - optional `mcp_den_update_worker_run_runtime` for PID/log/artifact/exit metadata;
-- status/abort/cleanup/rerun paths generalized from raw Pi worker tools or made substrate-aware.
+- status/abort/cleanup/rerun paths generalized from earlier substrate-specific tools or made substrate-aware.
 
 ### `den-hermes-bridge` responsibilities
 

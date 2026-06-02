@@ -795,9 +795,9 @@ bindings for `spawned-reviewer`), verify that deliveries without a
 # Simulated check (conceptual — no automation script for this yet):
 #
 # 1. Register two bindings for spawned-reviewer:
-#    - instance_id=hermes:den-k8:spawned-reviewer:pool-reviewer-01:wake-aaa
+#    - instance_id=hermes:den-k8plus:spawned-reviewer:pool-reviewer-01:wake-aaa
 #      pool_member_id=pool-reviewer-01
-#    - instance_id=hermes:den-k8:spawned-reviewer:pool-reviewer-02:wake-bbb
+#    - instance_id=hermes:den-k8plus:spawned-reviewer:pool-reviewer-02:wake-bbb
 #      pool_member_id=pool-reviewer-02
 # 2. Send a delivery target with agent_identity=spawned-reviewer but NO
 #    pool_member_id or concrete_identity.
@@ -1278,7 +1278,7 @@ Source and runtime evidence:
 
 - den-core live health after deploy: commit `c18dc36c4180`.
 - Deploy backup path: `/data/services/den-core/app.previous.20260601T110052Z`.
-- Focused server route tests on den-srv before deploy: `dotnet test tests/DenMcp.Server.Tests/DenMcp.Server.Tests.csproj --filter OrchestratorLease --logger "console;verbosity=minimal"` → 4/4 passed.
+- Focused server route tests on den-srv (192.168.1.10) before deploy: `dotnet test tests/DenMcp.Server.Tests/DenMcp.Server.Tests.csproj --filter OrchestratorLease --logger "console;verbosity=minimal"` → 4/4 passed.
 - Project-orchestrator member readback: `pool-orchestrator-01`, `profile_identity=spawned-orchestrator`, `worker_role=project_orchestrator`, `status=available`, `agent_instance_id=den-k8plus:spawned-orchestrator:project_orchestrator:gateway`, channel `5`.
 
 Lease lifecycle smoke:

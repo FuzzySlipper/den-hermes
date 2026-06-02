@@ -5,8 +5,8 @@
 
 schema_version: 1
 registry_id: den-hermes-runner-defaults
-updated_at: "2026-05-30T00:00:00Z"
-updated_by: task-1784-pool-worker-provisioning
+updated_at: "2026-06-02T00:00:00Z"
+updated_by: task-1842-runtime-profile-legacy-sweep
 notes: >-
   Central spawned-Hermes runtime picks for Den orchestrator roles.
   Role catalog: docs/worker-role-catalog.md.
@@ -123,8 +123,8 @@ roles:
   project_orchestrator:
     runtime_id: project-orchestrator-primary
     profile: spawned-orchestrator
-    provider: deepseek
-    model: deepseek-v4-flash
+    provider: openai-codex
+    model: gpt-5.5
     toolsets: [terminal, file]
     timeout_seconds: 1800
     reasoning_effort: high

@@ -187,7 +187,7 @@ class TestResolveRoleRuntime:
         )
         assert runtime["role"] == "project_orchestrator"
         assert runtime["profile"] == "spawned-orchestrator"
-        assert runtime["provider"] == "deepseek"
+        assert runtime["provider"] == "openai-codex"
 
     def test_missing_role_raises(self, registry):
         with pytest.raises(RuntimeError, match="not found"):

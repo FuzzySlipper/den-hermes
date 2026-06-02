@@ -42,7 +42,7 @@ profile identity is a grouping handle; concrete instance selection uses
 - **`pool_member_id`**: concrete instance identifier within a pool, e.g.
   `pool-coder-01`. Required for pool members; optional for one-shot workers.
 - **`agent_instance_id`**: system-level unique handle for the process/lifecycle,
-  e.g. `hermes:den-k8:spawned-coder:wake-a1b2c3`. Used in Gateway delivery
+  e.g. `hermes:den-k8plus:spawned-coder:wake-a1b2c3`. Used in Gateway delivery
   metadata and Core agent-instance bindings.
 - **Delivery targeting**: when delivering to a shared-profile worker pool,
   the delivery carries a `concrete_identity` (`pool_member_id` or
