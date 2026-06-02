@@ -123,6 +123,9 @@ class ResolvedPoolMember:
     capabilities: list[str]
     timeout_seconds: int
     status: str = "pending"  # pending | ready | blocked
+    provisioning_source: str = "den-worker"
+    provisioning_repo: str | None = None
+    provisioning_registry_fingerprint: str | None = None
 
 
 @dataclass
@@ -188,7 +191,7 @@ def resolve_role_runtime(
         "model": model,
         "toolsets": role_entry.get("toolsets", defaults.get("toolsets", [])),
         "timeout_seconds": role_entry.get("timeout_seconds", defaults.get("timeout_seconds", 900)),
-        "source": launch.get("source", "den-worker"),
+        "provisioning_source": launch.get("source", "den-worker"),
     }
 
 
@@ -261,6 +264,7 @@ def build_pool_member(
         capabilities=list(capabilities),
         timeout_seconds=runtime["timeout_seconds"],
         status="ready",
+        provisioning_source=runtime.get("provisioning_source", "den-worker"),
     )
 
 
@@ -393,7 +397,13 @@ def run_provision(
 
 
 def _emit_apply_payloads(result: ProvisioningResult) -> None:
-    """Print structured JSON payloads for Den MCP/Core upsert."""
+    """Print structured JSON payloads for Den MCP/Core upsert.
+
+    Payloads include a ``provisioning`` object for historical metadata
+    (source, registry fingerprint) while keeping operational fields
+    at the top level.  No bare ``task_id``, ``repo``, or ``source``
+    fields are emitted — those live under ``provisioning``.
+    """
     for member in result.members:
         payload = {
             "action": "upsert_pool_member",
@@ -409,6 +419,11 @@ def _emit_apply_payloads(result: ProvisioningResult) -> None:
                 "timeout_seconds": member.timeout_seconds,
                 "status": member.status,
                 "agent_instance_id_template": member.agent_instance_id_template,
+                "provisioning": {
+                    "source": member.provisioning_source,
+                    "repo": member.provisioning_repo,
+                    "registry_fingerprint": member.provisioning_registry_fingerprint or result.registry_fingerprint,
+                },
             },
         }
         print(f"### DEN_MCP_UPSERT {json.dumps(payload, indent=2)}")

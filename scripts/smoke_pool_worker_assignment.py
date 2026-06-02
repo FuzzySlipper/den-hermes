@@ -148,7 +148,10 @@ def smoke_role(
         project_id=project_id,
         metadata={
             "smoke": True,
-            "source": "smoke_pool_worker_assignment.py",
+            "provisioning": {
+                "source": "smoke_pool_worker_assignment.py",
+                "task_id": task_id,
+            },
         },
     )
 
@@ -311,6 +314,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         type=int,
         help="Task ID for smoke assignments (default: 1784)",
     )
+    parser.add_argument(
+        "--project-id",
+        default="den-hermes-bridge",
+        help="Project ID for smoke assignments (default: den-hermes-bridge)",
+    )
 
     args = parser.parse_args(argv)
     roles = [r.strip() for r in args.roles.split(",") if r.strip()]
@@ -318,6 +326,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     report = run_smoke(
         roles=roles,
         task_id=args.task_id,
+        project_id=args.project_id,
         run_id=args.run_id,
     )
 

@@ -1396,6 +1396,25 @@ Pool workers are reachable via a shared control channel (channel 5, `den-hermes-
 
 **Smoke defaults caveat:** `scripts/smoke_pool_worker_assignment.py` defaults `task_id=1784` / `project_id="den-hermes-bridge"`. These are **pilot provisioning defaults only**, not structural work-attribution truth. Cross-project callers must supply explicit `target_project_id`.
 
+### 14.12 Pool-member metadata schema (from #1836)
+
+Pool-member metadata is split into two layers to prevent historical provisioning defaults from being read as current work attribution.
+
+**Operational / control topology** (top-level, preserved):
+`worker_identity`, `profile_identity`, `worker_role`, `agent_instance_id`, `channel_id`, `session_id`, `status`, `capabilities`, `runtime_id`, `provider`, `model`, `registry_fingerprint`, `preflight`, `smoke`, `scout`, `lease_kind`, `memory_policy`, `core_dependency`, `timeout_seconds`.
+
+**Provisioning provenance** (nested under `provisioning`, historical only):
+`source` (e.g. `"provisioning_script"`, `"reviewed_provisioning_script"`), `repo` (e.g. `"den-hermes"`), `task_id` (e.g. `1784`), `commit`, `registry_fingerprint`.
+
+**Normalization rules:**
+- No bare `task_id`, `repo`, or `source` at the top level of pool member metadata.
+- Historical values are moved under a `provisioning` object.
+- `provision_pool_workers.py` emits `provisioning: {source, repo, registry_fingerprint}` in apply payloads.
+- `smoke_pool_worker_assignment.py` nests smoke metadata under `provisioning` key.
+- `Den MCP upsert_pool_member` consumers should read `provisioning` for audit/debug but resolve routing by `worker_role`/`profile`/`pool_member_id`.
+
+**Before/after evidence** should be recorded in the task thread (#1836): before shows historical `task_id`/`repo`/`source`; after shows `provisioning` object.
+
 ## Appendix C: Downstream notes for task #1739
 
 ### Pool-member identity naming convention
