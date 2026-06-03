@@ -3,6 +3,7 @@ import subprocess
 
 import pytest
 
+from den_hermes.api_urls import join_api_url
 from den_hermes.orchestrator import (
     DenWorkflowAdapter,
     GateRolePathResult,
@@ -20,6 +21,10 @@ from den_hermes.orchestrator import (
     lease_aware_stop,
     PROJECT_ORCHESTRATOR_DIAGNOSTIC_GUARDRAILS,
     _artifact_with_repo_metadata,
+    _classify_channels_error_text,
+    _classify_url_request_failure,
+    _completion_repo_refs,
+    _completion_summary_text,
     _finalize_pool_assignment,
     _record_launch_failure_recovery,
     _launch_zombie_smoke_check,
@@ -61,6 +66,13 @@ def make_adapter(tools):
         project_id="den-hermes-bridge",
         requested_by="den-hermes-runner",
     )
+
+
+@pytest.fixture(autouse=True)
+def clear_ambient_pool_runtime_env(monkeypatch):
+    """Keep role-specific orchestrator tests independent of live pool profiles."""
+    for name in ("DEN_HERMES_POOL_MEMBER_ID", "DEN_HERMES_PROFILE"):
+        monkeypatch.delenv(name, raising=False)
 
 
 def test_terminal_done_task_is_noop_and_does_not_launch_workers():
@@ -1111,6 +1123,96 @@ def test_reconcile_completed_child_assignment_skips_missing_completion():
         "list_assignments",
         "get_latest_worker_completion",
     ]
+
+
+def test_reconcile_completed_child_assignment_skips_malformed_assignment_keys():
+    tools = RecordingCoderTools()
+    tools.active_assignments = [
+        {"id": 106, "task_id": 1755, "role": "validator", "state": "ack"},
+        {"run_id": "missing-id", "task_id": 1755, "role": "validator", "state": "ack"},
+        {"id": 107, "run_id": "missing-task", "role": "validator", "state": "ack"},
+    ]
+
+    finalized = reconcile_completed_child_assignments(make_adapter(tools))
+
+    assert finalized == []
+    assert [name for name, _ in tools.calls] == ["list_assignments"]
+
+
+def test_reconcile_completed_child_assignment_rerun_after_checkpoint_before_release_is_idempotent():
+    tools = RecordingCoderTools()
+    tools.active_assignments = [
+        {"id": 108, "worker_identity": "pool-reviewer-02", "run_id": "review-crash-run", "task_id": 1755, "role": "reviewer", "state": "ack"}
+    ]
+    tools.completions["review-crash-run"] = {
+        "completion_state": "present",
+        "completion": {
+            "message_id": 10235,
+            "status": "completed",
+            "packet_type": "review_findings_packet",
+            "role": "reviewer",
+            "run_id": "review-crash-run",
+            "summary": "Review still looks good after retry.",
+        },
+    }
+    original_release = tools.mcp_den_release_assignment
+    release_attempts = {"count": 0}
+
+    def crash_once_release(**kwargs):
+        release_attempts["count"] += 1
+        if release_attempts["count"] == 1:
+            raise RuntimeError("simulated crash after checkpoint before release")
+        return original_release(**kwargs)
+
+    tools.mcp_den_release_assignment = crash_once_release
+    adapter = make_adapter(tools)
+
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        reconcile_completed_child_assignments(adapter)
+
+    finalized = reconcile_completed_child_assignments(adapter)
+
+    assert finalized == [108]
+    checkpoint_calls = [kwargs for name, kwargs in tools.calls if name == "append_checkpoint"]
+    assert len(checkpoint_calls) == 2
+    assert checkpoint_calls[0]["payload"] == checkpoint_calls[1]["payload"]
+    assert release_attempts["count"] == 2
+
+
+def test_assignment_cleanup_evidence_merges_extra_fields():
+    tools = RecordingCoderTools()
+    adapter = make_adapter(tools)
+
+    adapter.record_assignment_cleanup_evidence(
+        assignment_id=109,
+        evidence={"run_id": "cleanup-run", "role": "validator", "artifact_handles": ["/tmp/artifact.json"]},
+    )
+
+    cleanup = [kwargs for name, kwargs in tools.calls if name == "record_cleanup_evidence"][0]
+    cleanup_payload = json.loads(cleanup["evidence"])
+    assert cleanup_payload == {
+        "artifact_handles": ["/tmp/artifact.json"],
+        "role": "validator",
+        "run_id": "cleanup-run",
+        "source": "spawned_hermes_orchestrator",
+        "status": "cleaned_up",
+    }
+
+
+def test_completion_helpers_handle_non_mapping_repo_empty_summary_and_unavailable_tools():
+    assert _completion_repo_refs({"final_repo": "not-a-mapping", "metadata": {"branch": "task/fallback"}}) == (
+        "task/fallback",
+        None,
+    )
+    assert _completion_summary_text({"summary": "", "content": "\n"}, role="validator") == "validator worker completed"
+
+    class NoPoolTools:
+        pass
+
+    assert make_adapter(NoPoolTools()).verify_pool_member_available(worker_identity="pool-coder-01") == {
+        "verified": False,
+        "reason": "mcp_den_list_pool_members tool unavailable",
+    }
 
 
 
@@ -2498,6 +2600,24 @@ class TestGateRoleLaunchFailureFinalization:
     gate path has equivalent coverage.
     """
 
+    @staticmethod
+    def _assert_launch_failure_cleanup(tools, *, run_id: str, assignment_id: int, role: str) -> None:
+        lifecycle_calls = [
+            name for name, _ in tools.calls
+            if name in ("post_worker_completion_packet", "append_checkpoint", "record_cleanup_evidence", "release_assignment")
+        ]
+        assert "append_checkpoint" in lifecycle_calls
+        assert "record_cleanup_evidence" in lifecycle_calls
+        assert "release_assignment" in lifecycle_calls
+        cleanup_call = [c for c in tools.calls if c[0] == "record_cleanup_evidence"][0]
+        cleanup_evidence = json.loads(cleanup_call[1]["evidence"])
+        assert cleanup_evidence["status"] == "launch_failure_cleaned_up"
+        assert cleanup_evidence["run_id"] == run_id
+        assert cleanup_evidence["assignment_id"] == assignment_id
+        assert cleanup_evidence["role"] == role
+        assert cleanup_evidence["artifact_path"].endswith(f"{run_id}/completion.json")
+        assert cleanup_evidence["log_path"].endswith(f"{run_id}/worker.log")
+
     def test_validator_launch_failure_finalizes_assignment_and_no_zombie(self, tmp_path, monkeypatch):
         """Validator launch failure → assignment finalized and no zombie."""
         monkeypatch.delenv("DEN_HERMES_POOL_MEMBER_ID", raising=False)
@@ -2522,21 +2642,12 @@ class TestGateRoleLaunchFailureFinalization:
         assert result.status == "failed"
         assert result.assignment_finalized is True
 
-        lifecycle_calls = [
-            name for name, _ in tools.calls
-            if name in ("post_worker_completion_packet", "append_checkpoint", "record_cleanup_evidence", "release_assignment")
-        ]
-        assert "append_checkpoint" in lifecycle_calls
-        assert "record_cleanup_evidence" in lifecycle_calls
-        assert "release_assignment" in lifecycle_calls
-        cleanup_call = [c for c in tools.calls if c[0] == "record_cleanup_evidence"][0]
-        cleanup_evidence = json.loads(cleanup_call[1]["evidence"])
-        assert cleanup_evidence["status"] == "launch_failure_cleaned_up"
-        assert cleanup_evidence["run_id"] == "validator-fail-run"
-        assert cleanup_evidence["assignment_id"] == 55
-        assert cleanup_evidence["role"] == "validator"
-        assert cleanup_evidence["artifact_path"].endswith("validator-fail-run/completion.json")
-        assert cleanup_evidence["log_path"].endswith("validator-fail-run/worker.log")
+        self._assert_launch_failure_cleanup(
+            tools,
+            run_id="validator-fail-run",
+            assignment_id=55,
+            role="validator",
+        )
 
     def test_drift_checker_launch_failure_finalizes_assignment(self, tmp_path, monkeypatch):
         """Drift checker launch failure → assignment finalized."""
@@ -2562,11 +2673,12 @@ class TestGateRoleLaunchFailureFinalization:
         assert result.status == "failed"
         assert result.assignment_finalized is True
 
-        lifecycle_calls = [
-            name for name, _ in tools.calls
-            if name in ("post_worker_completion_packet", "append_checkpoint", "record_cleanup_evidence", "release_assignment")
-        ]
-        assert "release_assignment" in lifecycle_calls
+        self._assert_launch_failure_cleanup(
+            tools,
+            run_id="drift-fail-run",
+            assignment_id=56,
+            role="drift_checker",
+        )
 
     def test_packet_auditor_launch_failure_finalizes_assignment(self, tmp_path, monkeypatch):
         """Packet auditor launch failure → assignment finalized."""
@@ -2592,11 +2704,12 @@ class TestGateRoleLaunchFailureFinalization:
         assert result.status == "failed"
         assert result.assignment_finalized is True
 
-        lifecycle_calls = [
-            name for name, _ in tools.calls
-            if name in ("post_worker_completion_packet", "append_checkpoint", "record_cleanup_evidence", "release_assignment")
-        ]
-        assert "release_assignment" in lifecycle_calls
+        self._assert_launch_failure_cleanup(
+            tools,
+            run_id="audit-fail-run",
+            assignment_id=57,
+            role="packet_auditor",
+        )
 
 
 class TestSuccessfulLaunchNoDoubleRelease:
@@ -2907,10 +3020,37 @@ class TestDirectAgentWakeBridge:
         )
 
         assert result["ok"] is False
-        assert result["failure_category"] == "worker_wake_bridge_route_error"
+        assert result["failure_category"] == "worker_wake_bridge_auth_error"
         assert "error" in result
         assert "diagnostic" in result
         assert "channels.test" in result["diagnostic"]
+    def test_direct_agent_url_normalization_uses_shared_helper(self):
+        assert join_api_url(
+            "http://channels.test/api/gateway",
+            "/api/gateway/direct-agent-messages",
+        ) == "http://channels.test/api/gateway/direct-agent-messages"
+        assert join_api_url(
+            "http://channels.test/api",
+            "/api/gateway/direct-agent-messages",
+        ) == "http://channels.test/api/gateway/direct-agent-messages"
+
+    def test_direct_agent_failure_category_classifies_common_urllib_errors(self):
+        from email.message import Message
+        from urllib.error import HTTPError, URLError
+
+        assert _classify_channels_error_text("Unauthorized") == "worker_wake_bridge_auth_error"
+        assert _classify_channels_error_text("Connection refused") == "worker_wake_bridge_connection_error"
+        assert _classify_channels_error_text("Name or service not known") == "worker_wake_bridge_dns_error"
+        assert _classify_channels_error_text("timed out") == "worker_wake_bridge_timeout"
+        assert _classify_url_request_failure(HTTPError(
+            "http://channels.test/api/gateway/direct-agent-messages",
+            404,
+            "Not Found",
+            hdrs=Message(),
+            fp=None,
+        )) == "worker_wake_bridge_route_error"
+        assert _classify_url_request_failure(URLError(TimeoutError("timed out"))) == "worker_wake_bridge_timeout"
+
 
 
 def _make_minimal_tools():

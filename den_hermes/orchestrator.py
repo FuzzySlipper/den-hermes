@@ -11,27 +11,7 @@ from pathlib import Path
 from typing import Any, Mapping
 from urllib.parse import quote
 
-logger = logging.getLogger(__name__)
-
-
-def _join_channels_api_url(base_url: str, path: str) -> str:
-    """Join an operator-configured Channels/Gateway base URL to an API path.
-
-    Older profile configs have used both bare origins
-    (``http://host:18080``) and API-prefixed values
-    (``http://host:18080/api`` or ``.../api/gateway``). The bridge client
-    always passes absolute API paths, so normalize common API suffixes off the
-    base before appending the path to avoid double-path 404s such as
-    ``/api/gateway/api/gateway/direct-agent-messages``.
-    """
-    normalized = base_url.rstrip("/")
-    for suffix in ("/api/gateway", "/api"):
-        if normalized.endswith(suffix):
-            normalized = normalized[: -len(suffix)]
-            break
-    return f"{normalized}{path}"
-
-
+from den_hermes.api_urls import join_api_url
 from den_hermes.runtime_registry import DEFAULT_RUNTIME_REGISTRY_PATH, RuntimeRegistryError, resolve_role_runtime
 from den_hermes.worker_launcher import run_hermes_worker, _verify_git_branch_head
 from den_hermes.pool_drift import check_pool_runtime_drift
@@ -46,6 +26,8 @@ from den_hermes.budget_exhaustion_observer import (
     detect_budget_exhaustion,
     emit_budget_exhaustion_signal,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class OrchestratorActionType(str, Enum):
@@ -153,6 +135,51 @@ def _default_http_transport() -> Any:
 
 def _mcp_remote_tool_name(name: str) -> str:
     return name.removeprefix("mcp_den_")
+
+
+def _classify_url_request_failure(exc: BaseException) -> str:
+    """Classify stdlib urllib failures for direct-agent wake diagnostics."""
+    from urllib.error import HTTPError, URLError
+
+    if isinstance(exc, HTTPError):
+        return _classify_channels_http_status(getattr(exc, "code", None))
+    if isinstance(exc, TimeoutError):
+        return "worker_wake_bridge_timeout"
+    if isinstance(exc, URLError):
+        reason = getattr(exc, "reason", exc)
+        if isinstance(reason, TimeoutError):
+            return "worker_wake_bridge_timeout"
+        return _classify_channels_error_text(str(reason or exc))
+    return _classify_channels_error_text(str(exc))
+
+
+def _classify_channels_http_status(status: int | None) -> str:
+    if status in {401, 403}:
+        return "worker_wake_bridge_auth_error"
+    if status == 404:
+        return "worker_wake_bridge_route_error"
+    if status is not None:
+        return f"worker_wake_bridge_http_{status}"
+    return "worker_wake_bridge_client_error"
+
+
+def _classify_channels_error_text(error_text: str) -> str:
+    msg = error_text.lower()
+    if "http error" in msg:
+        for status in (401, 403, 404, 408, 409, 429, 500, 502, 503, 504):
+            if str(status) in msg:
+                return _classify_channels_http_status(status)
+    if "unauthorized" in msg or "forbidden" in msg:
+        return "worker_wake_bridge_auth_error"
+    if "not found" in msg or "404" in msg:
+        return "worker_wake_bridge_route_error"
+    if "timed out" in msg or "timeout" in msg:
+        return "worker_wake_bridge_timeout"
+    if "name or service not known" in msg or "nodename nor servname" in msg or "dns" in msg or "resolve" in msg:
+        return "worker_wake_bridge_dns_error"
+    if "connection refused" in msg or "connection reset" in msg or "network is unreachable" in msg:
+        return "worker_wake_bridge_connection_error"
+    return "worker_wake_bridge_client_error"
 
 
 @dataclass(frozen=True)
@@ -680,7 +707,7 @@ class DenWorkflowAdapter:
         from urllib.parse import urlencode
         from urllib.request import Request, urlopen
 
-        url = _join_channels_api_url(self.channels_url, path)
+        url = join_api_url(self.channels_url, path)
         if params:
             url = f"{url}?{urlencode(params)}"
         headers = {"Content-Type": "application/json", "Accept": "application/json"}
@@ -699,10 +726,12 @@ class DenWorkflowAdapter:
             return {"ok": True, "raw": data}
         except Exception as exc:
             error_text = str(exc)[:500]
+            failure_category = _classify_url_request_failure(exc)
             logger.warning("Channels API %s %s failed: %s", method, path, exc)
             return {
                 "ok": False,
                 "error": error_text,
+                "failure_category": failure_category,
                 "method": method,
                 "url": url,
                 "base_url": self.channels_url,
@@ -831,8 +860,10 @@ class DenWorkflowAdapter:
 
         result = dict(self._channels_request("POST", "/api/gateway/direct-agent-messages", json_payload=payload))
         if not result.get("ok") and result.get("error"):
-            result["failure_category"] = "worker_wake_bridge_route_error"
-            actual_url = result.get("url") or _join_channels_api_url(
+            result["failure_category"] = result.get("failure_category") or _classify_channels_error_text(
+                str(result.get("error") or ""),
+            )
+            actual_url = result.get("url") or join_api_url(
                 self.channels_url or "",
                 "/api/gateway/direct-agent-messages",
             )

@@ -21,6 +21,18 @@ from dataclasses import dataclass
 from typing import Any, Optional
 from urllib.parse import urlsplit
 
+try:
+    from den_hermes.api_urls import join_api_url
+except ModuleNotFoundError:  # pragma: no cover - exercised by plugin-only installs
+    def join_api_url(base_url: str, path: str) -> str:
+        """Fallback for clean Hermes plugin roots without the den_hermes package."""
+        normalized = base_url.rstrip("/")
+        for suffix in ("/api/gateway", "/api"):
+            if normalized.endswith(suffix):
+                normalized = normalized[: -len(suffix)]
+                break
+        return f"{normalized}{path}"
+
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
     BasePlatformAdapter,
@@ -1332,21 +1344,6 @@ def _classify_direct_agent_failure(exc: Exception) -> str:
     return "worker_wake_bridge_client_error"
 
 
-def _join_gateway_api_url(base_url: str, path: str) -> str:
-    """Join configured Gateway/Channels base to an absolute API path.
-
-    Some Hermes profiles historically set DEN_GATEWAY_URL to a path-prefixed
-    value such as ``http://host:18080/api/gateway`` while newer callers use a
-    bare origin. The direct-agent handler appends an absolute API path, so strip
-    common API suffixes before joining to avoid double-path 404s.
-    """
-    normalized = base_url.rstrip("/")
-    for suffix in ("/api/gateway", "/api"):
-        if normalized.endswith(suffix):
-            normalized = normalized[: -len(suffix)]
-            break
-    return f"{normalized}{path}"
-
 
 async def _handle_direct_agent_message(args: dict[str, Any] | None = None, **kwargs: Any) -> str:
     """Handler for the den_channels_send_direct_agent_message tool.
@@ -1440,7 +1437,7 @@ async def _handle_direct_agent_message(args: dict[str, Any] | None = None, **kwa
         payload["profileIdentity"] = str(profile_identity)
 
     endpoint_path = "/api/gateway/direct-agent-messages"
-    endpoint = _join_gateway_api_url(base_url, endpoint_path)
+    endpoint = join_api_url(base_url, endpoint_path)
     headers = {"Content-Type": "application/json"}
     token = str(
         os.getenv("DEN_GATEWAY_TOKEN")

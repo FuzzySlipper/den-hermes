@@ -36,8 +36,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from den_hermes.orchestrator import DenWorkflowAdapter, _join_channels_api_url
-from plugins.platforms.den_channels.adapter import _join_gateway_api_url
+from den_hermes.api_urls import join_api_url
+from den_hermes.orchestrator import DenWorkflowAdapter
 
 
 EXPECTED_GATEWAY_PATH = "/api/gateway/direct-agent-messages"
@@ -84,19 +84,12 @@ def smoke_url_construction() -> list[str]:
         ("http://host.test/api/gateway", f"http://host.test{EXPECTED_GATEWAY_PATH}"),
     ]
     for base, expected in cases:
-        actual = _join_channels_api_url(base, EXPECTED_GATEWAY_PATH)
+        actual = join_api_url(base, EXPECTED_GATEWAY_PATH)
         if actual != expected:
             errors.append(
-                f"orchestrator URL mismatch: base={base!r}\n"
+                f"shared URL mismatch: base={base!r}\n"
                 f"  expected: {expected}\n"
                 f"  got:      {actual}"
-            )
-        plugin_actual = _join_gateway_api_url(base, EXPECTED_GATEWAY_PATH)
-        if plugin_actual != expected:
-            errors.append(
-                f"plugin URL mismatch: base={base!r}\n"
-                f"  expected: {expected}\n"
-                f"  got:      {plugin_actual}"
             )
     return errors
 
