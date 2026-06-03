@@ -973,8 +973,10 @@ def test_tracked_gate_role_path_registration_failure_prevents_launch(tmp_path):
 # ------------------------------------------------------------------
 
 
-def test_coder_path_with_assignment_finalizes_lifecycle(tmp_path):
+def test_coder_path_with_assignment_finalizes_lifecycle(tmp_path, monkeypatch):
     """Pool-managed coder path: assignment_id provided → full lifecycle."""
+    monkeypatch.delenv("DEN_HERMES_POOL_MEMBER_ID", raising=False)
+    monkeypatch.delenv("DEN_HERMES_PROFILE", raising=False)
     head = init_git_repo(tmp_path)
     subprocess.run(["git", "checkout", "-b", "task/1368-fake"], cwd=tmp_path, check=True, capture_output=True, text=True)
     env = fake_env(tmp_path)
@@ -1227,8 +1229,10 @@ def test_finalize_pool_assignment_releases_target_work_and_restores_pool_home():
     ]
 
 
-def test_coder_failure_with_assignment_finalizes_lifecycle(tmp_path):
+def test_coder_failure_with_assignment_finalizes_lifecycle(tmp_path, monkeypatch):
     """Pool-managed coder failure: assignment_id provided → failure checkpoint + cleanup + release."""
+    monkeypatch.delenv("DEN_HERMES_POOL_MEMBER_ID", raising=False)
+    monkeypatch.delenv("DEN_HERMES_PROFILE", raising=False)
     tools = RecordingCoderTools()
     adapter = make_adapter(tools)
 
@@ -1271,8 +1275,10 @@ def test_coder_failure_with_assignment_finalizes_lifecycle(tmp_path):
     assert cleanup_evidence["process_handle_available"] is True
 
 
-def test_coder_path_with_assignment_joins_target_channel_and_cleans_up(tmp_path):
+def test_coder_path_with_assignment_joins_target_channel_and_cleans_up(tmp_path, monkeypatch):
     """Pool-managed coder lifecycle joins target_work channel then returns to pool home."""
+    monkeypatch.delenv("DEN_HERMES_POOL_MEMBER_ID", raising=False)
+    monkeypatch.delenv("DEN_HERMES_PROFILE", raising=False)
     head = init_git_repo(tmp_path)
     subprocess.run(["git", "checkout", "-b", "task/1368-fake"], cwd=tmp_path, check=True, capture_output=True, text=True)
     env = fake_env(tmp_path)
@@ -2596,8 +2602,10 @@ class TestGateRoleLaunchFailureFinalization:
 class TestSuccessfulLaunchNoDoubleRelease:
     """Verify successful worker launches do not double-release assignments."""
 
-    def test_successful_coder_launch_releases_assignment_exactly_once(self, tmp_path):
+    def test_successful_coder_launch_releases_assignment_exactly_once(self, tmp_path, monkeypatch):
         """Coder: successful launch → exactly one release call."""
+        monkeypatch.delenv("DEN_HERMES_POOL_MEMBER_ID", raising=False)
+        monkeypatch.delenv("DEN_HERMES_PROFILE", raising=False)
         head = init_git_repo(tmp_path)
         subprocess.run(["git", "checkout", "-b", "task/1368-fake"], cwd=tmp_path, check=True, capture_output=True, text=True)
         env = fake_env(tmp_path)
