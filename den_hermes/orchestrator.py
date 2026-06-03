@@ -13,6 +13,25 @@ from urllib.parse import quote
 
 logger = logging.getLogger(__name__)
 
+
+def _join_channels_api_url(base_url: str, path: str) -> str:
+    """Join an operator-configured Channels/Gateway base URL to an API path.
+
+    Older profile configs have used both bare origins
+    (``http://host:18080``) and API-prefixed values
+    (``http://host:18080/api`` or ``.../api/gateway``). The bridge client
+    always passes absolute API paths, so normalize common API suffixes off the
+    base before appending the path to avoid double-path 404s such as
+    ``/api/gateway/api/gateway/direct-agent-messages``.
+    """
+    normalized = base_url.rstrip("/")
+    for suffix in ("/api/gateway", "/api"):
+        if normalized.endswith(suffix):
+            normalized = normalized[: -len(suffix)]
+            break
+    return f"{normalized}{path}"
+
+
 from den_hermes.runtime_registry import DEFAULT_RUNTIME_REGISTRY_PATH, RuntimeRegistryError, resolve_role_runtime
 from den_hermes.worker_launcher import run_hermes_worker, _verify_git_branch_head
 from den_hermes.pool_drift import check_pool_runtime_drift
@@ -661,7 +680,7 @@ class DenWorkflowAdapter:
         from urllib.parse import urlencode
         from urllib.request import Request, urlopen
 
-        url = f"{self.channels_url.rstrip('/')}{path}"
+        url = _join_channels_api_url(self.channels_url, path)
         if params:
             url = f"{url}?{urlencode(params)}"
         headers = {"Content-Type": "application/json", "Accept": "application/json"}
@@ -679,8 +698,16 @@ class DenWorkflowAdapter:
                 return data
             return {"ok": True, "raw": data}
         except Exception as exc:
+            error_text = str(exc)[:500]
             logger.warning("Channels API %s %s failed: %s", method, path, exc)
-            return {"ok": False, "error": str(exc)[:500]}
+            return {
+                "ok": False,
+                "error": error_text,
+                "method": method,
+                "url": url,
+                "base_url": self.channels_url,
+                "endpoint": path,
+            }
 
     def ensure_worker_pool_control_membership(
         self, *, agent_identity: str,
@@ -752,6 +779,64 @@ class DenWorkflowAdapter:
             "POST",
             f"/api/channels/{channel_id}/memberships/{encoded_agent_identity}/release-target-work",
         )
+
+    def send_direct_agent_message(
+        self,
+        *,
+        channel_id: int,
+        member_identity: str,
+        body: str,
+        sender_identity: str | None = None,
+        project_id: str | None = None,
+        source_project_id: str | None = None,
+        target_task_id: int | None = None,
+        assignment_id: int | None = None,
+        worker_run_id: str | None = None,
+        worker_role: str | None = None,
+        pool_member_id: str | None = None,
+        profile_identity: str | None = None,
+    ) -> Mapping[str, Any]:
+        """Send a direct-agent message to wake a pool worker through Den Channels.
+
+        Posts to ``POST /api/gateway/direct-agent-messages``.
+
+        Includes concrete target metadata (assignmentId, workerRunId,
+        workerRole, poolMemberId, profileIdentity) when available so the
+        Gateway can route the wake to the correct pool member.
+        Task #1911.
+        """
+        payload: dict[str, Any] = {
+            "channelId": channel_id,
+            "memberIdentity": str(member_identity).strip(),
+            "body": str(body).strip(),
+        }
+        effective_sender = sender_identity or self.requested_by or "den-hermes-bridge"
+        payload["senderIdentity"] = str(effective_sender).strip()
+        if project_id:
+            payload["projectId"] = str(project_id).strip()
+        if source_project_id:
+            payload["sourceProjectId"] = str(source_project_id).strip()
+        if target_task_id is not None:
+            payload["targetTaskId"] = target_task_id
+        if assignment_id is not None:
+            payload["assignmentId"] = str(assignment_id)
+        if worker_run_id:
+            payload["workerRunId"] = str(worker_run_id)
+        if worker_role:
+            payload["workerRole"] = str(worker_role)
+        if pool_member_id:
+            payload["poolMemberId"] = str(pool_member_id)
+        if profile_identity:
+            payload["profileIdentity"] = str(profile_identity)
+
+        result = dict(self._channels_request("POST", "/api/gateway/direct-agent-messages", json_payload=payload))
+        if not result.get("ok") and result.get("error"):
+            result["failure_category"] = "worker_wake_bridge_route_error"
+            result["diagnostic"] = (
+                f"POST {self.channels_url}/api/gateway/direct-agent-messages "
+                f"failed: {result.get('error')}"
+            )
+        return result
 
     def check_active_orchestrator_leases(self) -> Mapping[str, Any]:
         """Query Core for active project_orchestrator leases for this project/profile.

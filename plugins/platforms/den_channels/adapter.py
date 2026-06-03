@@ -1302,11 +1302,62 @@ def _check_direct_agent_message_available() -> bool:
     )
 
 
+def _classify_direct_agent_failure(exc: Exception) -> str:
+    """Classify a direct-agent message failure for structured diagnostics.
+
+    Distinguishes route/client errors (404, connection refused, DNS) from
+    capacity errors so failure packets can route to the correct remediation
+    path.
+    """
+    import httpx
+
+    msg = str(exc).lower()
+    if isinstance(exc, httpx.HTTPStatusError):
+        status = exc.response.status_code
+        if status == 404:
+            return "worker_wake_bridge_route_404"
+        if status in (401, 403):
+            return "worker_wake_bridge_auth_error"
+        return f"worker_wake_bridge_http_{status}"
+    if isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout)):
+        if "name or service not known" in msg or "nodename nor servname" in msg:
+            return "worker_wake_bridge_dns_error"
+        return "worker_wake_bridge_connection_error"
+    if "timeout" in msg:
+        return "worker_wake_bridge_timeout"
+    if "name or service not known" in msg or "nodename nor servname" in msg or "dns" in msg or "resolve" in msg:
+        return "worker_wake_bridge_dns_error"
+    if "connection refused" in msg:
+        return "worker_wake_bridge_connection_error"
+    return "worker_wake_bridge_client_error"
+
+
+def _join_gateway_api_url(base_url: str, path: str) -> str:
+    """Join configured Gateway/Channels base to an absolute API path.
+
+    Some Hermes profiles historically set DEN_GATEWAY_URL to a path-prefixed
+    value such as ``http://host:18080/api/gateway`` while newer callers use a
+    bare origin. The direct-agent handler appends an absolute API path, so strip
+    common API suffixes before joining to avoid double-path 404s.
+    """
+    normalized = base_url.rstrip("/")
+    for suffix in ("/api/gateway", "/api"):
+        if normalized.endswith(suffix):
+            normalized = normalized[: -len(suffix)]
+            break
+    return f"{normalized}{path}"
+
+
 async def _handle_direct_agent_message(args: dict[str, Any] | None = None, **kwargs: Any) -> str:
     """Handler for the den_channels_send_direct_agent_message tool.
 
     Posts a direct-agent message to the Den Gateway
     ``/api/gateway/direct-agent-messages`` endpoint.
+
+    Forwards target-work metadata (assignmentId, workerRunId, workerRole,
+    poolMemberId, profileIdentity, targetTaskId, sourceProjectId) when
+    available so the Gateway can route the wake to the correct concrete
+    pool member.
     """
     if isinstance(args, dict):
         merged_args = dict(args)
@@ -1319,6 +1370,9 @@ async def _handle_direct_agent_message(args: dict[str, Any] | None = None, **kwa
     member_identity = merged_args.get("member_identity")
     body = merged_args.get("body")
     sender_identity = merged_args.get("sender_identity")
+    source_project_id = merged_args.get("source_project_id")
+    target_task_id = merged_args.get("target_task_id")
+    assignment_id = merged_args.get("assignment_id")
 
     if not member_identity:
         return json.dumps({"status": "error", "error": "member_identity is required"})
@@ -1362,6 +1416,31 @@ async def _handle_direct_agent_message(args: dict[str, Any] | None = None, **kwa
     if project_id:
         payload["projectId"] = str(project_id).strip()
 
+    # Forward target-work attribution metadata when present (#1911).
+    if source_project_id:
+        payload["sourceProjectId"] = str(source_project_id).strip()
+    if target_task_id is not None:
+        payload["targetTaskId"] = int(target_task_id) if not isinstance(target_task_id, int) else target_task_id
+    if assignment_id is not None:
+        payload["assignmentId"] = str(assignment_id).strip()
+
+    # Include pool-member metadata from activity context so the Gateway
+    # can route the wake to the correct concrete worker.
+    worker_run_id = activity_context.get("workerRunId") or activity_context.get("worker_run_id")
+    worker_role = activity_context.get("workerRole") or activity_context.get("worker_role")
+    pool_member_id = activity_context.get("poolMemberId") or activity_context.get("pool_member_id")
+    profile_identity = activity_context.get("profileIdentity") or activity_context.get("profile_identity")
+    if worker_run_id:
+        payload["workerRunId"] = str(worker_run_id)
+    if worker_role:
+        payload["workerRole"] = str(worker_role)
+    if pool_member_id:
+        payload["poolMemberId"] = str(pool_member_id)
+    if profile_identity:
+        payload["profileIdentity"] = str(profile_identity)
+
+    endpoint_path = "/api/gateway/direct-agent-messages"
+    endpoint = _join_gateway_api_url(base_url, endpoint_path)
     headers = {"Content-Type": "application/json"}
     token = str(
         os.getenv("DEN_GATEWAY_TOKEN")
@@ -1377,17 +1456,24 @@ async def _handle_direct_agent_message(args: dict[str, Any] | None = None, **kwa
 
         async with httpx.AsyncClient(timeout=15.0) as client:
             response = await client.post(
-                f"{base_url}/api/gateway/direct-agent-messages",
+                endpoint,
                 json=payload,
                 headers=headers,
             )
             response.raise_for_status()
             data = response.json() if response.content else {}
     except Exception as exc:
-        return json.dumps({
+        safe_exc = _redact(str(exc))
+        diagnostic = {
             "status": "error",
-            "error": str(exc),
-        })
+            "error": safe_exc,
+            "base_url": base_url,
+            "endpoint": endpoint,
+            "endpoint_path": endpoint_path,
+            "request_shape": _redact(payload),
+            "failure_category": _classify_direct_agent_failure(exc),
+        }
+        return json.dumps(diagnostic, sort_keys=True, default=str)
 
     return json.dumps({
         "status": "ok",

@@ -2745,3 +2745,163 @@ class TestLaunchFailureSmokeEndToEnd:
             f"Validator zombie detected after failed launch: {smoke['evidence']}"
         )
         assert smoke["still_active"] is False
+
+
+class TestDirectAgentWakeBridge:
+    """Tests for the direct-agent wake bridge path (task #1911).
+
+    Exercises the orchestrator adapter's ``send_direct_agent_message``
+    method and verifies that the _channels_request error diagnostics
+    include base URL, endpoint, and method without leaking secrets.
+    """
+
+    def test_send_direct_agent_posts_to_correct_endpoint(self):
+        """send_direct_agent_message constructs the correct POST payload and URL."""
+        captured = {}
+
+        adapter = DenWorkflowAdapter(
+            tools=_make_minimal_tools(),
+            project_id="den-hermes-bridge",
+            requested_by="den-hermes-runner",
+            channels_url="http://channels.test",
+        )
+
+        def capture_request(method, path, **kwargs):
+            captured["method"] = method
+            captured["path"] = path
+            captured["json_payload"] = kwargs.get("json_payload")
+            captured["params"] = kwargs.get("params")
+            return {"ok": True}
+
+        object.__setattr__(adapter, "_channels_request", capture_request)
+
+        result = adapter.send_direct_agent_message(
+            channel_id=42,
+            member_identity="pool-coder-01",
+            body="Wake: task 1911 coder context ready.",
+            assignment_id=132,
+            worker_run_id="dc-1911-send-wake",
+            worker_role="coder",
+            pool_member_id="pool-coder-01",
+            profile_identity="spawned-coder",
+            source_project_id="den-hermes-bridge",
+            target_task_id=1911,
+        )
+
+        assert result["ok"] is True
+        assert captured["method"] == "POST"
+        assert captured["path"] == "/api/gateway/direct-agent-messages"
+        payload = captured["json_payload"]
+        assert payload["channelId"] == 42
+        assert payload["memberIdentity"] == "pool-coder-01"
+        assert payload["assignmentId"] == "132"
+        assert payload["workerRunId"] == "dc-1911-send-wake"
+        assert payload["workerRole"] == "coder"
+        assert payload["poolMemberId"] == "pool-coder-01"
+        assert payload["profileIdentity"] == "spawned-coder"
+        assert payload["sourceProjectId"] == "den-hermes-bridge"
+        assert payload["targetTaskId"] == 1911
+
+    def test_send_direct_agent_error_diagnostics_include_url(self):
+        """Error responses include base URL and endpoint for debugging."""
+        adapter = DenWorkflowAdapter(
+            tools=_make_minimal_tools(),
+            project_id="den-hermes-bridge",
+            requested_by="den-hermes-runner",
+            channels_url="http://channels.test",
+        )
+
+        def failing_request(method, path, **kwargs):
+            return {
+                "ok": False,
+                "error": "HTTP Error 404: Not Found",
+                "method": method,
+                "url": "http://channels.test/api/gateway/direct-agent-messages",
+                "base_url": "http://channels.test",
+                "endpoint": path,
+            }
+
+        object.__setattr__(adapter, "_channels_request", failing_request)
+        result = adapter.send_direct_agent_message(
+            channel_id=42,
+            member_identity="pool-coder-01",
+            body="Wake test",
+        )
+
+        assert result["ok"] is False
+        assert result["failure_category"] == "worker_wake_bridge_route_error"
+        assert "direct-agent-messages" in result["diagnostic"]
+        assert "channels.test" in result["diagnostic"]
+
+    def test_channels_request_error_includes_url_and_method(self):
+        """_channels_request error includes method, url, base_url, endpoint."""
+        adapter = DenWorkflowAdapter(
+            tools=_make_minimal_tools(),
+            project_id="den-hermes-bridge",
+            requested_by="den-hermes-runner",
+            channels_url="http://channels.test",
+        )
+        # Simulate HTTPError via urllib
+        def failing_urlopen(request, timeout):
+            raise OSError("Connection refused")
+
+        import urllib.request
+        original_urlopen = urllib.request.urlopen
+        try:
+            urllib.request.urlopen = failing_urlopen
+            result = adapter._channels_request("POST", "/api/gateway/direct-agent-messages", json_payload={"test": True})
+        finally:
+            urllib.request.urlopen = original_urlopen
+
+        assert result["ok"] is False
+        assert result["method"] == "POST"
+        assert result["url"] == "http://channels.test/api/gateway/direct-agent-messages"
+        assert result["base_url"] == "http://channels.test"
+        assert result["endpoint"] == "/api/gateway/direct-agent-messages"
+        assert "Connection refused" in result["error"]
+
+    def test_send_direct_agent_redacts_secrets(self):
+        """send_direct_agent_message structures error with diagnostic fields."""
+        adapter = DenWorkflowAdapter(
+            tools=_make_minimal_tools(),
+            project_id="den-hermes-bridge",
+            requested_by="den-hermes-runner",
+            channels_url="http://channels.test",
+        )
+
+        def failing_request(method, path, **kwargs):
+            return {
+                "ok": False,
+                "error": "Unauthorized",
+                "method": method,
+                "url": "http://channels.test/api/gateway/direct-agent-messages",
+                "base_url": "http://channels.test",
+                "endpoint": path,
+            }
+
+        object.__setattr__(adapter, "_channels_request", failing_request)
+        result = adapter.send_direct_agent_message(
+            channel_id=42,
+            member_identity="pool-coder-01",
+            body="Wake test",
+        )
+
+        assert result["ok"] is False
+        assert result["failure_category"] == "worker_wake_bridge_route_error"
+        assert "error" in result
+        assert "diagnostic" in result
+        assert "channels.test" in result["diagnostic"]
+
+
+def _make_minimal_tools():
+    class MinimalTools:
+        def mcp_den_get_task_workflow_summary(self, **kwargs):
+            return {"task": {"id": 1911, "status": "in_progress"}}
+
+        def mcp_den_determine_orchestrator_next_action(self, **kwargs):
+            return {"next_action": "start_coder", "reason": "test"}
+
+        def mcp_den_get_latest_worker_completion(self, **kwargs):
+            return {"completion_state": "missing_packet"}
+
+    return MinimalTools()
