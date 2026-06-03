@@ -214,6 +214,64 @@ class OrchestratorStopResult:
     error: str | None = None
 
 
+@dataclass(frozen=True)
+class LaunchRecoveryRecord:
+    """Structured recovery evidence for a failed worker launch.
+
+    Captures every field required by the local CLI recovery path: run id,
+    assignment id, concrete pool member, artifact path, log path, process
+    or session handle when present, and cleanup/release evidence.
+
+    This is written to the assignment checkpoint and cleanup evidence
+    before releasing the assignment so that post-hoc reconciliation
+    and smoke checks can verify no launching/ack zombie remains.
+    """
+    run_id: str
+    assignment_id: int
+    role: str
+    status: str  # "failed", "blocked", "timed_out", "no_process_handle"
+    error: str | None = None
+    concrete_pool_member: str | None = None
+    artifact_path: str | None = None
+    log_path: str | None = None
+    process_handle_available: bool = False
+    session_id: str | None = None
+    cleanup_released: bool = False
+    release_evidence: dict[str, Any] = field(default_factory=dict)
+
+    def to_checkpoint_payload(self) -> dict[str, Any]:
+        return {
+            "type": "launch_failure",
+            "run_id": self.run_id,
+            "assignment_id": self.assignment_id,
+            "role": self.role,
+            "status": self.status,
+            "error": self.error,
+            "concrete_pool_member": self.concrete_pool_member,
+            "artifact_path": self.artifact_path,
+            "log_path": self.log_path,
+            "process_handle_available": self.process_handle_available,
+            "session_id": self.session_id,
+            "cleanup_released": self.cleanup_released,
+        }
+
+    def to_cleanup_evidence(self) -> dict[str, Any]:
+        return {
+            "status": "launch_failure_cleaned_up",
+            "source": "spawned_hermes_orchestrator",
+            "run_id": self.run_id,
+            "assignment_id": self.assignment_id,
+            "role": self.role,
+            "launch_status": self.status,
+            "concrete_pool_member": self.concrete_pool_member,
+            "process_handle_available": self.process_handle_available,
+            "session_id": self.session_id,
+            "artifact_path": self.artifact_path,
+            "log_path": self.log_path,
+            **self.release_evidence,
+        }
+
+
 # ---------------------------------------------------------------------------
 # Diagnostic guardrail instructions for project_orchestrator deliveries
 # ---------------------------------------------------------------------------
@@ -1091,6 +1149,134 @@ def _prepare_channel_residency(
     return ChannelResidencyContext(channel_id=channel_id, agent_identity=str(agent_identity))
 
 
+def _record_launch_failure_recovery(
+    adapter: DenWorkflowAdapter,
+    *,
+    assignment_id: int | None,
+    run_id: str,
+    role: str,
+    error: str,
+    concrete_pool_member: str | None = None,
+    artifact_path: str | None = None,
+    log_path: str | None = None,
+    process_handle_available: bool = False,
+    session_id: str | None = None,
+    requires_assignment: bool = False,
+    channel_id: int | None = None,
+    agent_identity: str | None = None,
+) -> LaunchRecoveryRecord | None:
+    """Record launch failure evidence and release the assignment.
+
+    When a worker launch fails before obtaining a process handle (e.g.
+    Gateway 404, no runtime claiming, subprocess fails to start), this
+    helper produces a structured ``LaunchRecoveryRecord``, writes a
+    failure checkpoint, records cleanup evidence, and releases the
+    assignment so it does not become a launching/ack zombie.
+
+    Returns the recovery record when assignment is finalized, or None
+    when the path is non-pool (no assignment to release).
+    """
+    if assignment_id is None:
+        if requires_assignment:
+            raise RuntimeError(
+                f"Missing assignment_id for pool-managed launch failure recovery "
+                f"{run_id!r} role {role!r}."
+            )
+        logger.info(
+            "No assignment_id for launch failure run %s role %s — "
+            "non-pool path, skipping launch recovery.",
+            run_id, role,
+        )
+        return None
+
+    recovery = LaunchRecoveryRecord(
+        run_id=run_id,
+        assignment_id=assignment_id,
+        role=role,
+        status="no_process_handle" if not process_handle_available else "failed",
+        error=error,
+        concrete_pool_member=concrete_pool_member or agent_identity,
+        artifact_path=artifact_path,
+        log_path=log_path,
+        process_handle_available=process_handle_available,
+        session_id=session_id,
+        cleanup_released=True,
+        release_evidence={
+            "released_by": "spawned_hermes_orchestrator",
+            "release_reason": "launch_failure",
+        },
+    )
+
+    adapter.append_assignment_checkpoint(
+        assignment_id=assignment_id,
+        run_id=run_id,
+        checkpoint_type="failure",
+        payload=recovery.to_checkpoint_payload(),
+    )
+    adapter.record_assignment_cleanup_evidence(
+        assignment_id=assignment_id,
+        evidence=recovery.to_cleanup_evidence(),
+    )
+    adapter.release_assignment(assignment_id=assignment_id)
+
+    if channel_id is not None and agent_identity not in {None, ""}:
+        _cleanup_channel_residency(
+            adapter,
+            channel_id=channel_id,
+            agent_identity=str(agent_identity),
+            run_id=run_id,
+            role=role,
+        )
+
+    return recovery
+
+
+def _launch_zombie_smoke_check(
+    adapter: DenWorkflowAdapter,
+    *,
+    assignment_id: int,
+    run_id: str,
+    role: str,
+) -> dict[str, Any]:
+    """Verify no launching/ack zombie remains after a failed launch.
+
+    Queries the adapter for active child assignments and checks that the
+    given assignment_id is NOT in launching or ack state.  Returns a
+    structured smoke result suitable for embedding in test assertions
+    and the completion artifact's ``launch_failure_smoke`` field.
+    """
+    child_state = adapter.list_active_child_assignments()
+    stuck = list(child_state.get("stuck_assignments", []))
+    stuck_ids = {
+        int(a.get("assignment_id") or a.get("id") or 0)
+        for a in stuck
+    }
+    all_active = list(child_state.get("active_assignments", []))
+    active_ids = {
+        int(a.get("assignment_id") or a.get("id") or 0)
+        for a in all_active
+    }
+
+    zombie_detected = assignment_id in stuck_ids
+    still_active = assignment_id in active_ids
+
+    return {
+        "covered": True,
+        "evidence": (
+            f"Launch failure smoke for assignment {assignment_id} "
+            f"(run {run_id}, role {role}): "
+            f"zombie_detected={zombie_detected}, "
+            f"still_active={still_active}, "
+            f"total_stuck={len(stuck)}, "
+            f"total_active={len(all_active)}"
+        ),
+        "zombie_detected": zombie_detected,
+        "still_active": still_active,
+        "stuck_count": len(stuck),
+        "active_count": len(all_active),
+    }
+
+
 def _finalize_pool_assignment(
     adapter: DenWorkflowAdapter,
     *,
@@ -1571,9 +1757,14 @@ def run_tracked_coder_path(
     if worker.status != "completed" or worker.artifact is None:
         error = worker.error or "Coder worker did not complete"
         adapter.mark_worker_failed(task_id=task_id, run_id=run_id, role="coder", error=error)
-        _finalize_pool_assignment(
+        _record_launch_failure_recovery(
             adapter, assignment_id=assignment_id, run_id=run_id, role="coder",
-            success=False, error=error, requires_assignment=assignment_id is not None,
+            error=error, requires_assignment=assignment_id is not None,
+            concrete_pool_member=os.environ.get("DEN_HERMES_POOL_MEMBER_ID") or runtime.profile,
+            artifact_path=artifact_path,
+            log_path=log_path,
+            process_handle_available=worker.exit_code is not None or bool(worker.command),
+            session_id=os.environ.get("DEN_WORKER_SESSION_ID"),
             **channel_residency_kwargs,
         )
         _maybe_emit_budget_exhaustion(
@@ -1820,9 +2011,14 @@ def run_tracked_reviewer_path(
     if worker.status != "completed" or worker.artifact is None:
         error = worker.error or "Reviewer worker did not complete"
         adapter.mark_worker_failed(task_id=task_id, run_id=run_id, role="reviewer", error=error)
-        _finalize_pool_assignment(
+        _record_launch_failure_recovery(
             adapter, assignment_id=assignment_id, run_id=run_id, role="reviewer",
-            success=False, error=error, requires_assignment=assignment_id is not None,
+            error=error, requires_assignment=assignment_id is not None,
+            concrete_pool_member=os.environ.get("DEN_HERMES_POOL_MEMBER_ID") or runtime.profile,
+            artifact_path=artifact_path,
+            log_path=log_path,
+            process_handle_available=worker.exit_code is not None or bool(worker.command),
+            session_id=os.environ.get("DEN_WORKER_SESSION_ID"),
             **channel_residency_kwargs,
         )
         _maybe_emit_budget_exhaustion(
@@ -2054,9 +2250,14 @@ def run_tracked_gate_role_path(
     if worker.status != "completed" or worker.artifact is None:
         error = worker.error or f"{role} worker did not complete"
         adapter.mark_worker_failed(task_id=task_id, run_id=run_id, role=role, error=error)
-        _finalize_pool_assignment(
+        _record_launch_failure_recovery(
             adapter, assignment_id=assignment_id, run_id=run_id, role=role,
-            success=False, error=error, requires_assignment=assignment_id is not None,
+            error=error, requires_assignment=assignment_id is not None,
+            concrete_pool_member=os.environ.get("DEN_HERMES_POOL_MEMBER_ID") or runtime.profile,
+            artifact_path=artifact_path,
+            log_path=log_path,
+            process_handle_available=worker.exit_code is not None or bool(worker.command),
+            session_id=os.environ.get("DEN_WORKER_SESSION_ID"),
             **channel_residency_kwargs,
         )
         _maybe_emit_budget_exhaustion(

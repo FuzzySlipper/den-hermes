@@ -6,6 +6,7 @@ import pytest
 from den_hermes.orchestrator import (
     DenWorkflowAdapter,
     GateRolePathResult,
+    LaunchRecoveryRecord,
     OrchestratorAction,
     OrchestratorActionType,
     OrchestratorStopResult,
@@ -20,6 +21,8 @@ from den_hermes.orchestrator import (
     PROJECT_ORCHESTRATOR_DIAGNOSTIC_GUARDRAILS,
     _artifact_with_repo_metadata,
     _finalize_pool_assignment,
+    _record_launch_failure_recovery,
+    _launch_zombie_smoke_check,
     _verify_promotion_head_match,
     reconcile_completed_child_assignments,
     _coder_prompt_with_packet,
@@ -1258,6 +1261,14 @@ def test_coder_failure_with_assignment_finalizes_lifecycle(tmp_path):
     ckpt_call = [c for c in tools.calls if c[0] == "append_checkpoint"][0]
     assert ckpt_call[1]["checkpoint_type"] == "failure"
     assert ckpt_call[1]["assignment_id"] == 11
+    cleanup_call = [c for c in tools.calls if c[0] == "record_cleanup_evidence"][0]
+    cleanup_evidence = json.loads(cleanup_call[1]["evidence"])
+    assert cleanup_evidence["status"] == "launch_failure_cleaned_up"
+    assert cleanup_evidence["run_id"] == "coder-run"
+    assert cleanup_evidence["assignment_id"] == 11
+    assert cleanup_evidence["artifact_path"].endswith("coder-run/completion.json")
+    assert cleanup_evidence["log_path"].endswith("coder-run/worker.log")
+    assert cleanup_evidence["process_handle_available"] is True
 
 
 def test_coder_path_with_assignment_joins_target_channel_and_cleans_up(tmp_path):
@@ -1316,8 +1327,10 @@ def test_coder_path_with_assignment_joins_target_channel_and_cleans_up(tmp_path)
     ]
 
 
-def test_reviewer_path_with_assignment_finalizes_lifecycle(tmp_path):
+def test_reviewer_path_with_assignment_finalizes_lifecycle(tmp_path, monkeypatch):
     """Pool-managed reviewer path: assignment_id provided → full lifecycle after completion."""
+    monkeypatch.delenv("DEN_HERMES_POOL_MEMBER_ID", raising=False)
+    monkeypatch.delenv("DEN_HERMES_PROFILE", raising=False)
     tools = RecordingCoderTools()
     adapter = make_adapter(tools)
 
@@ -1356,8 +1369,10 @@ def test_reviewer_path_with_assignment_finalizes_lifecycle(tmp_path):
     assert ckpt_call[1]["checkpoint_type"] == "completion"
 
 
-def test_gate_path_with_assignment_finalizes_lifecycle(tmp_path):
+def test_gate_path_with_assignment_finalizes_lifecycle(tmp_path, monkeypatch):
     """Pool-managed gate path: assignment_id provided → full lifecycle after completion."""
+    monkeypatch.delenv("DEN_HERMES_POOL_MEMBER_ID", raising=False)
+    monkeypatch.delenv("DEN_HERMES_PROFILE", raising=False)
     tools = RecordingCoderTools()
     adapter = make_adapter(tools)
 
@@ -2281,3 +2296,444 @@ def test_diagnostic_guardrails_present():
     assert "Do NOT SSH" in PROJECT_ORCHESTRATOR_DIAGNOSTIC_GUARDRAILS
     assert "sysadmin" in PROJECT_ORCHESTRATOR_DIAGNOSTIC_GUARDRAILS.lower()
     assert "runaway command exploration" in PROJECT_ORCHESTRATOR_DIAGNOSTIC_GUARDRAILS.lower()
+
+
+# ---------------------------------------------------------------------------
+# Launch failure recovery and zombie prevention tests (#1904)
+# ---------------------------------------------------------------------------
+
+
+class TestLaunchFailureRecovery:
+    """Tests for _record_launch_failure_recovery and LaunchRecoveryRecord.
+
+    Verifies that failed worker launches produce a structured recovery
+    record, finalize the assignment lifecycle, and prevent launching/ack
+    zombies across coder, reviewer, and validator roles.
+    """
+
+    def test_recovery_record_is_immutable(self):
+        """LaunchRecoveryRecord is a frozen dataclass."""
+        record = LaunchRecoveryRecord(
+            run_id="r1",
+            assignment_id=99,
+            role="coder",
+            status="no_process_handle",
+            error="gateway 404",
+        )
+        with pytest.raises(AttributeError):
+            record.status = "completed"
+
+    def test_recovery_record_checkpoint_payload_has_all_required_fields(self):
+        """to_checkpoint_payload returns all expected keys."""
+        record = LaunchRecoveryRecord(
+            run_id="r1",
+            assignment_id=99,
+            role="validator",
+            status="no_process_handle",
+            error="no runtime claimed assignment",
+            concrete_pool_member="pool-validator-01",
+            artifact_path="/tmp/artifacts/r1/completion.json",
+            log_path="/tmp/artifacts/r1/worker.log",
+            process_handle_available=False,
+            session_id="sess-abc",
+            cleanup_released=True,
+        )
+        payload = record.to_checkpoint_payload()
+        assert payload["type"] == "launch_failure"
+        assert payload["run_id"] == "r1"
+        assert payload["assignment_id"] == 99
+        assert payload["role"] == "validator"
+        assert payload["status"] == "no_process_handle"
+        assert payload["error"] == "no runtime claimed assignment"
+        assert payload["concrete_pool_member"] == "pool-validator-01"
+        assert payload["artifact_path"] == "/tmp/artifacts/r1/completion.json"
+        assert payload["log_path"] == "/tmp/artifacts/r1/worker.log"
+        assert payload["process_handle_available"] is False
+        assert payload["session_id"] == "sess-abc"
+        assert payload["cleanup_released"] is True
+
+    def test_recovery_record_cleanup_evidence_includes_release_evidence(self):
+        """to_cleanup_evidence merges release_evidence."""
+        record = LaunchRecoveryRecord(
+            run_id="r1",
+            assignment_id=99,
+            role="coder",
+            status="failed",
+            error="subprocess crash",
+            release_evidence={"pid": 12345, "signal": "SIGTERM"},
+        )
+        evidence = record.to_cleanup_evidence()
+        assert evidence["status"] == "launch_failure_cleaned_up"
+        assert evidence["source"] == "spawned_hermes_orchestrator"
+        assert evidence["run_id"] == "r1"
+        assert evidence["pid"] == 12345
+        assert evidence["signal"] == "SIGTERM"
+
+    def test_record_launch_failure_recovery_writes_checkpoint_and_releases(self):
+        """_record_launch_failure_recovery produces full lifecycle."""
+        tools = RecordingCoderTools()
+        adapter = make_adapter(tools)
+
+        recovery = _record_launch_failure_recovery(
+            adapter,
+            assignment_id=42,
+            run_id="launch-fail-run",
+            role="validator",
+            error="gateway 404: no runtime claims assignment",
+            concrete_pool_member="pool-validator-01",
+            artifact_path="/tmp/artifacts/launch-fail-run/completion.json",
+            log_path="/tmp/artifacts/launch-fail-run/worker.log",
+            process_handle_available=False,
+            requires_assignment=True,
+        )
+
+        assert recovery is not None
+        assert recovery.run_id == "launch-fail-run"
+        assert recovery.assignment_id == 42
+        assert recovery.role == "validator"
+        assert recovery.status == "no_process_handle"
+        assert recovery.process_handle_available is False
+        assert recovery.cleanup_released is True
+
+        lifecycle_calls = [
+            name for name, _ in tools.calls
+            if name in ("append_checkpoint", "record_cleanup_evidence", "release_assignment")
+        ]
+        assert lifecycle_calls == [
+            "append_checkpoint",
+            "record_cleanup_evidence",
+            "release_assignment",
+        ]
+
+        # Verify checkpoint has launch_failure type
+        ckpt = [c for c in tools.calls if c[0] == "append_checkpoint"][0]
+        assert ckpt[1]["assignment_id"] == 42
+        assert ckpt[1]["checkpoint_type"] == "failure"
+        ckpt_payload = json.loads(ckpt[1]["payload"])
+        assert ckpt_payload["type"] == "launch_failure"
+        assert ckpt_payload["status"] == "no_process_handle"
+
+        # Verify cleanup evidence
+        evidence_call = [c for c in tools.calls if c[0] == "record_cleanup_evidence"][0]
+        ev_payload = json.loads(evidence_call[1]["evidence"])
+        assert ev_payload["status"] == "launch_failure_cleaned_up"
+        assert ev_payload["concrete_pool_member"] == "pool-validator-01"
+
+
+class TestLaunchZombieSmokeCheck:
+    """Tests for _launch_zombie_smoke_check.
+
+    Verifies that the smoke check correctly identifies zombie states
+    and confirms that a properly finalized assignment is not stuck.
+    """
+
+    def test_smoke_returns_clean_when_no_zombie(self):
+        """Smoke check: assignment not in active/stuck lists → clean."""
+        tools = RecordingCoderTools()
+        tools.active_assignments = []
+        adapter = make_adapter(tools)
+
+        smoke = _launch_zombie_smoke_check(
+            adapter,
+            assignment_id=99,
+            run_id="r1",
+            role="coder",
+        )
+
+        assert smoke["covered"] is True
+        assert smoke["zombie_detected"] is False
+        assert smoke["still_active"] is False
+        assert smoke["stuck_count"] == 0
+        assert smoke["active_count"] == 0
+
+    def test_smoke_detects_zombie_in_launching_state(self):
+        """Smoke check: assignment in launching state → zombie detected."""
+        tools = RecordingCoderTools()
+        tools.active_assignments = [
+            {"assignment_id": 77, "run_id": "zombie-run", "role": "validator", "state": "launching"},
+        ]
+        adapter = make_adapter(tools)
+
+        smoke = _launch_zombie_smoke_check(
+            adapter,
+            assignment_id=77,
+            run_id="zombie-run",
+            role="validator",
+        )
+
+        assert smoke["covered"] is True
+        assert smoke["zombie_detected"] is True
+        assert smoke["still_active"] is True
+        assert smoke["stuck_count"] == 1
+
+    def test_smoke_detects_zombie_in_ack_state(self):
+        """Smoke check: assignment in ack state → zombie detected."""
+        tools = RecordingCoderTools()
+        tools.active_assignments = [
+            {"id": 88, "run_id": "ack-run", "role": "coder", "state": "ack"},
+        ]
+        adapter = make_adapter(tools)
+
+        smoke = _launch_zombie_smoke_check(
+            adapter,
+            assignment_id=88,
+            run_id="ack-run",
+            role="coder",
+        )
+
+        assert smoke["zombie_detected"] is True
+
+
+class TestGateRoleLaunchFailureFinalization:
+    """Test that gate role paths (validator, drift_checker, packet_auditor)
+    properly finalize on launch failure — matching coder/reviewer behavior.
+
+    GoblinBench #1755 failed on validator launch; these tests ensure the
+    gate path has equivalent coverage.
+    """
+
+    def test_validator_launch_failure_finalizes_assignment_and_no_zombie(self, tmp_path, monkeypatch):
+        """Validator launch failure → assignment finalized and no zombie."""
+        monkeypatch.delenv("DEN_HERMES_POOL_MEMBER_ID", raising=False)
+        monkeypatch.delenv("DEN_HERMES_PROFILE", raising=False)
+        tools = RecordingCoderTools()
+        adapter = make_adapter(tools)
+
+        result = run_tracked_gate_role_path(
+            adapter,
+            task_id=1755,
+            role="validator",
+            prompt="Validate.",
+            run_id="validator-fail-run",
+            branch="task/1755-zombie",
+            head_commit=FAKE_HEAD,
+            cwd=tmp_path,
+            env_overrides=fake_env(tmp_path, mode="missing_artifact"),
+            runtime_registry_path=write_runtime_registry(tmp_path),
+            assignment_id=55,
+        )
+
+        assert result.status == "failed"
+        assert result.assignment_finalized is True
+
+        lifecycle_calls = [
+            name for name, _ in tools.calls
+            if name in ("post_worker_completion_packet", "append_checkpoint", "record_cleanup_evidence", "release_assignment")
+        ]
+        assert "append_checkpoint" in lifecycle_calls
+        assert "record_cleanup_evidence" in lifecycle_calls
+        assert "release_assignment" in lifecycle_calls
+        cleanup_call = [c for c in tools.calls if c[0] == "record_cleanup_evidence"][0]
+        cleanup_evidence = json.loads(cleanup_call[1]["evidence"])
+        assert cleanup_evidence["status"] == "launch_failure_cleaned_up"
+        assert cleanup_evidence["run_id"] == "validator-fail-run"
+        assert cleanup_evidence["assignment_id"] == 55
+        assert cleanup_evidence["role"] == "validator"
+        assert cleanup_evidence["artifact_path"].endswith("validator-fail-run/completion.json")
+        assert cleanup_evidence["log_path"].endswith("validator-fail-run/worker.log")
+
+    def test_drift_checker_launch_failure_finalizes_assignment(self, tmp_path, monkeypatch):
+        """Drift checker launch failure → assignment finalized."""
+        monkeypatch.delenv("DEN_HERMES_POOL_MEMBER_ID", raising=False)
+        monkeypatch.delenv("DEN_HERMES_PROFILE", raising=False)
+        tools = RecordingCoderTools()
+        adapter = make_adapter(tools)
+
+        result = run_tracked_gate_role_path(
+            adapter,
+            task_id=1755,
+            role="drift_checker",
+            prompt="Check drift.",
+            run_id="drift-fail-run",
+            branch="task/1755-drift",
+            head_commit=FAKE_HEAD,
+            cwd=tmp_path,
+            env_overrides=fake_env(tmp_path, mode="missing_artifact"),
+            runtime_registry_path=write_runtime_registry(tmp_path),
+            assignment_id=56,
+        )
+
+        assert result.status == "failed"
+        assert result.assignment_finalized is True
+
+        lifecycle_calls = [
+            name for name, _ in tools.calls
+            if name in ("post_worker_completion_packet", "append_checkpoint", "record_cleanup_evidence", "release_assignment")
+        ]
+        assert "release_assignment" in lifecycle_calls
+
+    def test_packet_auditor_launch_failure_finalizes_assignment(self, tmp_path, monkeypatch):
+        """Packet auditor launch failure → assignment finalized."""
+        monkeypatch.delenv("DEN_HERMES_POOL_MEMBER_ID", raising=False)
+        monkeypatch.delenv("DEN_HERMES_PROFILE", raising=False)
+        tools = RecordingCoderTools()
+        adapter = make_adapter(tools)
+
+        result = run_tracked_gate_role_path(
+            adapter,
+            task_id=1755,
+            role="packet_auditor",
+            prompt="Audit packets.",
+            run_id="audit-fail-run",
+            branch="task/1755-audit",
+            head_commit=FAKE_HEAD,
+            cwd=tmp_path,
+            env_overrides=fake_env(tmp_path, mode="missing_artifact"),
+            runtime_registry_path=write_runtime_registry(tmp_path),
+            assignment_id=57,
+        )
+
+        assert result.status == "failed"
+        assert result.assignment_finalized is True
+
+        lifecycle_calls = [
+            name for name, _ in tools.calls
+            if name in ("post_worker_completion_packet", "append_checkpoint", "record_cleanup_evidence", "release_assignment")
+        ]
+        assert "release_assignment" in lifecycle_calls
+
+
+class TestSuccessfulLaunchNoDoubleRelease:
+    """Verify successful worker launches do not double-release assignments."""
+
+    def test_successful_coder_launch_releases_assignment_exactly_once(self, tmp_path):
+        """Coder: successful launch → exactly one release call."""
+        head = init_git_repo(tmp_path)
+        subprocess.run(["git", "checkout", "-b", "task/1368-fake"], cwd=tmp_path, check=True, capture_output=True, text=True)
+        env = fake_env(tmp_path)
+        env["FAKE_HEAD"] = head
+        tools = RecordingCoderTools(launch_log=tmp_path / "fake-hermes-call.jsonl")
+        adapter = make_adapter(tools)
+
+        result = run_tracked_coder_path(
+            adapter,
+            task_id=1904,
+            prompt="Implement.",
+            run_id="coder-success-run",
+            cwd=tmp_path,
+            env_overrides=env,
+            runtime_registry_path=write_runtime_registry(tmp_path),
+            verify_git=True,
+            assignment_id=100,
+        )
+
+        assert result.status == "completed"
+        release_count = len([c for c in tools.calls if c[0] == "release_assignment"])
+        assert release_count == 1, f"Expected 1 release, got {release_count}"
+
+    def test_successful_validator_launch_releases_assignment_exactly_once(self, tmp_path, monkeypatch):
+        """Validator: successful launch → exactly one release call."""
+        monkeypatch.delenv("DEN_HERMES_POOL_MEMBER_ID", raising=False)
+        monkeypatch.delenv("DEN_HERMES_PROFILE", raising=False)
+        tools = RecordingCoderTools()
+        adapter = make_adapter(tools)
+
+        result = run_tracked_gate_role_path(
+            adapter,
+            task_id=1904,
+            role="validator",
+            prompt="Validate.",
+            run_id="validator-success-run",
+            branch="task/1904-validator",
+            head_commit=FAKE_HEAD,
+            cwd=tmp_path,
+            env_overrides=fake_env(tmp_path),
+            runtime_registry_path=write_runtime_registry(tmp_path),
+            assignment_id=101,
+        )
+
+        assert result.status == "completed"
+        release_count = len([c for c in tools.calls if c[0] == "release_assignment"])
+        assert release_count == 1, f"Expected 1 release, got {release_count}"
+
+
+class TestLaunchFailureSmokeEndToEnd:
+    """End-to-end smoke: launch failure → no zombie remains.
+
+    Pattern: launch a worker that fails, then verify the smoke check
+    returns clean (no launching/ack zombie).
+    """
+
+    def test_coder_launch_failure_smoke_no_zombie(self, tmp_path, monkeypatch):
+        """Coder launch failure → smoke check confirms no zombie."""
+        monkeypatch.delenv("DEN_HERMES_POOL_MEMBER_ID", raising=False)
+        monkeypatch.delenv("DEN_HERMES_PROFILE", raising=False)
+        tools = RecordingCoderTools()
+        adapter = make_adapter(tools)
+
+        result = run_tracked_coder_path(
+            adapter,
+            task_id=1904,
+            prompt="Implement.",
+            run_id="coder-smoke-run",
+            cwd=tmp_path,
+            env_overrides=fake_env(tmp_path, mode="missing_artifact"),
+            runtime_registry_path=write_runtime_registry(tmp_path),
+            assignment_id=200,
+        )
+
+        assert result.status == "failed"
+        assert result.assignment_finalized is True
+
+        # Smoke check: assignment 200 should NOT be in active/stuck assignments
+        smoke = _launch_zombie_smoke_check(
+            adapter,
+            assignment_id=200,
+            run_id="coder-smoke-run",
+            role="coder",
+        )
+        assert smoke["covered"] is True
+        assert smoke["zombie_detected"] is False, (
+            f"Zombie detected: {smoke['evidence']}"
+        )
+        assert smoke["still_active"] is False
+
+    def test_validator_launch_failure_smoke_no_zombie(self, tmp_path, monkeypatch):
+        """Validator launch failure → smoke check confirms no zombie.
+
+        This directly reproduces the GoblinBench #1755 scenario:
+        a validator launch attempt that fails should not leave a
+        launching/ack zombie.
+        """
+        monkeypatch.delenv("DEN_HERMES_POOL_MEMBER_ID", raising=False)
+        monkeypatch.delenv("DEN_HERMES_PROFILE", raising=False)
+        tools = RecordingCoderTools()
+        # Pre-populate active assignments with the "failed" one to simulate
+        # what Core sees before reconciliation.
+        tools.active_assignments = [
+            {"assignment_id": 201, "run_id": "validator-smoke-run", "role": "validator", "state": "launching"},
+        ]
+        adapter = make_adapter(tools)
+
+        result = run_tracked_gate_role_path(
+            adapter,
+            task_id=1755,
+            role="validator",
+            prompt="Validate.",
+            run_id="validator-smoke-run",
+            branch="task/1755-validate",
+            head_commit=FAKE_HEAD,
+            cwd=tmp_path,
+            env_overrides=fake_env(tmp_path, mode="missing_artifact"),
+            runtime_registry_path=write_runtime_registry(tmp_path),
+            assignment_id=201,
+        )
+
+        assert result.status == "failed"
+        assert result.assignment_finalized is True
+
+        # After finalization, smoke check: assignment should be released.
+        # Clear the pre-populated state to simulate that Core no longer
+        # lists it as active after release.
+        tools.active_assignments = []
+
+        smoke = _launch_zombie_smoke_check(
+            adapter,
+            assignment_id=201,
+            run_id="validator-smoke-run",
+            role="validator",
+        )
+        assert smoke["zombie_detected"] is False, (
+            f"Validator zombie detected after failed launch: {smoke['evidence']}"
+        )
+        assert smoke["still_active"] is False
