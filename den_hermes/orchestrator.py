@@ -9,6 +9,7 @@ from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Any, Mapping
+from urllib.parse import quote
 
 logger = logging.getLogger(__name__)
 
@@ -258,6 +259,8 @@ class DenWorkflowAdapter:
     project_id: str
     requested_by: str
     target_project_id: str | None = None
+    channels_url: str | None = None
+    channels_token: str | None = None
 
     @property
     def work_project_id(self) -> str:
@@ -577,6 +580,120 @@ class DenWorkflowAdapter:
             "worker_identity": member_identity,
             "status": status or None,
         }
+
+    # ------------------------------------------------------------------
+    # Channel membership methods (worker-pool home / target-work residency)
+    # ------------------------------------------------------------------
+
+    def _channels_request(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: dict[str, str] | None = None,
+        json_payload: Any = None,
+    ) -> Mapping[str, Any]:
+        """Make a synchronous HTTP request to the Channels API.
+
+        Uses stdlib HTTP to avoid adding a runtime dependency to the Bridge.
+        Returns the parsed JSON response or a safe fallback on errors.
+        """
+        if not self.channels_url:
+            return {"ok": False, "error": "no channels_url configured"}
+        from urllib.parse import urlencode
+        from urllib.request import Request, urlopen
+
+        url = f"{self.channels_url.rstrip('/')}{path}"
+        if params:
+            url = f"{url}?{urlencode(params)}"
+        headers = {"Content-Type": "application/json", "Accept": "application/json"}
+        if self.channels_token:
+            headers["Authorization"] = f"Bearer {self.channels_token}"
+        body = json.dumps(json_payload).encode("utf-8") if json_payload is not None else None
+        try:
+            request = Request(url, data=body, headers=headers, method=method)
+            with urlopen(request, timeout=10) as response:  # noqa: S310 - URL is operator-configured LAN Core/Channels API.
+                content = response.read()
+            if not content:
+                return {"ok": True}
+            data = json.loads(content.decode("utf-8"))
+            if isinstance(data, dict):
+                return data
+            return {"ok": True, "raw": data}
+        except Exception as exc:
+            logger.warning("Channels API %s %s failed: %s", method, path, exc)
+            return {"ok": False, "error": str(exc)[:500]}
+
+    def ensure_worker_pool_control_membership(
+        self, *, agent_identity: str,
+    ) -> Mapping[str, Any]:
+        """Ensure the agent has active worker_pool_control membership in the #worker-pool channel.
+
+        Calls PUT /api/worker-pool/control/membership (idempotent, reactivates left workers).
+        Task #1880.
+        """
+        return self._channels_request(
+            "PUT",
+            "/api/worker-pool/control/membership",
+            params={"agentIdentity": agent_identity},
+        )
+
+    def ensure_target_work_membership(
+        self,
+        *,
+        channel_id: int,
+        agent_identity: str,
+        task_id: int,
+        run_id: str,
+        role: str,
+        assignment_id: int | None = None,
+    ) -> Mapping[str, Any]:
+        """Ensure a worker is resident in the active target-work channel.
+
+        This is separate from worker-pool capacity accounting: it creates or
+        reactivates a Channels membership with purpose ``target_work`` and
+        records project/task/run attribution in membership settings.  The idle
+        ``worker_pool_control`` membership remains in the neutral #worker-pool
+        channel and is not used as the work routing location.
+        """
+        settings = {
+            "runtimeProjectId": self.project_id,
+            "targetProjectId": self.work_project_id,
+            "taskId": task_id,
+            "workerRunId": run_id,
+            "workerRole": role,
+            "assignmentId": assignment_id,
+            "membershipPurpose": "target_work",
+        }
+        return self._channels_request(
+            "PUT",
+            f"/api/channels/{channel_id}/memberships",
+            json_payload={
+                "memberType": "agent",
+                "memberIdentity": agent_identity,
+                "membershipStatus": "active",
+                "wakePolicy": "mentions_only",
+                "membershipPurpose": "target_work",
+                "settingsJson": json.dumps(
+                    {key: value for key, value in settings.items() if value not in {None, ""}},
+                    sort_keys=True,
+                ),
+            },
+        )
+
+    def release_target_work_membership(
+        self, *, channel_id: int, agent_identity: str,
+    ) -> Mapping[str, Any]:
+        """Release a worker's target-work membership in a project channel.
+
+        Sets membership_status to 'left' without touching worker_pool_control or agent_commons.
+        Task #1880.
+        """
+        encoded_agent_identity = quote(agent_identity, safe="")
+        return self._channels_request(
+            "POST",
+            f"/api/channels/{channel_id}/memberships/{encoded_agent_identity}/release-target-work",
+        )
 
     def check_active_orchestrator_leases(self) -> Mapping[str, Any]:
         """Query Core for active project_orchestrator leases for this project/profile.
@@ -921,6 +1038,59 @@ def _maybe_emit_budget_exhaustion(
         )
 
 
+@dataclass(frozen=True)
+class ChannelResidencyContext:
+    """Best-effort Channels residency handles for a worker assignment."""
+
+    channel_id: int
+    agent_identity: str
+
+
+def _prepare_channel_residency(
+    adapter: DenWorkflowAdapter,
+    *,
+    task_id: int,
+    run_id: str,
+    role: str,
+    agent_identity: str | None,
+    assignment_id: int | None,
+    activity_context: Mapping[str, Any] | None = None,
+    env_overrides: Mapping[str, str] | None = None,
+) -> ChannelResidencyContext | None:
+    """Join the target work channel for this assignment when routing context exists.
+
+    Channels membership is deliberately not used for capacity accounting.  This
+    helper only records/refreshes the worker's target-work residency so wake and
+    operator UX can route to the current work channel; finalization later clears
+    the same target-work residency and restores the neutral pool home.
+    """
+    parent = _source_activity_context(explicit_context=activity_context, env_overrides=env_overrides)
+    channel_value = parent.get("channelId") or parent.get("channel_id")
+    if channel_value in {None, ""} or agent_identity in {None, ""}:
+        return None
+    try:
+        channel_id = int(str(channel_value))
+    except (TypeError, ValueError):
+        logger.info("Skipping target-work channel residency for run %s: invalid channel id %r", run_id, channel_value)
+        return None
+    result = adapter.ensure_target_work_membership(
+        channel_id=channel_id,
+        agent_identity=str(agent_identity),
+        task_id=task_id,
+        run_id=run_id,
+        role=role,
+        assignment_id=assignment_id,
+    )
+    if not result.get("ok") and result.get("error"):
+        logger.info(
+            "Channel residency setup: target-work membership for %s in channel %s: %s",
+            agent_identity,
+            channel_id,
+            result.get("error"),
+        )
+    return ChannelResidencyContext(channel_id=channel_id, agent_identity=str(agent_identity))
+
+
 def _finalize_pool_assignment(
     adapter: DenWorkflowAdapter,
     *,
@@ -933,6 +1103,8 @@ def _finalize_pool_assignment(
     error: str | None = None,
     branch: str | None = None,
     head_commit: str | None = None,
+    channel_id: int | None = None,
+    agent_identity: str | None = None,
 ) -> bool:
     """Complete the pool assignment lifecycle: checkpoint → cleanup → release.
 
@@ -942,6 +1114,12 @@ def _finalize_pool_assignment(
         - assignment_id MUST be a valid integer; raises RuntimeError if None.
     When requires_assignment=False (legacy/non-pool paths):
         - assignment_id=None is acceptable; logs info and returns False.
+
+    Channel residency cleanup (#1881):
+        When ``channel_id`` and ``agent_identity`` are both provided, the adapter
+        releases the target-work membership in the project channel and ensures
+        the worker retains (or regains) its worker_pool_control idle membership
+        in the neutral #worker-pool home channel.
     """
     if assignment_id is None:
         if requires_assignment:
@@ -977,7 +1155,74 @@ def _finalize_pool_assignment(
     )
     adapter.record_assignment_cleanup_evidence(assignment_id=assignment_id)
     adapter.release_assignment(assignment_id=assignment_id)
+
+    # Channel residency cleanup (#1881): release target-work membership
+    # and keep/restore worker_pool_control idle membership.
+    if channel_id is not None and agent_identity not in {None, ""}:
+        _cleanup_channel_residency(
+            adapter,
+            channel_id=channel_id,
+            agent_identity=agent_identity,
+            run_id=run_id,
+            role=role,
+        )
     return True
+
+
+def _cleanup_channel_residency(
+    adapter: DenWorkflowAdapter,
+    *,
+    channel_id: int,
+    agent_identity: str,
+    run_id: str,
+    role: str,
+) -> None:
+    """Release target-work channel residency and restore neutral pool home.
+
+    Calls:
+      1. release_target_work_membership to mark the project-channel
+         target_work membership as 'left'.
+      2. ensure_worker_pool_control_membership to keep/restore the
+         idle worker_pool_control membership in the #worker-pool channel.
+
+    Errors in either call are logged and swallowed — channel membership
+    is best-effort and must not block the primary assignment lifecycle.
+    Task #1881.
+    """
+    try:
+        result = adapter.release_target_work_membership(
+            channel_id=channel_id,
+            agent_identity=agent_identity,
+        )
+    except Exception as exc:  # noqa: BLE001 - channel cleanup must not block release
+        logger.info(
+            "Channel residency cleanup: release-target-work for %s in channel %s failed: %s",
+            agent_identity,
+            channel_id,
+            exc,
+        )
+        result = {"ok": False, "error": str(exc)[:500]}
+    if not result.get("ok") and result.get("error"):
+        logger.info(
+            "Channel residency cleanup: release-target-work for %s in channel %s: %s",
+            agent_identity, channel_id, result.get("error"),
+        )
+    try:
+        pool_home = adapter.ensure_worker_pool_control_membership(
+            agent_identity=agent_identity,
+        )
+    except Exception as exc:  # noqa: BLE001 - channel cleanup must not block release
+        logger.info(
+            "Channel residency cleanup: ensure-worker-pool-control for %s failed: %s",
+            agent_identity,
+            exc,
+        )
+        pool_home = {"ok": False, "error": str(exc)[:500]}
+    if not pool_home.get("ok") and pool_home.get("error"):
+        logger.info(
+            "Channel residency cleanup: ensure-worker-pool-control for %s: %s",
+            agent_identity, pool_home.get("error"),
+        )
 
 
 def reconcile_completed_child_assignments(adapter: DenWorkflowAdapter) -> list[int]:
@@ -1059,6 +1304,26 @@ def reconcile_completed_child_assignments(adapter: DenWorkflowAdapter) -> list[i
             worker_identity=_assignment_str(assignment, "worker_identity"),
             pool_member_id=_assignment_str(assignment, "pool_member_id"),
         )
+
+        # Channel residency cleanup (#1881) during reconciliation:
+        # release target-work membership and keep pool home.
+        channel_id_for_assign = _assignment_int(assignment, "channel_id", "channelId")
+        worker_agent_identity = _assignment_str(
+            assignment,
+            "profile_identity",
+            "agent_identity",
+            "pool_member_id",
+            "worker_identity",
+        )
+        if channel_id_for_assign is not None and worker_agent_identity not in {None, ""}:
+            _cleanup_channel_residency(
+                adapter,
+                channel_id=channel_id_for_assign,
+                agent_identity=worker_agent_identity,
+                run_id=run_id,
+                role=role,
+            )
+
         finalized.append(assignment_id)
     return finalized
 
@@ -1260,6 +1525,25 @@ def run_tracked_coder_path(
     except Exception as exc:  # noqa: BLE001 - fail closed before subprocess launch
         return CoderPathResult(status="failed", run_id=run_id, artifact_path=artifact_path, error=str(exc))
 
+    channel_residency = (
+        _prepare_channel_residency(
+            adapter,
+            task_id=task_id,
+            run_id=run_id,
+            role="coder",
+            agent_identity=runtime.profile or "coder",
+            assignment_id=assignment_id,
+            activity_context=activity_context,
+            env_overrides=worker_env_overrides,
+        )
+        if assignment_id is not None
+        else None
+    )
+    channel_residency_kwargs = {
+        "channel_id": channel_residency.channel_id if channel_residency else None,
+        "agent_identity": channel_residency.agent_identity if channel_residency else None,
+    }
+
     adapter.mark_worker_started(task_id=task_id, run_id=run_id, role="coder")
     worker_prompt = _coder_prompt_with_packet(prompt=prompt, packet_message_id=packet_message_id)
     worker = run_hermes_worker(
@@ -1290,6 +1574,7 @@ def run_tracked_coder_path(
         _finalize_pool_assignment(
             adapter, assignment_id=assignment_id, run_id=run_id, role="coder",
             success=False, error=error, requires_assignment=assignment_id is not None,
+            **channel_residency_kwargs,
         )
         _maybe_emit_budget_exhaustion(
             adapter, worker_result=worker,
@@ -1309,6 +1594,7 @@ def run_tracked_coder_path(
             _finalize_pool_assignment(
                 adapter, assignment_id=assignment_id, run_id=run_id, role="coder",
                 success=False, error=git_error, requires_assignment=assignment_id is not None,
+                **channel_residency_kwargs,
             )
             return CoderPathResult(
                 status="failed",
@@ -1326,6 +1612,7 @@ def run_tracked_coder_path(
         _finalize_pool_assignment(
             adapter, assignment_id=assignment_id, run_id=run_id, role="coder",
             success=False, error=str(exc), requires_assignment=assignment_id is not None,
+            **channel_residency_kwargs,
         )
         return CoderPathResult(
             status="failed",
@@ -1342,6 +1629,7 @@ def run_tracked_coder_path(
         summary=str(worker.artifact.get("summary", "")),
         branch=str(worker.artifact.get("branch")),
         head_commit=str(worker.artifact.get("head_commit")),
+        **channel_residency_kwargs,
     )
     latest_completion = adapter.get_latest_worker_completion(task_id=task_id, run_id=run_id, role="coder")
     worker_status = adapter.get_worker_run_status(task_id=task_id, run_id=run_id)
@@ -1481,6 +1769,25 @@ def run_tracked_reviewer_path(
     except Exception as exc:  # noqa: BLE001 - fail closed before subprocess launch
         return ReviewerPathResult(status="failed", run_id=run_id, review_request=review_request, artifact_path=artifact_path, error=str(exc))
 
+    channel_residency = (
+        _prepare_channel_residency(
+            adapter,
+            task_id=task_id,
+            run_id=run_id,
+            role="reviewer",
+            agent_identity=runtime.profile or "reviewer",
+            assignment_id=assignment_id,
+            activity_context=activity_context,
+            env_overrides=worker_env_overrides,
+        )
+        if assignment_id is not None
+        else None
+    )
+    channel_residency_kwargs = {
+        "channel_id": channel_residency.channel_id if channel_residency else None,
+        "agent_identity": channel_residency.agent_identity if channel_residency else None,
+    }
+
     adapter.mark_worker_started(task_id=task_id, run_id=run_id, role="reviewer")
     worker = run_hermes_worker(
         task_id=task_id,
@@ -1516,6 +1823,7 @@ def run_tracked_reviewer_path(
         _finalize_pool_assignment(
             adapter, assignment_id=assignment_id, run_id=run_id, role="reviewer",
             success=False, error=error, requires_assignment=assignment_id is not None,
+            **channel_residency_kwargs,
         )
         _maybe_emit_budget_exhaustion(
             adapter, worker_result=worker,
@@ -1557,6 +1865,7 @@ def run_tracked_reviewer_path(
         _finalize_pool_assignment(
             adapter, assignment_id=assignment_id, run_id=run_id, role="reviewer",
             success=False, error=str(exc), requires_assignment=assignment_id is not None,
+            **channel_residency_kwargs,
         )
         return ReviewerPathResult(
             status="failed", run_id=run_id, review_request=review_request,
@@ -1570,6 +1879,8 @@ def run_tracked_reviewer_path(
         summary=str(worker.artifact.get("summary", "")),
         branch=branch,
         head_commit=head_commit,
+        requires_assignment=assignment_id is not None,
+        **channel_residency_kwargs,
     )
     latest_completion = adapter.get_latest_worker_completion(task_id=task_id, run_id=run_id, role="reviewer")
     worker_status = adapter.get_worker_run_status(task_id=task_id, run_id=run_id)
@@ -1692,6 +2003,25 @@ def run_tracked_gate_role_path(
     except Exception as exc:  # noqa: BLE001 - fail closed before subprocess launch
         return GateRolePathResult(status="failed", run_id=run_id, role=role, artifact_path=artifact_path, error=str(exc))
 
+    channel_residency = (
+        _prepare_channel_residency(
+            adapter,
+            task_id=task_id,
+            run_id=run_id,
+            role=role,
+            agent_identity=runtime.profile or role,
+            assignment_id=assignment_id,
+            activity_context=activity_context,
+            env_overrides=worker_env_overrides,
+        )
+        if assignment_id is not None
+        else None
+    )
+    channel_residency_kwargs = {
+        "channel_id": channel_residency.channel_id if channel_residency else None,
+        "agent_identity": channel_residency.agent_identity if channel_residency else None,
+    }
+
     adapter.mark_worker_started(task_id=task_id, run_id=run_id, role=role)
     worker = run_hermes_worker(
         task_id=task_id,
@@ -1727,6 +2057,7 @@ def run_tracked_gate_role_path(
         _finalize_pool_assignment(
             adapter, assignment_id=assignment_id, run_id=run_id, role=role,
             success=False, error=error, requires_assignment=assignment_id is not None,
+            **channel_residency_kwargs,
         )
         _maybe_emit_budget_exhaustion(
             adapter, worker_result=worker,
@@ -1752,6 +2083,7 @@ def run_tracked_gate_role_path(
         _finalize_pool_assignment(
             adapter, assignment_id=assignment_id, run_id=run_id, role=role,
             success=False, error=str(exc), requires_assignment=assignment_id is not None,
+            **channel_residency_kwargs,
         )
         return GateRolePathResult(
             status="failed",
@@ -1768,6 +2100,7 @@ def run_tracked_gate_role_path(
         summary=str(worker.artifact.get("summary", "")),
         branch=branch,
         head_commit=head_commit,
+        **channel_residency_kwargs,
     )
     latest_completion = adapter.get_latest_worker_completion(task_id=task_id, run_id=run_id, role=role)
     worker_status = adapter.get_worker_run_status(task_id=task_id, run_id=run_id)
@@ -1872,6 +2205,8 @@ def build_mcp_adapter(
         project_id=project_id,
         requested_by=requested_by,
         target_project_id=target_project_id or os.environ.get("DEN_TARGET_PROJECT_ID") or None,
+        channels_url=os.environ.get("DEN_CHANNELS_URL") or os.environ.get("DEN_GATEWAY_URL") or None,
+        channels_token=os.environ.get("DEN_CHANNELS_TOKEN") or os.environ.get("DEN_GATEWAY_TOKEN") or None,
     )
 
 

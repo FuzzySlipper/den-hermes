@@ -1184,6 +1184,46 @@ def test_finalize_pool_assignment_allows_explicit_legacy_no_assignment_mode():
     assert lifecycle_calls == []
 
 
+def test_finalize_pool_assignment_releases_target_work_and_restores_pool_home():
+    """Pool finalization also clears target-work residency and returns worker to neutral home."""
+    tools = RecordingCoderTools()
+    adapter = make_adapter(tools)
+    channel_calls = []
+    object.__setattr__(
+        adapter,
+        "release_target_work_membership",
+        lambda **kwargs: channel_calls.append(("release_target_work", kwargs)) or {"ok": True},
+    )
+    object.__setattr__(
+        adapter,
+        "ensure_worker_pool_control_membership",
+        lambda **kwargs: channel_calls.append(("ensure_pool_home", kwargs)) or {"ok": True},
+    )
+
+    finalized = _finalize_pool_assignment(
+        adapter,
+        assignment_id=42,
+        requires_assignment=True,
+        run_id="pool-run",
+        role="coder",
+        success=True,
+        summary="completed",
+        channel_id=77,
+        agent_identity="spawned-coder",
+    )
+
+    assert finalized is True
+    lifecycle_calls = [
+        name for name, _ in tools.calls
+        if name in ("append_checkpoint", "record_cleanup_evidence", "release_assignment")
+    ]
+    assert lifecycle_calls == ["append_checkpoint", "record_cleanup_evidence", "release_assignment"]
+    assert channel_calls == [
+        ("release_target_work", {"channel_id": 77, "agent_identity": "spawned-coder"}),
+        ("ensure_pool_home", {"agent_identity": "spawned-coder"}),
+    ]
+
+
 def test_coder_failure_with_assignment_finalizes_lifecycle(tmp_path):
     """Pool-managed coder failure: assignment_id provided → failure checkpoint + cleanup + release."""
     tools = RecordingCoderTools()
@@ -1218,6 +1258,62 @@ def test_coder_failure_with_assignment_finalizes_lifecycle(tmp_path):
     ckpt_call = [c for c in tools.calls if c[0] == "append_checkpoint"][0]
     assert ckpt_call[1]["checkpoint_type"] == "failure"
     assert ckpt_call[1]["assignment_id"] == 11
+
+
+def test_coder_path_with_assignment_joins_target_channel_and_cleans_up(tmp_path):
+    """Pool-managed coder lifecycle joins target_work channel then returns to pool home."""
+    head = init_git_repo(tmp_path)
+    subprocess.run(["git", "checkout", "-b", "task/1368-fake"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    env = fake_env(tmp_path)
+    env["FAKE_HEAD"] = head
+    tools = RecordingCoderTools()
+    adapter = make_adapter(tools)
+    channel_calls = []
+    object.__setattr__(
+        adapter,
+        "ensure_target_work_membership",
+        lambda **kwargs: channel_calls.append(("ensure_target_work", kwargs)) or {"ok": True},
+    )
+    object.__setattr__(
+        adapter,
+        "release_target_work_membership",
+        lambda **kwargs: channel_calls.append(("release_target_work", kwargs)) or {"ok": True},
+    )
+    object.__setattr__(
+        adapter,
+        "ensure_worker_pool_control_membership",
+        lambda **kwargs: channel_calls.append(("ensure_pool_home", kwargs)) or {"ok": True},
+    )
+
+    result = run_tracked_coder_path(
+        adapter,
+        task_id=1881,
+        prompt="Implement.",
+        run_id="coder-channel-run",
+        cwd=tmp_path,
+        env_overrides=env,
+        runtime_registry_path=write_runtime_registry(tmp_path),
+        assignment_id=88,
+        activity_context={"channelId": 321, "gatewayUrl": "http://gateway", "displayBlockId": "display-1"},
+    )
+
+    assert result.status == "completed"
+    assert result.assignment_finalized is True
+    assert channel_calls == [
+        (
+            "ensure_target_work",
+            {
+                "channel_id": 321,
+                "agent_identity": "den-coder-profile",
+                "task_id": 1881,
+                "run_id": "coder-channel-run",
+                "role": "coder",
+                "assignment_id": 88,
+            },
+        ),
+        ("release_target_work", {"channel_id": 321, "agent_identity": "den-coder-profile"}),
+        ("ensure_pool_home", {"agent_identity": "den-coder-profile"}),
+    ]
 
 
 def test_reviewer_path_with_assignment_finalizes_lifecycle(tmp_path):
