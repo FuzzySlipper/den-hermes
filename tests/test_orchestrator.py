@@ -21,6 +21,7 @@ from den_hermes.orchestrator import (
     _artifact_with_repo_metadata,
     _finalize_pool_assignment,
     _verify_promotion_head_match,
+    reconcile_completed_child_assignments,
     _coder_prompt_with_packet,
     _reviewer_prompt_with_packet,
     _gate_prompt_with_packet,
@@ -223,6 +224,8 @@ class RecordingCoderTools:
         self.verdict_response = verdict_response or {"ok": True}
         self.completions = {}
         self.workflow_summary = {"current_review_state": {"review_round_id": 321, "verdict": "changes_requested"}}
+        self.active_assignments = []
+        self.pool_members = {}
 
     def mcp_den_get_task_workflow_summary(self, **kwargs):
         self.calls.append(("get_task_workflow_summary", kwargs))
@@ -321,7 +324,13 @@ class RecordingCoderTools:
 
     def mcp_den_list_assignments(self, **kwargs):
         self.calls.append(("list_assignments", kwargs))
-        return {"active_assignments": [], "assignments": []}
+        return {"active_assignments": list(self.active_assignments), "assignments": list(self.active_assignments)}
+
+    def mcp_den_list_pool_members(self, **kwargs):
+        self.calls.append(("list_pool_members", kwargs))
+        worker_identity = kwargs.get("worker_identity")
+        member = self.pool_members.get(worker_identity, {"worker_identity": worker_identity, "status": "available"})
+        return {"members": [member] if worker_identity else list(self.pool_members.values())}
 
     def mcp_den_transition_orchestrator_lease(self, **kwargs):
         self.calls.append(("transition_orchestrator_lease", kwargs))
@@ -1003,6 +1012,101 @@ def test_coder_path_with_assignment_finalizes_lifecycle(tmp_path):
     assert ckpt_call[1]["run_id"] == "t1799-pool-coder"
     assert ckpt_call[1]["checkpoint_type"] == "completion"
     assert json.loads(ckpt_call[1]["payload"])["role"] == "coder"
+
+
+def test_reconcile_completed_child_assignment_releases_ack_assignment():
+    tools = RecordingCoderTools()
+    tools.active_assignments = [
+        {
+            "id": 104,
+            "worker_identity": "pool-reviewer-01",
+            "pool_member_id": "pool-reviewer-01",
+            "run_id": "review-1755-r1028-202606022235",
+            "project_id": "goblinbench",
+            "task_id": 1755,
+            "role": "reviewer",
+            "state": "ack",
+            "assigned_by": "spawned-orchestrator",
+        }
+    ]
+    tools.completions["review-1755-r1028-202606022235"] = {
+        "completion_state": "present",
+        "completion": {
+            "message_id": 10234,
+            "status": "completed",
+            "packet_type": "review_findings_packet",
+            "role": "reviewer",
+            "run_id": "review-1755-r1028-202606022235",
+            "review_round_id": 1028,
+            "final_repo": {
+                "branch": "task/1755-pluggable-scoring",
+                "head_commit": "2cf849fbf6c2caea29bfca2ce5f4297dfc2bee02",
+            },
+            "summary": "Review looks good.",
+        },
+    }
+    tools.pool_members["pool-reviewer-01"] = {"worker_identity": "pool-reviewer-01", "status": "available"}
+    adapter = make_adapter(tools)
+
+    finalized = reconcile_completed_child_assignments(adapter)
+
+    assert finalized == [104]
+    lifecycle_calls = [
+        name for name, _ in tools.calls
+        if name in (
+            "list_assignments",
+            "get_latest_worker_completion",
+            "append_checkpoint",
+            "record_cleanup_evidence",
+            "release_assignment",
+            "list_pool_members",
+        )
+    ]
+    assert lifecycle_calls == [
+        "list_assignments",
+        "get_latest_worker_completion",
+        "append_checkpoint",
+        "record_cleanup_evidence",
+        "release_assignment",
+        "list_pool_members",
+    ]
+    checkpoint = [kwargs for name, kwargs in tools.calls if name == "append_checkpoint"][0]
+    assert checkpoint["assignment_id"] == 104
+    assert checkpoint["run_id"] == "review-1755-r1028-202606022235"
+    assert checkpoint["checkpoint_type"] == "completion"
+    checkpoint_payload = json.loads(checkpoint["payload"])
+    assert checkpoint_payload["completion_packet_message_id"] == 10234
+    assert checkpoint_payload["review_round_id"] == 1028
+    assert checkpoint_payload["branch"] == "task/1755-pluggable-scoring"
+
+    cleanup = [kwargs for name, kwargs in tools.calls if name == "record_cleanup_evidence"][0]
+    cleanup_payload = json.loads(cleanup["evidence"])
+    assert cleanup_payload["source"] == "spawned_hermes_orchestrator_reconciliation"
+    assert cleanup_payload["completion_packet_message_id"] == 10234
+
+
+
+def test_reconcile_completed_child_assignment_skips_missing_completion():
+    tools = RecordingCoderTools()
+    tools.active_assignments = [
+        {
+            "id": 105,
+            "worker_identity": "pool-validator-01",
+            "run_id": "validate-1755-202606022336",
+            "task_id": 1755,
+            "role": "validator",
+            "state": "ack",
+        }
+    ]
+
+    finalized = reconcile_completed_child_assignments(make_adapter(tools))
+
+    assert finalized == []
+    assert [name for name, _ in tools.calls] == [
+        "list_assignments",
+        "get_latest_worker_completion",
+    ]
+
 
 
 def test_coder_path_without_assignment_skips_lifecycle(tmp_path):

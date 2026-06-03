@@ -520,13 +520,21 @@ class DenWorkflowAdapter:
         )
         return payload_response
 
-    def record_assignment_cleanup_evidence(self, *, assignment_id: int) -> Mapping[str, Any]:
+    def record_assignment_cleanup_evidence(
+        self,
+        *,
+        assignment_id: int,
+        evidence: Mapping[str, Any] | None = None,
+    ) -> Mapping[str, Any]:
+        evidence_payload = {
+            "status": "cleaned_up",
+            "source": "spawned_hermes_orchestrator",
+        }
+        if evidence:
+            evidence_payload.update(dict(evidence))
         response = self.tools.mcp_den_record_cleanup_evidence(
             assignment_id=assignment_id,
-            evidence=json.dumps({
-                "status": "cleaned_up",
-                "source": "spawned_hermes_orchestrator",
-            }),
+            evidence=json.dumps(evidence_payload, sort_keys=True),
         )
         payload_response = _coerce_mapping_response(response)
         _ensure_den_did_not_reject(
@@ -545,6 +553,30 @@ class DenWorkflowAdapter:
             context=f"assignment release for {assignment_id}",
         )
         return payload_response
+
+    def verify_pool_member_available(
+        self,
+        *,
+        worker_identity: str | None = None,
+        pool_member_id: str | None = None,
+    ) -> Mapping[str, Any]:
+        """Best-effort readback that a released concrete pool member is available."""
+
+        member_identity = pool_member_id or worker_identity
+        if not member_identity:
+            return {"verified": False, "reason": "no worker identity supplied"}
+        tool = getattr(self.tools, "mcp_den_list_pool_members", None)
+        if tool is None:
+            return {"verified": False, "reason": "mcp_den_list_pool_members tool unavailable"}
+        response = tool(worker_identity=member_identity, limit=1, verbose=True)
+        payload = _coerce_mapping_response(response)
+        members = list(payload.get("members") or [])
+        status = str(members[0].get("status", "")) if members else ""
+        return {
+            "verified": status == "available",
+            "worker_identity": member_identity,
+            "status": status or None,
+        }
 
     def check_active_orchestrator_leases(self) -> Mapping[str, Any]:
         """Query Core for active project_orchestrator leases for this project/profile.
@@ -946,6 +978,143 @@ def _finalize_pool_assignment(
     adapter.record_assignment_cleanup_evidence(assignment_id=assignment_id)
     adapter.release_assignment(assignment_id=assignment_id)
     return True
+
+
+def reconcile_completed_child_assignments(adapter: DenWorkflowAdapter) -> list[int]:
+    """Finalize active child assignments whose worker already posted terminal completion.
+
+    Project orchestrators can be restarted or compacted between a downstream
+    worker posting its completion packet and the orchestrator releasing the
+    concrete pool slot. This reconciliation pass is intentionally idempotent:
+    it only considers assignments that Core still reports as active, skips
+    missing/non-terminal completion packets, and then performs the normal
+    checkpoint → cleanup evidence → release lifecycle exactly once.
+    """
+
+    child_state = adapter.list_active_child_assignments()
+    assignments = list(child_state.get("active_assignments") or [])
+    finalized: list[int] = []
+    for assignment in assignments:
+        assignment_id = _assignment_int(assignment, "assignment_id", "id")
+        run_id = _assignment_str(assignment, "run_id")
+        role = _assignment_str(assignment, "role", "worker_role") or "worker"
+        task_id = _assignment_int(assignment, "task_id")
+        if assignment_id is None or not run_id or task_id is None:
+            continue
+
+        completion_response = adapter.get_latest_worker_completion(
+            task_id=task_id,
+            run_id=run_id,
+            role=role,
+        )
+        terminal = _terminal_worker_completion(completion_response)
+        if terminal is None:
+            continue
+
+        completion, success = terminal
+        completion_message_id = completion.get("message_id") or completion_response.get("message_id")
+        summary = _completion_summary_text(completion, role=role)
+        branch, head_commit = _completion_repo_refs(completion)
+        checkpoint_payload: dict[str, Any] = {
+            "type": "completion" if success else "failure",
+            "run_id": run_id,
+            "role": role,
+            "summary": summary,
+            "source": "spawned_hermes_orchestrator_reconciliation",
+        }
+        for key, value in (
+            ("completion_packet_message_id", completion_message_id),
+            ("review_round_id", completion.get("review_round_id")),
+            ("verdict", completion.get("verdict")),
+            ("branch", branch),
+            ("head_commit", head_commit),
+        ):
+            if value not in {None, ""}:
+                checkpoint_payload[key] = value
+
+        adapter.append_assignment_checkpoint(
+            assignment_id=assignment_id,
+            run_id=run_id,
+            checkpoint_type="completion" if success else "failure",
+            payload=checkpoint_payload,
+        )
+        cleanup_evidence = {
+            "status": "cleaned_up",
+            "source": "spawned_hermes_orchestrator_reconciliation",
+            "run_id": run_id,
+            "role": role,
+            "completion_status": completion.get("status"),
+            "completion_packet_message_id": completion_message_id,
+            "review_round_id": completion.get("review_round_id"),
+            "verdict": completion.get("verdict"),
+            "artifact_handles": completion.get("artifact_handles") or [],
+            "log_path": assignment.get("log_path"),
+        }
+        adapter.record_assignment_cleanup_evidence(
+            assignment_id=assignment_id,
+            evidence={key: value for key, value in cleanup_evidence.items() if value is not None and value != ""},
+        )
+        adapter.release_assignment(assignment_id=assignment_id)
+        adapter.verify_pool_member_available(
+            worker_identity=_assignment_str(assignment, "worker_identity"),
+            pool_member_id=_assignment_str(assignment, "pool_member_id"),
+        )
+        finalized.append(assignment_id)
+    return finalized
+
+
+def _assignment_int(assignment: Mapping[str, Any], *keys: str) -> int | None:
+    for key in keys:
+        value = assignment.get(key)
+        if value is not None and value != "":
+            return int(value)
+    return None
+
+
+def _assignment_str(assignment: Mapping[str, Any], *keys: str) -> str | None:
+    for key in keys:
+        value = assignment.get(key)
+        if value is not None and value != "":
+            return str(value)
+    return None
+
+
+def _terminal_worker_completion(response: Mapping[str, Any]) -> tuple[Mapping[str, Any], bool] | None:
+    state = str(response.get("completion_state") or "").lower()
+    if state in {"missing_packet", "pending", "missing_or_untracked", "not_found"}:
+        return None
+    nested_completion = response.get("completion")
+    completion: Mapping[str, Any]
+    if isinstance(nested_completion, Mapping):
+        completion = nested_completion
+    else:
+        completion = response
+    status = str(completion.get("status") or response.get("status") or state).lower()
+    if status in {"completed", "blocked", "failed", "needs_input", "incomplete"}:
+        return completion, status == "completed"
+    if state in {"present", "posted_completed", "completed"}:
+        return completion, True
+    return None
+
+
+def _completion_repo_refs(completion: Mapping[str, Any]) -> tuple[str | None, str | None]:
+    raw_final_repo = completion.get("final_repo")
+    raw_metadata = completion.get("metadata")
+    final_repo: Mapping[str, Any] = raw_final_repo if isinstance(raw_final_repo, Mapping) else {}
+    metadata: Mapping[str, Any] = raw_metadata if isinstance(raw_metadata, Mapping) else {}
+    branch = completion.get("branch") or final_repo.get("branch") or metadata.get("branch")
+    head_commit = completion.get("head_commit") or final_repo.get("head_commit") or metadata.get("head_commit")
+    return (str(branch) if branch else None, str(head_commit) if head_commit else None)
+
+
+def _completion_summary_text(completion: Mapping[str, Any], *, role: str) -> str:
+    summary = completion.get("summary")
+    if summary:
+        return str(summary)
+    content = completion.get("content")
+    if isinstance(content, str) and content.strip():
+        return content.strip().splitlines()[0]
+    return f"{role} worker completed"
 
 
 def _post_pool_drift_blocked(
@@ -1943,6 +2112,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1 if stop_result.status in {"failed", "blocked"} else 0
 
     emission_guard = WorkCompleteEmissionGuard()
+    reconcile_completed_child_assignments(adapter)
     action = decide_next_action(adapter, task_id=args.task_id, max_attempts=args.max_attempts)
 
     # Emit work-complete notification for terminal drain states. The guard is
