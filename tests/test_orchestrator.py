@@ -2833,6 +2833,26 @@ class TestDirectAgentWakeBridge:
         assert "direct-agent-messages" in result["diagnostic"]
         assert "channels.test" in result["diagnostic"]
 
+    def test_send_direct_agent_diagnostic_uses_normalized_url(self):
+        """Diagnostic URL mirrors the actual normalized request URL."""
+        adapter = DenWorkflowAdapter(
+            tools=_make_minimal_tools(),
+            project_id="den-hermes-bridge",
+            requested_by="den-hermes-runner",
+            channels_url="http://channels.test/api/gateway",
+        )
+
+        result = adapter.send_direct_agent_message(
+            channel_id=42,
+            member_identity="pool-coder-01",
+            body="Wake test",
+        )
+
+        assert result["ok"] is False
+        assert result["url"] == "http://channels.test/api/gateway/direct-agent-messages"
+        assert "http://channels.test/api/gateway/direct-agent-messages" in result["diagnostic"]
+        assert "/api/gateway/api/gateway/" not in result["diagnostic"]
+
     def test_channels_request_error_includes_url_and_method(self):
         """_channels_request error includes method, url, base_url, endpoint."""
         adapter = DenWorkflowAdapter(
@@ -2860,7 +2880,7 @@ class TestDirectAgentWakeBridge:
         assert result["endpoint"] == "/api/gateway/direct-agent-messages"
         assert "Connection refused" in result["error"]
 
-    def test_send_direct_agent_redacts_secrets(self):
+    def test_send_direct_agent_error_diagnostic_structure(self):
         """send_direct_agent_message structures error with diagnostic fields."""
         adapter = DenWorkflowAdapter(
             tools=_make_minimal_tools(),

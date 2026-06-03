@@ -832,10 +832,11 @@ class DenWorkflowAdapter:
         result = dict(self._channels_request("POST", "/api/gateway/direct-agent-messages", json_payload=payload))
         if not result.get("ok") and result.get("error"):
             result["failure_category"] = "worker_wake_bridge_route_error"
-            result["diagnostic"] = (
-                f"POST {self.channels_url}/api/gateway/direct-agent-messages "
-                f"failed: {result.get('error')}"
+            actual_url = result.get("url") or _join_channels_api_url(
+                self.channels_url or "",
+                "/api/gateway/direct-agent-messages",
             )
+            result["diagnostic"] = f"POST {actual_url} failed: {result.get('error')}"
         return result
 
     def check_active_orchestrator_leases(self) -> Mapping[str, Any]:
