@@ -68,6 +68,8 @@ class FakeChannelsClient:
         self.messages: dict[int, dict[str, Any]] = {}
         self.events_by_channel: dict[int, dict[str, Any]] = {}
         self.event_requests: list[tuple[int, int, int]] = []
+        self.membership_discovery: dict[str, Any] = {"memberships": []}
+        self.membership_requests: list[dict[str, Any]] = []
         self.posts: list[tuple[str | int, dict[str, Any]]] = []
         self.reactions: list[tuple[str | int, dict[str, Any]]] = []
         self._next_post_id = 9000
@@ -75,6 +77,10 @@ class FakeChannelsClient:
     async def get_direct_agent_events(self, *, channel_id: int, after_id: int = 0, limit: int = 10) -> dict[str, Any]:
         self.event_requests.append((channel_id, after_id, limit))
         return dict(self.events_by_channel.get(channel_id, {"items": [], "nextAfterId": after_id}))
+
+    async def get_channel_memberships(self, *, member_identity: str, include_left: bool = False, limit: int = 200) -> dict[str, Any]:
+        self.membership_requests.append({"member_identity": member_identity, "include_left": include_left, "limit": limit})
+        return dict(self.membership_discovery)
 
     async def get_gateway_message(self, message_id: str | int) -> dict[str, Any]:
         return dict(self.messages[int(message_id)])
@@ -234,6 +240,47 @@ async def test_configured_poll_channel_ids_are_used_for_worker_pool_control() ->
 
     assert first == [604, 672]
     assert second == [604, 672]
+    assert channels.membership_requests == []
+
+
+@pytest.mark.asyncio
+async def test_member_identity_membership_discovery_finds_worker_pool_and_target_channels() -> None:
+    gateway = FakeGatewayClient()
+    channels = FakeChannelsClient()
+    channels.membership_discovery = {
+        "memberIdentity": "spawned-coder",
+        "memberships": [
+            {"channelId": 604, "channelSlug": "worker-pool", "membershipStatus": "active", "membershipPurpose": "worker_pool_control"},
+            {"channelId": 1, "channelSlug": "project-agora-os", "membershipStatus": "active", "membershipPurpose": "target_work"},
+            {"channelId": 642, "channelSlug": "project-pi-crew", "membershipStatus": "left", "membershipPurpose": "target_work"},
+            {"channelId": "bad", "membershipStatus": "active"},
+        ],
+    }
+    adapter = DenChannelsAdapter(
+        PlatformConfig(
+            enabled=True,
+            token="***",
+            extra={
+                "channels_url": "http://192.168.1.10:18081",
+                "project_id": "",
+                "agent_identity": "spawned-coder",
+                "role": "coder",
+                "profile": "spawned-coder",
+                "adapter_instance_id": "test-host:spawned-coder:coder:worker",
+                "start_claim_loop": False,
+                "start_poll_loop": False,
+            },
+        ),
+        gateway_client=gateway,
+        channels_client=channels,
+    )
+
+    first = await adapter._resolve_poll_channels()
+    second = await adapter._resolve_poll_channels()
+
+    assert first == [1, 604]
+    assert second == [1, 604]
+    assert channels.membership_requests == [{"member_identity": "spawned-coder", "include_left": False, "limit": 200}]
 
 
 @pytest.mark.asyncio
