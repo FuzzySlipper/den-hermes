@@ -1359,10 +1359,10 @@ class DenChannelsAdapter(BasePlatformAdapter):
             for channel_id in self.poll_channel_ids:
                 self._polled_channels.add(channel_id)
             return list(self.poll_channel_ids)
-        if self._polled_channels:
-            return list(self._polled_channels)
         now = _time.time()
-        if now - self._last_channel_discovery < self._channel_discovery_interval:
+        if self._polled_channels and now - self._last_channel_discovery < self._channel_discovery_interval:
+            return sorted(self._polled_channels)
+        if not self._polled_channels and now - self._last_channel_discovery < self._channel_discovery_interval:
             return []
         self._last_channel_discovery = now
 
@@ -1370,6 +1370,8 @@ class DenChannelsAdapter(BasePlatformAdapter):
         headers = {"Content-Type": "application/json"}
         if channels_token:
             headers["Authorization"] = f"Bearer {channels_token}"
+
+        discovered_channels: set[int] = set()
 
         async def _check_memberships(url: str) -> None:
             async with httpx.AsyncClient(timeout=10.0) as client:
@@ -1384,7 +1386,7 @@ class DenChannelsAdapter(BasePlatformAdapter):
                     status = str(member.get("membershipStatus") or member.get("membership_status") or "active").lower()
                     if mid == self.agent_identity and status != "left":
                         if cid is not None:
-                            self._polled_channels.add(cid)
+                            discovered_channels.add(cid)
                         return
 
         async def _discover_member_channels() -> None:
@@ -1409,13 +1411,14 @@ class DenChannelsAdapter(BasePlatformAdapter):
                 cid = _coerce_int(item.get("channelId") or item.get("channel_id"))
                 status = str(item.get("membershipStatus") or item.get("membership_status") or "active").lower()
                 if cid is not None and status != "left":
-                    self._polled_channels.add(cid)
+                    discovered_channels.add(cid)
 
         try:
             await _discover_member_channels()
         except Exception:
             logger.debug("[DenChannels] member channel discovery failed", exc_info=True)
-        if self._polled_channels:
+        if discovered_channels:
+            self._polled_channels = set(discovered_channels)
             logger.info("[DenChannels] poll channels discovered from member memberships: %s", sorted(self._polled_channels))
             return sorted(self._polled_channels)
 
@@ -1428,14 +1431,15 @@ class DenChannelsAdapter(BasePlatformAdapter):
                 await _check_memberships(f"{self.channels_url}/api/gateway/memberships?channelId={cid}")
             except Exception:
                 logger.debug("[DenChannels] channel discovery failed for %s", cid, exc_info=True)
-        if not self._polled_channels and self.project_id:
+        if not discovered_channels and self.project_id:
             try:
                 await _check_memberships(f"{self.channels_url}/api/gateway/memberships?projectId={self.project_id}")
             except Exception:
                 logger.debug("[DenChannels] project channel discovery failed", exc_info=True)
-        if self._polled_channels:
+        if discovered_channels:
+            self._polled_channels = set(discovered_channels)
             logger.info("[DenChannels] poll channels discovered: %s", sorted(self._polled_channels))
-        return list(self._polled_channels)
+        return sorted(self._polled_channels)
 
     @staticmethod
     def _event_to_delivery(raw_event: dict[str, Any]) -> dict[str, Any]:

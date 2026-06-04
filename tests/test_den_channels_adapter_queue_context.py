@@ -284,6 +284,55 @@ async def test_member_identity_membership_discovery_finds_worker_pool_and_target
 
 
 @pytest.mark.asyncio
+async def test_member_identity_membership_discovery_refreshes_after_interval() -> None:
+    gateway = FakeGatewayClient()
+    channels = FakeChannelsClient()
+    channels.membership_discovery = {
+        "memberIdentity": "spawned-reviewer",
+        "memberships": [
+            {"channelId": 604, "membershipStatus": "active", "membershipPurpose": "worker_pool_control"},
+        ],
+    }
+    adapter = DenChannelsAdapter(
+        PlatformConfig(
+            enabled=True,
+            token="***",
+            extra={
+                "channels_url": "http://192.168.1.10:18081",
+                "project_id": "",
+                "agent_identity": "spawned-reviewer",
+                "role": "reviewer",
+                "profile": "spawned-reviewer",
+                "adapter_instance_id": "test-host:spawned-reviewer:reviewer:worker",
+                "channel_discovery_interval_seconds": 30,
+                "start_claim_loop": False,
+                "start_poll_loop": False,
+            },
+        ),
+        gateway_client=gateway,
+        channels_client=channels,
+    )
+
+    first = await adapter._resolve_poll_channels()
+    adapter._last_channel_discovery -= adapter._channel_discovery_interval + 1
+    channels.membership_discovery = {
+        "memberIdentity": "spawned-reviewer",
+        "memberships": [
+            {"channelId": 604, "membershipStatus": "active", "membershipPurpose": "worker_pool_control"},
+            {"channelId": 1, "membershipStatus": "active", "membershipPurpose": "target_work"},
+        ],
+    }
+    second = await adapter._resolve_poll_channels()
+
+    assert first == [604]
+    assert second == [1, 604]
+    assert channels.membership_requests == [
+        {"member_identity": "spawned-reviewer", "include_left": False, "limit": 200},
+        {"member_identity": "spawned-reviewer", "include_left": False, "limit": 200},
+    ]
+
+
+@pytest.mark.asyncio
 async def test_channels_only_connect_does_not_require_gateway_binding() -> None:
     channels = FakeChannelsClient()
     adapter = DenChannelsAdapter(
