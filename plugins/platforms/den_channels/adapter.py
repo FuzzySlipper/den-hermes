@@ -845,7 +845,13 @@ class DenChannelsAdapter(BasePlatformAdapter):
             _first(metadata, "sender_identity", "senderIdentity", default=_first(message, "senderIdentity", "sender_identity", default="unknown"))
             or "unknown"
         )
-        body = str(_first(message, "body", "text", "content", default=_first(delivery, "context_summary", "contextSummary", default="")) or "")
+        body = str(_first(
+            message,
+            "body",
+            "text",
+            "content",
+            default=_first(delivery, "body", "text", "content", "context_summary", "contextSummary", default=""),
+        ) or "")
         chat_name = _first(metadata, "channel_slug", "channelSlug", "channel_name", "channelName")
 
         # --- Session lane selection (#1871) ---

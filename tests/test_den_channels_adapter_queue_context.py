@@ -124,6 +124,34 @@ def _delivery(delivery_id: int, message_id: int, *, attempt_id: int, session_id:
 
 
 @pytest.mark.asyncio
+async def test_direct_agent_delivery_body_takes_precedence_over_generated_summary() -> None:
+    """Direct-agent wake summaries are delivery evidence, not user message text."""
+    gateway = FakeGatewayClient()
+    channels = FakeChannelsClient()
+    adapter = _adapter(gateway, channels)
+
+    event = await adapter.delivery_to_event({
+        "delivery_request_id": 2225,
+        "attempt_id": 1,
+        "session_id": "session-direct-agent",
+        "project_id": "den-hermes-bridge",
+        "source_kind": "wake_event",
+        "source_id": "direct-agent-message:672:den-mcp-planner:0e0261578baa4fc48a7c6e919da84177",
+        "body": "1939 finished, is it still coming through goofy?",
+        "context_summary": "Direct agent request to den-mcp-planner: recorded, pending claim/completion",
+        "metadata_json": json.dumps({
+            "channel_id": 672,
+            "channel_slug": "den-system",
+            "sender_identity": "Patch",
+        }),
+    })
+
+    assert event.text == "1939 finished, is it still coming through goofy?"
+    assert "recorded, pending claim/completion" not in event.text
+    assert event.raw_message["context_summary"] == "Direct agent request to den-mcp-planner: recorded, pending claim/completion"
+
+
+@pytest.mark.asyncio
 async def test_explicit_delivery_metadata_keeps_queued_lane_contexts_distinct() -> None:
     """Queued same-lane deliveries must not overwrite the earlier delivery handle.
 
