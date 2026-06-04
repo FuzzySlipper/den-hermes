@@ -121,7 +121,7 @@ def _delivery(
     extra_metadata: dict[str, Any] | None = None,
     extra_delivery: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    metadata: dict[str, Any] = {"channel_id": channel_id, "channel_slug": "ops-hub"}
+    metadata: dict[str, Any] = {"channel_id": channel_id, "channel_slug": "ops-hub", "session_scope": "source_lane"}
     if extra_metadata:
         metadata.update(extra_metadata)
     result: dict[str, Any] = {

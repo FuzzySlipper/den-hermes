@@ -373,17 +373,85 @@ class _DeliveryContext:
     original_source_id: str
     raw_delivery: dict[str, Any]
     conversation_lane_id: Optional[str] = None
-    """Explicit Den conversation lane id carried in delivery metadata.
+    """Explicit Den conversation/source-lane id carried in delivery metadata.
 
-    When present, this overrides the default ``project:<id>:channel:<id>``
-    chat_id used for session key construction, allowing Den Core/Channels/
-    Gateway to control Hermes session continuity independently of the raw
-    source channel identity.  See ``docs/den-channels-session-lanes-1871.md``
-    for the lane-selection precedence contract.
+    This is compatibility/source-lane identity. When ``session_owner_id`` is
+    present, the session owner dominates and this field records only the source
+    lane for routing/display.
+    """
+    session_owner_id: Optional[str] = None
+    """Resolved session-owner identity from #1890.
+
+    When present, this is the concrete agent/worker identity that owns the
+    Hermes session. It overrides channel-lane session identity for durable
+    agents and distinct worker instances.
     """
 
 
 _DIRECT_AGENT_CONFIG_DEFAULTS: dict[str, str] = {}
+
+
+def _resolve_session_owner(
+    delivery: dict[str, Any],
+    metadata: dict[str, Any],
+    adapter_instance_id: Optional[str],
+    pool_member_id: Optional[str],
+    agent_instance_id: Optional[str],
+    profile: str,
+) -> Optional[str]:
+    """Resolve the Hermes session owner for a delivery.
+
+    Session-owner precedence (#1890): explicit session owner, concrete
+    delivery agent instance, assignment, worker run, then adapter-level
+    concrete identity.  A delivery can opt back into #1871 source-lane
+    compatibility by setting ``session_scope``/``sessionScope`` to
+    ``source_lane``.
+    """
+    scope = (
+        _first(metadata, "session_scope", "sessionScope")
+        or _first(delivery, "session_scope", "sessionScope")
+        or ""
+    )
+    if str(scope).strip().lower() in {"source_lane", "source-lane", "channel", "source_channel"}:
+        return None
+
+    explicit_owner = _first(metadata, "session_owner_id", "sessionOwnerId") or _first(
+        delivery, "session_owner_id", "sessionOwnerId"
+    )
+    if explicit_owner is not None and str(explicit_owner).strip():
+        return f"owner:{str(explicit_owner).strip()}"
+
+    delivery_agent_instance = _first(metadata, "agent_instance_id", "agentInstanceId") or _first(
+        delivery, "agent_instance_id", "agentInstanceId"
+    )
+    if delivery_agent_instance is not None and str(delivery_agent_instance).strip():
+        return f"owner:{str(delivery_agent_instance).strip()}"
+
+    assignment_id = _first(
+        metadata, "assignment_id", "targetAssignmentId", "target_assignment_id", "assignmentId"
+    ) or _first(
+        delivery, "assignment_id", "targetAssignmentId", "target_assignment_id", "assignmentId"
+    )
+    if assignment_id is not None:
+        return f"owner:assignment:{assignment_id}"
+
+    worker_run_id = _first(metadata, "worker_run_id", "workerRunId") or _first(
+        delivery, "worker_run_id", "workerRunId"
+    )
+    if worker_run_id is not None:
+        return f"owner:run:{worker_run_id}"
+
+    if pool_member_id:
+        return f"owner:pool:{pool_member_id}"
+    if agent_instance_id:
+        return f"owner:{agent_instance_id}"
+    if adapter_instance_id:
+        return f"owner:{adapter_instance_id}"
+
+    # Never collapse distinct workers solely by shared profile identity.
+    if profile:
+        return None
+    return None
 
 
 def _resolve_conversation_lane(
@@ -543,6 +611,50 @@ class DenGatewayClient:
         return await self._request("POST", f"/api/deliveries/{delivery_request_id}/fail", payload)
 
 
+class _DirectAgentEventPoller:
+    """Cursor-tracked poller for direct-agent wake events from Den Channels."""
+
+    def __init__(self, channels_client: "DenChannelsClient", agent_identity: str):
+        self._channels_client = channels_client
+        self._agent_identity = agent_identity
+        self._cursor_by_channel: dict[int, int] = {}
+
+    async def poll(self, channel_id: int, limit: int = 10) -> list[dict[str, Any]]:
+        after_id = self._cursor_by_channel.get(channel_id, 0)
+        page = await self._channels_client.get_direct_agent_events(
+            channel_id=channel_id, after_id=after_id, limit=limit
+        )
+        items = page.get("items") or page.get("eventItems") or []
+        my_events: list[dict[str, Any]] = []
+        for event in items:
+            event_id = _coerce_int(event.get("id") or event.get("eventId"))
+            if event_id is None:
+                continue
+            if event_id <= after_id:
+                continue
+            if self._is_targeting_me(event):
+                my_events.append(event)
+            if event_id > self._cursor_by_channel.get(channel_id, 0):
+                self._cursor_by_channel[channel_id] = event_id
+        next_after = _coerce_int(page.get("nextAfterId") or page.get("next_after_id"))
+        if next_after is not None:
+            current = self._cursor_by_channel.get(channel_id, 0)
+            if next_after > current:
+                self._cursor_by_channel[channel_id] = next_after
+        return my_events
+
+    def _is_targeting_me(self, event: dict[str, Any]) -> bool:
+        member_id = str(event.get("memberIdentity") or event.get("member_identity") or "").strip()
+        if member_id:
+            return member_id == self._agent_identity
+        source_id = str(event.get("sourceId") or event.get("source_id") or event.get("SourceId") or "")
+        if source_id.startswith("direct-agent-message:"):
+            parts = source_id.split(":")
+            if len(parts) >= 3:
+                return parts[2] == self._agent_identity
+        return False
+
+
 class DenChannelsClient:
     """Small async HTTP client for Den Channels message APIs."""
 
@@ -563,6 +675,14 @@ class DenChannelsClient:
             if not response.content:
                 return {}
             return response.json()
+
+    async def get_direct_agent_events(
+        self, *, channel_id: int, after_id: int = 0, limit: int = 10
+    ) -> dict[str, Any]:
+        return await self._request(
+            "GET",
+            f"/api/direct-agent-events?channelId={channel_id}&afterId={after_id}&limit={limit}",
+        )
 
     async def get_gateway_message(self, message_id: str | int) -> dict[str, Any]:
         return await self._request("GET", f"/api/gateway/messages/{message_id}")
@@ -629,7 +749,10 @@ class DenChannelsAdapter(BasePlatformAdapter):
         self.claim_interval_seconds = float(extra.get("claim_interval_seconds") or 2.0)
         self.claim_limit = max(1, _coerce_int(extra.get("claim_limit")) or 1)
         self.lease_seconds = max(1, _coerce_int(extra.get("lease_seconds")) or 300)
-        self.start_claim_loop = _coerce_bool(extra.get("start_claim_loop"), True)
+        self.start_claim_loop = _coerce_bool(extra.get("start_claim_loop"), bool(self.gateway_url))
+        self.poll_interval_seconds = float(extra.get("poll_interval_seconds") or 2.0)
+        self.poll_limit = max(1, _coerce_int(extra.get("poll_limit")) or 10)
+        self.start_poll_loop = _coerce_bool(extra.get("start_poll_loop"), True)
         self._sleep = sleep or asyncio.sleep
         token = str(extra.get("token") or os.getenv("DEN_GATEWAY_TOKEN") or "").strip() or None
         channels_token = str(extra.get("channels_token") or os.getenv("DEN_CHANNELS_TOKEN") or token or "").strip() or None
@@ -639,10 +762,17 @@ class DenChannelsAdapter(BasePlatformAdapter):
             token=channels_token or token,
             agent_identity=self.agent_identity,
         )
-        self._has_trusted_transport = bool(token or _is_private_url(self.gateway_url))
-        self.gateway_client = gateway_client or DenGatewayClient(self.gateway_url, token=token)
+        self._has_trusted_transport = bool(
+            token or channels_token or _is_private_url(self.gateway_url) or _is_private_url(self.channels_url)
+        )
+        self.gateway_client = gateway_client or (DenGatewayClient(self.gateway_url, token=token) if self.gateway_url else None)
         self.channels_client = channels_client or DenChannelsClient(self.channels_url, token=channels_token)
         self._claim_task: asyncio.Task | None = None
+        self._event_task: asyncio.Task | None = None
+        self._event_poller = _DirectAgentEventPoller(self.channels_client, self.agent_identity)
+        self._polled_channels: set[int] = set()
+        self._last_channel_discovery = 0.0
+        self._channel_discovery_interval = float(extra.get("channel_discovery_interval_seconds") or 30.0)
         self._contexts_by_session: dict[str, _DeliveryContext] = {}
         self._contexts_by_chat: dict[str, _DeliveryContext] = {}
         self._contexts_by_lane: dict[tuple[str, str | None], _DeliveryContext] = {}
@@ -665,14 +795,20 @@ class DenChannelsAdapter(BasePlatformAdapter):
                 retryable=False,
             )
             return False
-        await self.gateway_client.upsert_adapter_binding(self._binding_payload())
+        if self.gateway_client is not None:
+            await self.gateway_client.upsert_adapter_binding(self._binding_payload())
         self._running = True
-        if self.start_claim_loop:
+        if self.start_claim_loop and self.gateway_client is not None:
             try:
                 self._claim_task = asyncio.create_task(self._claim_loop())
             except RuntimeError:
                 # Unit tests may construct without a running loop; connect still proves config/binding.
                 self._claim_task = None
+        if self.start_poll_loop and self.channels_url:
+            try:
+                self._event_task = asyncio.create_task(self._event_poll_loop())
+            except RuntimeError:
+                self._event_task = None
         return True
 
     async def disconnect(self) -> None:
@@ -684,6 +820,13 @@ class DenChannelsAdapter(BasePlatformAdapter):
             except asyncio.CancelledError:
                 pass
         self._claim_task = None
+        if self._event_task and not self._event_task.done():
+            self._event_task.cancel()
+            try:
+                await self._event_task
+            except asyncio.CancelledError:
+                pass
+        self._event_task = None
 
     async def get_chat_info(self, chat_id: str) -> dict[str, Any]:
         return {"id": chat_id, "name": chat_id, "type": "channel"}
@@ -854,14 +997,20 @@ class DenChannelsAdapter(BasePlatformAdapter):
         ) or "")
         chat_name = _first(metadata, "channel_slug", "channelSlug", "channel_name", "channelName")
 
-        # --- Session lane selection (#1871) ---
-        # Resolve the conversation lane identity from delivery metadata.
-        # Precedence: explicit conversationLaneId/hermesSessionKey > target-task
-        # lane > target-assignment lane > worker-run lane > source channel.
+        # --- Session owner / lane selection (#1890/#1871) ---
+        # Prefer durable session-owner identity when available; source/channel
+        # lanes remain as compatibility metadata or when session_scope=source_lane.
+        session_owner_id = _resolve_session_owner(
+            delivery, metadata, self.adapter_instance_id, self.pool_member_id, self.agent_instance_id, self.profile
+        )
         conversation_lane_id = _resolve_conversation_lane(delivery, metadata)
         raw_chat_id = f"project:{project_id}:channel:{channel_id}"
 
-        if conversation_lane_id is not None:
+        if session_owner_id is not None:
+            chat_type = "thread" if thread_root is not None else "channel"
+            chat_id = session_owner_id
+            thread_id = f"thread:{thread_root}" if thread_root is not None else None
+        elif conversation_lane_id is not None:
             # Use the explicit lane id as the Hermes session key namespace.
             # Thread qualification is preserved only when the explicit lane
             # does not already embed thread context.
@@ -896,6 +1045,7 @@ class DenChannelsAdapter(BasePlatformAdapter):
                 "channel_id": channel_id,
                 "project_id": project_id,
                 "conversation_lane_id": conversation_lane_id,
+                "session_owner_id": session_owner_id,
                 "raw_chat_id": raw_chat_id,
             },
             message_id=str(trigger_message_id or source_id),
@@ -931,6 +1081,7 @@ class DenChannelsAdapter(BasePlatformAdapter):
         trigger_message_id = _coerce_int(_first(message, "id", "messageId", default=getattr(event, "message_id", None)))
         thread_root = _coerce_int(_first(message, "threadRootMessageId", "thread_root_message_id"))
         conversation_lane_id = raw.get("conversation_lane_id")
+        session_owner_id = raw.get("session_owner_id")
         return _DeliveryContext(
             delivery_request_id=delivery_id,
             attempt_id=_coerce_int(_first(raw, "attempt_id", "attemptId")),
@@ -944,6 +1095,7 @@ class DenChannelsAdapter(BasePlatformAdapter):
             original_source_id=str(_first(raw, "source_id", "sourceId", default="") or ""),
             raw_delivery=raw,
             conversation_lane_id=str(conversation_lane_id) if conversation_lane_id is not None else None,
+            session_owner_id=str(session_owner_id) if session_owner_id is not None else None,
         )
 
     async def on_processing_start(self, event: MessageEvent) -> None:
@@ -1120,6 +1272,129 @@ class DenChannelsAdapter(BasePlatformAdapter):
                 logger.warning("[DenChannels] delivery claim loop failed", exc_info=True)
                 await self._maybe_sleep(self.claim_interval_seconds)
 
+    async def _event_poll_loop(self) -> None:
+        """Poll Channels for direct-agent wake events targeted at this agent."""
+        while self._running:
+            try:
+                channels_to_poll = await self._resolve_poll_channels()
+                for channel_id in channels_to_poll:
+                    events = await self._event_poller.poll(channel_id, limit=self.poll_limit)
+                    if events:
+                        logger.info("[DenChannels] polled %d event(s) on channel %d", len(events), channel_id)
+                    for raw_event in events:
+                        try:
+                            delivery = self._event_to_delivery(raw_event)
+                            event = await self.delivery_to_event(delivery)
+                            await self.handle_message(event)
+                        except Exception:
+                            logger.warning(
+                                "[DenChannels] event %s conversion failed",
+                                raw_event.get("id") or raw_event.get("eventId"),
+                                exc_info=True,
+                            )
+                await self._maybe_sleep(self.poll_interval_seconds)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning("[DenChannels] event poll loop failed", exc_info=True)
+                await self._maybe_sleep(self.poll_interval_seconds)
+
+    async def _resolve_poll_channels(self) -> list[int]:
+        """Return channel IDs this adapter should poll for direct-agent events."""
+        import time as _time
+        import httpx
+
+        if not self.channels_url or not self.agent_identity:
+            return []
+        if self._polled_channels:
+            return list(self._polled_channels)
+        now = _time.time()
+        if now - self._last_channel_discovery < self._channel_discovery_interval:
+            return []
+        self._last_channel_discovery = now
+
+        channels_token = str(getattr(self.channels_client, "token", None) or "").strip() or None
+        headers = {"Content-Type": "application/json"}
+        if channels_token:
+            headers["Authorization"] = f"Bearer {channels_token}"
+
+        async def _check_memberships(url: str) -> None:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                response = await client.get(url, headers=headers)
+                if response.status_code != 200:
+                    return
+                body = response.json() if response.content else {}
+                cid = _coerce_int(body.get("channelId") or body.get("channel_id"))
+                members = body.get("members") or body.get("memberships") or []
+                for member in members:
+                    mid = str(member.get("memberIdentity") or member.get("member_identity") or "").strip()
+                    status = str(member.get("membershipStatus") or member.get("membership_status") or "active").lower()
+                    if mid == self.agent_identity and status != "left":
+                        if cid is not None:
+                            self._polled_channels.add(cid)
+                        return
+
+        # Den system channel is the common direct-agent channel; project_id can
+        # discover a project default channel when configured.
+        for cid in (672,):
+            try:
+                await _check_memberships(f"{self.channels_url}/api/gateway/memberships?channelId={cid}")
+            except Exception:
+                logger.debug("[DenChannels] channel discovery failed for %s", cid, exc_info=True)
+        if not self._polled_channels and self.project_id:
+            try:
+                await _check_memberships(f"{self.channels_url}/api/gateway/memberships?projectId={self.project_id}")
+            except Exception:
+                logger.debug("[DenChannels] project channel discovery failed", exc_info=True)
+        if self._polled_channels:
+            logger.info("[DenChannels] poll channels discovered: %s", sorted(self._polled_channels))
+        return list(self._polled_channels)
+
+    @staticmethod
+    def _event_to_delivery(raw_event: dict[str, Any]) -> dict[str, Any]:
+        """Convert a Channels direct-agent wake_event to delivery_to_event shape."""
+        event_id = _coerce_int(raw_event.get("id") or raw_event.get("eventId") or 0) or 0
+        channel_id = _coerce_int(raw_event.get("channelId") or raw_event.get("channel_id"))
+        metadata: dict[str, Any] = {}
+        metadata_str = raw_event.get("metadataJson") or raw_event.get("metadata_json") or raw_event.get("metadata")
+        if isinstance(metadata_str, str) and metadata_str.strip():
+            try:
+                metadata = json.loads(metadata_str)
+            except Exception:
+                metadata = {}
+        elif isinstance(metadata_str, dict):
+            metadata = metadata_str
+        if channel_id is not None and "channel_id" not in metadata and "channelId" not in metadata:
+            metadata["channel_id"] = channel_id
+        human_body = raw_event.get("body") or raw_event.get("text") or raw_event.get("content") or ""
+        summary = raw_event.get("summary") or ""
+        delivery: dict[str, Any] = {
+            "delivery_request_id": event_id,
+            "project_id": str(raw_event.get("sourceProjectId") or raw_event.get("source_project_id") or raw_event.get("projectId") or ""),
+            "source_kind": str(raw_event.get("sourceKind") or raw_event.get("source_kind") or "wake_event"),
+            "source_id": str(raw_event.get("sourceId") or raw_event.get("source_id") or ""),
+            "body": human_body,
+            "context_summary": summary or human_body,
+            "metadata_json": json.dumps(metadata, sort_keys=True, default=str) if metadata else "{}",
+            "channel_id": channel_id,
+            "target_project_id": raw_event.get("targetProjectId") or raw_event.get("target_project_id"),
+            "target_task_id": raw_event.get("targetTaskId") or raw_event.get("target_task_id"),
+            "assignment_id": raw_event.get("assignmentId") or raw_event.get("assignment_id"),
+            "worker_run_id": raw_event.get("workerRunId") or raw_event.get("worker_run_id"),
+            "worker_role": raw_event.get("workerRole") or raw_event.get("worker_role"),
+            "profile_identity": raw_event.get("profileIdentity") or raw_event.get("profile_identity"),
+            "pool_member_id": raw_event.get("poolMemberId") or raw_event.get("pool_member_id"),
+            "agent_instance_id": raw_event.get("agentInstanceId") or raw_event.get("agent_instance_id"),
+            "session_owner_id": raw_event.get("sessionOwnerId") or raw_event.get("session_owner_id"),
+            "session_id": raw_event.get("sessionId") or raw_event.get("session_id"),
+        }
+        for meta_key in ("deliveryStatus", "claimStatus", "completionStatus", "wakePolicy"):
+            meta_val = metadata.get(meta_key)
+            if meta_val is not None:
+                delivery[meta_key] = meta_val
+        return delivery
+
+
     async def _maybe_sleep(self, seconds: float) -> None:
         result = self._sleep(seconds)
         if inspect.isawaitable(result):
@@ -1190,6 +1465,8 @@ class DenChannelsAdapter(BasePlatformAdapter):
         # Clear raw channel id mapping (used by non-lane contexts)
         if self._contexts_by_chat.get(chat_id) is context:
             self._contexts_by_chat.pop(chat_id, None)
+        if context.session_owner_id is not None and self._contexts_by_chat.get(context.session_owner_id) is context:
+            self._contexts_by_chat.pop(context.session_owner_id, None)
         # Clear explicit lane mapping (when conversation_lane_id was used as chat_id)
         if context.conversation_lane_id is not None:
             lane_chat_id = context.conversation_lane_id
@@ -1274,7 +1551,11 @@ def validate_config(config: PlatformConfig) -> bool:
     channels_url = extra.get("channels_url") or os.getenv("DEN_CHANNELS_URL")
     agent_identity = extra.get("agent_identity") or os.getenv("HERMES_AGENT_IDENTITY") or os.getenv("HERMES_PROFILE")
     token = str(extra.get("token") or os.getenv("DEN_GATEWAY_TOKEN") or "").strip()
-    return bool(gateway_url and channels_url and agent_identity and (token or _is_private_url(str(gateway_url))))
+    return bool(
+        channels_url
+        and agent_identity
+        and (token or _is_private_url(str(gateway_url or "")) or _is_private_url(str(channels_url)))
+    )
 
 
 _DIRECT_AGENT_MESSAGE_PARAMETERS = {

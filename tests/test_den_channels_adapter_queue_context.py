@@ -66,9 +66,15 @@ class FakeGatewayClient:
 class FakeChannelsClient:
     def __init__(self) -> None:
         self.messages: dict[int, dict[str, Any]] = {}
+        self.events_by_channel: dict[int, dict[str, Any]] = {}
+        self.event_requests: list[tuple[int, int, int]] = []
         self.posts: list[tuple[str | int, dict[str, Any]]] = []
         self.reactions: list[tuple[str | int, dict[str, Any]]] = []
         self._next_post_id = 9000
+
+    async def get_direct_agent_events(self, *, channel_id: int, after_id: int = 0, limit: int = 10) -> dict[str, Any]:
+        self.event_requests.append((channel_id, after_id, limit))
+        return dict(self.events_by_channel.get(channel_id, {"items": [], "nextAfterId": after_id}))
 
     async def get_gateway_message(self, message_id: str | int) -> dict[str, Any]:
         return dict(self.messages[int(message_id)])
@@ -119,7 +125,7 @@ def _delivery(delivery_id: int, message_id: int, *, attempt_id: int, session_id:
         "project_id": "den-hermes-bridge",
         "source_kind": "channel_message",
         "source_id": str(message_id),
-        "metadata_json": json.dumps({"channel_id": 42, "channel_slug": "direct-agent-messages"}),
+        "metadata_json": json.dumps({"channel_id": 42, "channel_slug": "direct-agent-messages", "session_scope": "source_lane"}),
     }
 
 
@@ -149,6 +155,79 @@ async def test_direct_agent_delivery_body_takes_precedence_over_generated_summar
     assert event.text == "1939 finished, is it still coming through goofy?"
     assert "recorded, pending claim/completion" not in event.text
     assert event.raw_message["context_summary"] == "Direct agent request to den-mcp-planner: recorded, pending claim/completion"
+    assert event.source.chat_id == "owner:test-host:den-mcp-runner:runner:gateway"
+
+
+@pytest.mark.asyncio
+async def test_direct_agent_event_to_delivery_preserves_body_and_summary_evidence() -> None:
+    gateway = FakeGatewayClient()
+    channels = FakeChannelsClient()
+    adapter = _adapter(gateway, channels)
+
+    delivery = adapter._event_to_delivery({
+        "id": 2227,
+        "channelId": 672,
+        "sourceProjectId": "den-web",
+        "sourceKind": "wake_event",
+        "sourceId": "direct-agent-message:672:den-mcp-runner:abc",
+        "senderIdentity": "Patch",
+        "summary": "Direct agent request to den-mcp-runner: recorded, pending claim/completion",
+        "body": "actual human request body",
+        "metadataJson": json.dumps({"sender_identity": "Patch", "channel_slug": "den-system"}),
+    })
+
+    event = await adapter.delivery_to_event(delivery)
+
+    assert delivery["body"] == "actual human request body"
+    assert delivery["context_summary"] == "Direct agent request to den-mcp-runner: recorded, pending claim/completion"
+    assert event.text == "actual human request body"
+    assert event.raw_message["context_summary"] == delivery["context_summary"]
+
+
+@pytest.mark.asyncio
+async def test_direct_agent_event_poller_filters_target_and_advances_cursor() -> None:
+    channels = FakeChannelsClient()
+    channels.events_by_channel[672] = {
+        "items": [
+            {"id": 10, "channelId": 672, "memberIdentity": "someone-else", "body": "ignore"},
+            {"id": 11, "channelId": 672, "memberIdentity": "den-mcp-runner", "body": "deliver"},
+            {"id": 12, "channelId": 672, "sourceId": "direct-agent-message:672:den-mcp-runner:abc", "body": "also deliver"},
+        ],
+        "nextAfterId": 12,
+    }
+    poller = _adapter_module._DirectAgentEventPoller(channels, "den-mcp-runner")
+
+    first = await poller.poll(672, limit=10)
+    second = await poller.poll(672, limit=10)
+
+    assert [event["id"] for event in first] == [11, 12]
+    assert second == []
+    assert channels.event_requests == [(672, 0, 10), (672, 12, 10)]
+
+
+@pytest.mark.asyncio
+async def test_channels_only_connect_does_not_require_gateway_binding() -> None:
+    channels = FakeChannelsClient()
+    adapter = DenChannelsAdapter(
+        PlatformConfig(
+            enabled=True,
+            token="***",
+            extra={
+                "channels_url": "http://192.168.1.10:18081",
+                "project_id": "",
+                "agent_identity": "den-mcp-runner",
+                "role": "runner",
+                "profile": "den-mcp-runner",
+                "adapter_instance_id": "test-host:den-mcp-runner:runner:gateway",
+                "start_claim_loop": False,
+                "start_poll_loop": False,
+            },
+        ),
+        channels_client=channels,
+    )
+
+    assert await adapter.connect() is True
+    assert adapter.gateway_client is None
 
 
 @pytest.mark.asyncio
@@ -1027,11 +1106,11 @@ async def test_different_channels_produce_different_session_keys() -> None:
     # Override channel_id in delivery metadata
     event_a = await adapter.delivery_to_event({
         **_delivery(901, 300, attempt_id=1001),
-        "metadata_json": json.dumps({"channel_id": 42, "channel_slug": "team-a"}),
+        "metadata_json": json.dumps({"channel_id": 42, "channel_slug": "team-a", "session_scope": "source_lane"}),
     })
     event_b = await adapter.delivery_to_event({
         **_delivery(902, 400, attempt_id=1002),
-        "metadata_json": json.dumps({"channel_id": 99, "channel_slug": "team-b"}),
+        "metadata_json": json.dumps({"channel_id": 99, "channel_slug": "team-b", "session_scope": "source_lane"}),
     })
 
     assert event_a.source.chat_id != event_b.source.chat_id
