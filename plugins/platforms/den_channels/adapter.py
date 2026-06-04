@@ -1,9 +1,14 @@
-"""Native Hermes Gateway adapter for Den Channels durable sessions.
+"""Native Hermes adapter for Den Channels durable sessions.
 
-This adapter treats Den Channels as a first-class Hermes Gateway platform.  It
-claims delivery requests from Den Gateway, turns them into normal GatewayRunner
-``MessageEvent`` objects with stable Den Channels session lanes, and posts final
-assistant replies back to Den Channels as ``gateway_delivery`` messages.
+This adapter treats Den Channels as a first-class Hermes platform.  It
+claims delivery requests from Den Channels, turns them into normal runner
+``MessageEvent`` objects with stable Den Channels session lanes, and posts
+final assistant replies back to Den Channels as ``human_text`` or
+``gateway_delivery`` messages.
+
+Breadcrumb / tool-activity emission posts to ``POST /api/channel-activity-events``
+on the configured Channels base URL (``channels_url`` / ``channelsUrl``),
+with ``gateway_url`` / ``gatewayUrl`` as a compatibility fallback.
 """
 
 from __future__ import annotations
@@ -258,9 +263,21 @@ def _json_dict_from_payload(value: Any) -> dict[str, Any]:
 
 
 def _emit_activity_event(context: dict[str, Any], payload: dict[str, Any]) -> None:
-    gateway_url = str(context.get("gatewayUrl") or context.get("gateway_url") or "").rstrip("/")
+    """Post a tool-activity event to Den Channels.
+
+    Prefers ``channelsUrl`` / ``channels_url`` as the base URL.
+    Falls back to ``gatewayUrl`` / ``gateway_url`` for backward
+    compatibility with pre-#1944 Gateway-shaped configs.
+    The gateway fallback should be removed once deployed configs
+    have migrated to Channels-owned URLs.
+    """
+    base_url = str(
+        context.get("channelsUrl") or context.get("channels_url")
+        or context.get("gatewayUrl") or context.get("gateway_url")
+        or ""
+    ).rstrip("/")
     channel_id = context.get("channelId") or context.get("channel_id")
-    if not gateway_url or not channel_id:
+    if not base_url or not channel_id:
         return
     request_payload = {
         "channelId": str(channel_id),
@@ -296,7 +313,7 @@ def _emit_activity_event(context: dict[str, Any], payload: dict[str, Any]) -> No
         import httpx
 
         with httpx.Client(timeout=2.0) as client:
-            response = client.post(f"{gateway_url}/api/channel-activity-events", json=request_payload, headers=headers)
+            response = client.post(f"{base_url}/api/channel-activity-events", json=request_payload, headers=headers)
             response.raise_for_status()
     except Exception:
         logger.debug("[DenChannels] activity event emission failed", exc_info=True)
@@ -1160,6 +1177,7 @@ class DenChannelsAdapter(BasePlatformAdapter):
     def _set_activity_environment(self, context: _DeliveryContext) -> None:
         payload = {
             "gatewayUrl": self.gateway_url,
+            "channelsUrl": self.channels_url,
             "token": self.gateway_client.token if isinstance(self.gateway_client, DenGatewayClient) else None,
             "channelId": context.channel_id,
             "projectId": context.project_id,

@@ -579,6 +579,137 @@ def test_activity_emitter_forwards_spawned_worker_context(monkeypatch: pytest.Mo
     assert metadata["workerRole"] == "coder"
 
 
+def test_activity_emitter_accepts_channels_url_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Activity emission works with only channels_url (no gatewayUrl)."""
+    posted: list[dict[str, Any]] = []
+
+    class FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+    class FakeClient:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        def __enter__(self) -> "FakeClient":
+            return self
+
+        def __exit__(self, *args: Any) -> None:
+            return None
+
+        def post(self, url: str, *, json: dict[str, Any], headers: dict[str, str]) -> FakeResponse:
+            posted.append((url, json))
+            return FakeResponse()
+
+    class FakeHttpx:
+        Client = FakeClient
+
+    monkeypatch.setitem(sys.modules, "httpx", FakeHttpx)
+
+    _adapter_module._emit_activity_event(
+        {
+            "channels_url": "http://channels.test",
+            "channelId": 42,
+            "projectId": "den-hermes-bridge",
+            "agentIdentity": "den-mcp-runner",
+            "deliveryRequestId": 702,
+        },
+        normalize_tool_activity("terminal", {"command": "date"}),
+    )
+
+    assert len(posted) == 1
+    url, body = posted[0]
+    assert url == "http://channels.test/api/channel-activity-events"
+    assert body["channelId"] == "42"
+    assert body["agentIdentity"] == "den-mcp-runner"
+
+
+def test_activity_emitter_prefers_channels_over_gateway(monkeypatch: pytest.MonkeyPatch) -> None:
+    """When both channels_url and gatewayUrl are set, channels_url is preferred."""
+    posted: list[dict[str, Any]] = []
+
+    class FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+    class FakeClient:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        def __enter__(self) -> "FakeClient":
+            return self
+
+        def __exit__(self, *args: Any) -> None:
+            return None
+
+        def post(self, url: str, *, json: dict[str, Any], headers: dict[str, str]) -> FakeResponse:
+            posted.append((url, json))
+            return FakeResponse()
+
+    class FakeHttpx:
+        Client = FakeClient
+
+    monkeypatch.setitem(sys.modules, "httpx", FakeHttpx)
+
+    _adapter_module._emit_activity_event(
+        {
+            "channelsUrl": "http://channels.test",
+            "gatewayUrl": "http://gateway.test",
+            "channelId": 42,
+            "projectId": "den-hermes-bridge",
+            "agentIdentity": "den-mcp-runner",
+        },
+        normalize_tool_activity("terminal", {"command": "date"}),
+    )
+
+    assert len(posted) == 1
+    url, _body = posted[0]
+    assert url == "http://channels.test/api/channel-activity-events"
+    assert "gateway.test" not in url
+
+
+def test_activity_emitter_falls_back_to_gateway_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    """When only gatewayUrl is set (no channels_url), gatewayUrl is used as fallback."""
+    posted: list[dict[str, Any]] = []
+
+    class FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+    class FakeClient:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        def __enter__(self) -> "FakeClient":
+            return self
+
+        def __exit__(self, *args: Any) -> None:
+            return None
+
+        def post(self, url: str, *, json: dict[str, Any], headers: dict[str, str]) -> FakeResponse:
+            posted.append((url, json))
+            return FakeResponse()
+
+    class FakeHttpx:
+        Client = FakeClient
+
+    monkeypatch.setitem(sys.modules, "httpx", FakeHttpx)
+
+    _adapter_module._emit_activity_event(
+        {
+            "gatewayUrl": "http://gateway.test",
+            "channelId": 42,
+            "projectId": "den-hermes-bridge",
+            "agentIdentity": "den-mcp-runner",
+        },
+        normalize_tool_activity("terminal", {"command": "date"}),
+    )
+
+    assert len(posted) == 1
+    url, _body = posted[0]
+    assert url == "http://gateway.test/api/channel-activity-events"
+
+
 def test_canonical_spawned_worker_activity_payload_shape_1567(monkeypatch: pytest.MonkeyPatch) -> None:
     """Cross-repo invariant for spawned-worker activity grouping payloads.
 
