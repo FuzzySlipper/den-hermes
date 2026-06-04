@@ -101,6 +101,29 @@ def _coerce_int(value: Any) -> Optional[int]:
         return None
 
 
+def _coerce_int_list(value: Any) -> list[int]:
+    """Parse a config value into a de-duplicated list of positive integers."""
+    if value is None or value == "":
+        return []
+    raw_items: list[Any]
+    if isinstance(value, (list, tuple, set)):
+        raw_items = list(value)
+    elif isinstance(value, str):
+        raw_items = [part.strip() for part in value.replace(";", ",").split(",")]
+    else:
+        raw_items = [value]
+
+    seen: set[int] = set()
+    result: list[int] = []
+    for item in raw_items:
+        parsed = _coerce_int(item)
+        if parsed is None or parsed <= 0 or parsed in seen:
+            continue
+        seen.add(parsed)
+        result.append(parsed)
+    return result
+
+
 def _redact(value: Any) -> Any:
     """Recursively redact secret-looking keys and placeholder secret values."""
     if isinstance(value, dict):
@@ -753,6 +776,14 @@ class DenChannelsAdapter(BasePlatformAdapter):
         self.poll_interval_seconds = float(extra.get("poll_interval_seconds") or 2.0)
         self.poll_limit = max(1, _coerce_int(extra.get("poll_limit")) or 10)
         self.start_poll_loop = _coerce_bool(extra.get("start_poll_loop"), True)
+        self.poll_channel_ids = _coerce_int_list(
+            extra.get("poll_channel_ids")
+            or extra.get("channel_ids")
+            or extra.get("channel_id")
+            or os.getenv("DEN_CHANNELS_POLL_CHANNEL_IDS")
+            or os.getenv("DEN_CHANNELS_CHANNEL_IDS")
+            or os.getenv("DEN_CHANNELS_CHANNEL_ID")
+        )
         self._sleep = sleep or asyncio.sleep
         token = str(extra.get("token") or os.getenv("DEN_GATEWAY_TOKEN") or "").strip() or None
         channels_token = str(extra.get("channels_token") or os.getenv("DEN_CHANNELS_TOKEN") or token or "").strip() or None
@@ -1306,6 +1337,10 @@ class DenChannelsAdapter(BasePlatformAdapter):
 
         if not self.channels_url or not self.agent_identity:
             return []
+        if self.poll_channel_ids:
+            for channel_id in self.poll_channel_ids:
+                self._polled_channels.add(channel_id)
+            return list(self.poll_channel_ids)
         if self._polled_channels:
             return list(self._polled_channels)
         now = _time.time()
@@ -1334,8 +1369,10 @@ class DenChannelsAdapter(BasePlatformAdapter):
                             self._polled_channels.add(cid)
                         return
 
-        # Den system channel is the common direct-agent channel; project_id can
-        # discover a project default channel when configured.
+        # Den system/direct-agent channels are common control channels; project_id can
+        # discover a project default channel when configured. Worker profiles should
+        # prefer explicit poll_channel_ids/channel_ids so #worker-pool (or another
+        # neutral control channel) is not confused with a project waystation.
         for cid in (672,):
             try:
                 await _check_memberships(f"{self.channels_url}/api/gateway/memberships?channelId={cid}")

@@ -206,6 +206,37 @@ async def test_direct_agent_event_poller_filters_target_and_advances_cursor() ->
 
 
 @pytest.mark.asyncio
+async def test_configured_poll_channel_ids_are_used_for_worker_pool_control() -> None:
+    gateway = FakeGatewayClient()
+    channels = FakeChannelsClient()
+    adapter = DenChannelsAdapter(
+        PlatformConfig(
+            enabled=True,
+            token="***",
+            extra={
+                "channels_url": "http://192.168.1.10:18081",
+                "project_id": "",
+                "agent_identity": "spawned-coder",
+                "role": "coder",
+                "profile": "spawned-coder",
+                "adapter_instance_id": "test-host:spawned-coder:coder:worker",
+                "poll_channel_ids": "604, 604, 672, not-an-int, -2",
+                "start_claim_loop": False,
+                "start_poll_loop": False,
+            },
+        ),
+        gateway_client=gateway,
+        channels_client=channels,
+    )
+
+    first = await adapter._resolve_poll_channels()
+    second = await adapter._resolve_poll_channels()
+
+    assert first == [604, 672]
+    assert second == [604, 672]
+
+
+@pytest.mark.asyncio
 async def test_channels_only_connect_does_not_require_gateway_binding() -> None:
     channels = FakeChannelsClient()
     adapter = DenChannelsAdapter(
