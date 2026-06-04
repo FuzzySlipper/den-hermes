@@ -1387,6 +1387,38 @@ class DenChannelsAdapter(BasePlatformAdapter):
                             self._polled_channels.add(cid)
                         return
 
+        async def _discover_member_channels() -> None:
+            response_body: dict[str, Any] = {}
+            getter = getattr(self.channels_client, "get_channel_memberships", None)
+            if callable(getter):
+                result = getter(member_identity=self.agent_identity, include_left=False, limit=200)
+                maybe_body = await result if inspect.isawaitable(result) else result
+                response_body = maybe_body if isinstance(maybe_body, dict) else {}
+            else:
+                from urllib.parse import urlencode
+
+                query = urlencode({"memberIdentity": self.agent_identity, "includeLeft": "false", "limit": "200"})
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    response = await client.get(f"{self.channels_url}/api/channel-memberships?{query}", headers=headers)
+                    if response.status_code != 200:
+                        return
+                    response_body = response.json() if response.content else {}
+
+            memberships = response_body.get("memberships") or response_body.get("items") or []
+            for item in memberships:
+                cid = _coerce_int(item.get("channelId") or item.get("channel_id"))
+                status = str(item.get("membershipStatus") or item.get("membership_status") or "active").lower()
+                if cid is not None and status != "left":
+                    self._polled_channels.add(cid)
+
+        try:
+            await _discover_member_channels()
+        except Exception:
+            logger.debug("[DenChannels] member channel discovery failed", exc_info=True)
+        if self._polled_channels:
+            logger.info("[DenChannels] poll channels discovered from member memberships: %s", sorted(self._polled_channels))
+            return sorted(self._polled_channels)
+
         # Den system/direct-agent channels are common control channels; project_id can
         # discover a project default channel when configured. Worker profiles should
         # prefer explicit poll_channel_ids/channel_ids so #worker-pool (or another
