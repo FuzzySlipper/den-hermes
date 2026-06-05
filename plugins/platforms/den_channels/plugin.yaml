@@ -3,26 +3,26 @@ label: Den Channels
 kind: platform
 version: 0.1.0
 description: >
-  Native Den Channels Gateway adapter for durable Hermes sessions. Claims Den
-  Gateway deliveries, routes them through GatewayRunner/SessionStore, and posts
-  visible replies back to Den Channels with sourceKind=gateway_delivery.
+  Native Den Channels adapter for durable Hermes sessions. Polls canonical
+  Channels direct-agent events, routes them through GatewayRunner/SessionStore,
+  and posts visible replies back to Den Channels with sourceKind=gateway_delivery.
 author: Hermes Agent contributors
 requires_env:
-  - name: DEN_GATEWAY_URL
-    description: "Den Gateway base URL used for delivery claims and completion audit"
-    prompt: "Den Gateway URL"
-    password: false
   - name: DEN_CHANNELS_URL
-    description: "Den Channels service base URL used for visible channel messages"
+    description: "Den Channels service base URL used for direct-agent events and visible channel messages"
     prompt: "Den Channels URL"
     password: false
 optional_env:
+  - name: DEN_GATEWAY_URL
+    description: "Legacy Gateway compatibility base URL used only for old delivery-claim fallback"
+    prompt: "Legacy Den Gateway URL"
+    password: false
   - name: DEN_GATEWAY_TOKEN
-    description: "Bearer token for Den Gateway APIs, if required"
-    prompt: "Den Gateway token"
+    description: "Legacy Gateway bearer token, if the fallback path is intentionally enabled"
+    prompt: "Legacy Den Gateway token"
     password: true
   - name: DEN_CHANNELS_TOKEN
-    description: "Bearer token for Den Channels APIs, if different from Den Gateway"
+    description: "Bearer token for Den Channels APIs, if required"
     prompt: "Den Channels token"
     password: true
   - name: DEN_CHANNELS_PROJECT_ID

@@ -1294,7 +1294,7 @@ def test_direct_agent_message_handler_uses_adapter_config_and_defaults_sender(mo
     parsed = json.loads(result)
 
     assert parsed["status"] == "ok"
-    assert captured["url"] == "http://channels.test/api/gateway/direct-agent-messages"
+    assert captured["url"] == "http://channels.test/api/direct-agent-events"
     assert captured["json"] == {
         "channelId": 569,
         "memberIdentity": "reviewer",
@@ -1355,7 +1355,7 @@ def test_direct_agent_message_handler_accepts_registry_args_dict(monkeypatch: py
     parsed = json.loads(result)
 
     assert parsed["status"] == "ok"
-    assert captured["url"] == "http://channels.test/api/gateway/direct-agent-messages"
+    assert captured["url"] == "http://channels.test/api/direct-agent-events"
     assert captured["json"] == {
         "channelId": 569,
         "memberIdentity": "reviewer",

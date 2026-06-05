@@ -1379,21 +1379,25 @@ class DenChannelsAdapter(BasePlatformAdapter):
 
         discovered_channels: set[int] = set()
 
-        async def _check_memberships(url: str) -> None:
+        async def _check_memberships(query: dict[str, Any]) -> None:
+            from urllib.parse import urlencode
+
+            scoped = {"memberIdentity": self.agent_identity, "includeLeft": "false", "limit": "200"}
+            scoped.update(query)
             async with httpx.AsyncClient(timeout=10.0) as client:
-                response = await client.get(url, headers=headers)
+                response = await client.get(
+                    f"{self.channels_url}/api/channel-memberships?{urlencode(scoped)}",
+                    headers=headers,
+                )
                 if response.status_code != 200:
                     return
                 body = response.json() if response.content else {}
-                cid = _coerce_int(body.get("channelId") or body.get("channel_id"))
-                members = body.get("members") or body.get("memberships") or []
-                for member in members:
-                    mid = str(member.get("memberIdentity") or member.get("member_identity") or "").strip()
-                    status = str(member.get("membershipStatus") or member.get("membership_status") or "active").lower()
-                    if mid == self.agent_identity and status != "left":
-                        if cid is not None:
-                            discovered_channels.add(cid)
-                        return
+                memberships = body.get("memberships") or body.get("items") or []
+                for item in memberships:
+                    cid = _coerce_int(item.get("channelId") or item.get("channel_id"))
+                    status = str(item.get("membershipStatus") or item.get("membership_status") or "active").lower()
+                    if cid is not None and status != "left":
+                        discovered_channels.add(cid)
 
         async def _discover_member_channels() -> None:
             response_body: dict[str, Any] = {}
@@ -1434,12 +1438,12 @@ class DenChannelsAdapter(BasePlatformAdapter):
         # neutral control channel) is not confused with a project waystation.
         for cid in (672,):
             try:
-                await _check_memberships(f"{self.channels_url}/api/gateway/memberships?channelId={cid}")
+                await _check_memberships({"channelId": cid})
             except Exception:
                 logger.debug("[DenChannels] channel discovery failed for %s", cid, exc_info=True)
         if not discovered_channels and self.project_id:
             try:
-                await _check_memberships(f"{self.channels_url}/api/gateway/memberships?projectId={self.project_id}")
+                await _check_memberships({"projectId": self.project_id})
             except Exception:
                 logger.debug("[DenChannels] project channel discovery failed", exc_info=True)
         if discovered_channels:
@@ -1718,34 +1722,34 @@ def _classify_direct_agent_failure(exc: Exception) -> str:
     if isinstance(exc, httpx.HTTPStatusError):
         status = exc.response.status_code
         if status == 404:
-            return "worker_wake_bridge_route_404"
+            return "worker_wake_channels_route_404"
         if status in (401, 403):
-            return "worker_wake_bridge_auth_error"
-        return f"worker_wake_bridge_http_{status}"
+            return "worker_wake_channels_auth_error"
+        return f"worker_wake_channels_http_{status}"
     if isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout)):
         if "name or service not known" in msg or "nodename nor servname" in msg:
-            return "worker_wake_bridge_dns_error"
-        return "worker_wake_bridge_connection_error"
+            return "worker_wake_channels_dns_error"
+        return "worker_wake_channels_connection_error"
     if "timeout" in msg:
-        return "worker_wake_bridge_timeout"
+        return "worker_wake_channels_timeout"
     if "name or service not known" in msg or "nodename nor servname" in msg or "dns" in msg or "resolve" in msg:
-        return "worker_wake_bridge_dns_error"
+        return "worker_wake_channels_dns_error"
     if "connection refused" in msg:
-        return "worker_wake_bridge_connection_error"
-    return "worker_wake_bridge_client_error"
+        return "worker_wake_channels_connection_error"
+    return "worker_wake_channels_client_error"
 
 
 
 async def _handle_direct_agent_message(args: dict[str, Any] | None = None, **kwargs: Any) -> str:
     """Handler for the den_channels_send_direct_agent_message tool.
 
-    Posts a direct-agent message to the Den Gateway
-    ``/api/gateway/direct-agent-messages`` endpoint.
+    Posts a direct-agent event to canonical Den Channels
+    ``/api/direct-agent-events`` endpoint.
 
     Forwards target-work metadata (assignmentId, workerRunId, workerRole,
     poolMemberId, profileIdentity, targetTaskId, sourceProjectId) when
-    available so the Gateway can route the wake to the correct concrete
-    pool member.
+    available so Channels/current-work projections can correlate the wake to the
+    correct concrete pool member.
     """
     if isinstance(args, dict):
         merged_args = dict(args)
@@ -1812,8 +1816,8 @@ async def _handle_direct_agent_message(args: dict[str, Any] | None = None, **kwa
     if assignment_id is not None:
         payload["assignmentId"] = str(assignment_id).strip()
 
-    # Include pool-member metadata from activity context so the Gateway
-    # can route the wake to the correct concrete worker.
+    # Include pool-member metadata from activity context so Channels
+    # can correlate the wake to the correct concrete worker.
     worker_run_id = activity_context.get("workerRunId") or activity_context.get("worker_run_id")
     worker_role = activity_context.get("workerRole") or activity_context.get("worker_role")
     pool_member_id = activity_context.get("poolMemberId") or activity_context.get("pool_member_id")
@@ -1827,7 +1831,7 @@ async def _handle_direct_agent_message(args: dict[str, Any] | None = None, **kwa
     if profile_identity:
         payload["profileIdentity"] = str(profile_identity)
 
-    endpoint_path = "/api/gateway/direct-agent-messages"
+    endpoint_path = "/api/direct-agent-events"
     endpoint = join_api_url(base_url, endpoint_path)
     headers = {"Content-Type": "application/json"}
     token = str(

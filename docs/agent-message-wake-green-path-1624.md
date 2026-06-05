@@ -57,7 +57,7 @@ Expected shape:
   "memberIdentity": "den-mcp-runner",
   "membershipStatus": "active",
   "wakePolicy": "mentions_only",
-  "gatewayEventsUrl": "http://192.168.1.10:18080/api/gateway/events?channelId=3&afterId=0"
+  "directAgentEventsUrl": "http://192.168.1.10:18080/api/direct-agent-events?channelId=3&afterId=0"
 }
 ```
 

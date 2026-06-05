@@ -1431,7 +1431,7 @@ Pool workers are reachable via a shared control channel (channel 5, `den-hermes-
 | Target assignment | `AssignmentId` / `target_assignment_id` | 63 |
 
 **Gateway message behavior (den-channels):**
-- `POST /api/gateway/direct-agent-messages` accepts optional `sourceProjectId`, `targetTaskId`, and `assignmentId` fields.
+- `POST /api/direct-agent-events` accepts optional `sourceProjectId`, `targetTaskId`, and `assignmentId` fields.
 - When provided, the channel message records `SourceProjectId: <caller's value>` instead of the channel's project.
 - The response DTO echoes all three attribution fields.
 

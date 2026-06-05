@@ -6,7 +6,7 @@ from urllib.parse import urlencode
 
 AGENT_COMMONS_CHANNEL_ID = 21
 AGENT_COMMONS_SLUG = "agent-commons"
-DEFAULT_CHANNELS_BASE_URL = "http://192.168.1.10:18080"
+DEFAULT_CHANNELS_BASE_URL = "http://192.168.1.10:18081"
 
 
 @dataclass(frozen=True)
@@ -24,8 +24,8 @@ class AgentMessageResult:
     target_assignment_id: int | None = None
     message_id: int | str | None = None
     delivery_request_id: int | str | None = None
-    gateway_message_url: str | None = None
-    gateway_events_url: str | None = None
+    direct_agent_event_url: str | None = None
+    direct_agent_events_url: str | None = None
     delivery_status: str | None = None
     diagnostic: str | None = None
 
@@ -124,8 +124,8 @@ class DenChannelsAgentMessenger:
             target_assignment_id=target_assignment_id,
             message_id=message_id,
             delivery_request_id=delivery_request_id,
-            gateway_message_url=self._message_url(message_id) if message_id is not None else None,
-            gateway_events_url=self._events_url(resolved_channel_id),
+            direct_agent_event_url=self._direct_agent_event_url(message_id) if message_id is not None else None,
+            direct_agent_events_url=self._direct_agent_events_url(resolved_channel_id),
             delivery_status=delivery_status,
         )
 
@@ -154,11 +154,11 @@ class DenChannelsAgentMessenger:
         except Exception:  # noqa: BLE001 - evidence enrichment is best-effort after send.
             return None
 
-    def _message_url(self, message_id: int | str) -> str:
-        return f"{self.base_url}/api/gateway/messages/{message_id}"
+    def _direct_agent_event_url(self, event_id: int | str) -> str:
+        return f"{self.base_url}/api/direct-agent-events/{event_id}"
 
-    def _events_url(self, channel_id: int) -> str:
-        return f"{self.base_url}/api/gateway/events?{urlencode({'channelId': channel_id, 'afterId': 0})}"
+    def _direct_agent_events_url(self, channel_id: int) -> str:
+        return f"{self.base_url}/api/direct-agent-events?{urlencode({'channelId': channel_id, 'afterId': 0})}"
 
 
 def _extract_memberships(response: Any) -> Mapping[str, Any]:

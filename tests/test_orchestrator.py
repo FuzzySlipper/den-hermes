@@ -2903,7 +2903,7 @@ class TestDirectAgentWakeBridge:
 
         assert result["ok"] is True
         assert captured["method"] == "POST"
-        assert captured["path"] == "/api/gateway/direct-agent-messages"
+        assert captured["path"] == "/api/direct-agent-events"
         payload = captured["json_payload"]
         assert payload["channelId"] == 42
         assert payload["memberIdentity"] == "pool-coder-01"
@@ -2929,7 +2929,7 @@ class TestDirectAgentWakeBridge:
                 "ok": False,
                 "error": "HTTP Error 404: Not Found",
                 "method": method,
-                "url": "http://channels.test/api/gateway/direct-agent-messages",
+                "url": "http://channels.test/api/direct-agent-events",
                 "base_url": "http://channels.test",
                 "endpoint": path,
             }
@@ -2942,8 +2942,8 @@ class TestDirectAgentWakeBridge:
         )
 
         assert result["ok"] is False
-        assert result["failure_category"] == "worker_wake_bridge_route_error"
-        assert "direct-agent-messages" in result["diagnostic"]
+        assert result["failure_category"] == "worker_wake_channels_route_error"
+        assert "direct-agent-events" in result["diagnostic"]
         assert "channels.test" in result["diagnostic"]
 
     def test_send_direct_agent_diagnostic_uses_normalized_url(self):
@@ -2962,8 +2962,8 @@ class TestDirectAgentWakeBridge:
         )
 
         assert result["ok"] is False
-        assert result["url"] == "http://channels.test/api/gateway/direct-agent-messages"
-        assert "http://channels.test/api/gateway/direct-agent-messages" in result["diagnostic"]
+        assert result["url"] == "http://channels.test/api/direct-agent-events"
+        assert "http://channels.test/api/direct-agent-events" in result["diagnostic"]
         assert "/api/gateway/api/gateway/" not in result["diagnostic"]
 
     def test_channels_request_error_includes_url_and_method(self):
@@ -2982,15 +2982,15 @@ class TestDirectAgentWakeBridge:
         original_urlopen = urllib.request.urlopen
         try:
             urllib.request.urlopen = failing_urlopen
-            result = adapter._channels_request("POST", "/api/gateway/direct-agent-messages", json_payload={"test": True})
+            result = adapter._channels_request("POST", "/api/direct-agent-events", json_payload={"test": True})
         finally:
             urllib.request.urlopen = original_urlopen
 
         assert result["ok"] is False
         assert result["method"] == "POST"
-        assert result["url"] == "http://channels.test/api/gateway/direct-agent-messages"
+        assert result["url"] == "http://channels.test/api/direct-agent-events"
         assert result["base_url"] == "http://channels.test"
-        assert result["endpoint"] == "/api/gateway/direct-agent-messages"
+        assert result["endpoint"] == "/api/direct-agent-events"
         assert "Connection refused" in result["error"]
 
     def test_send_direct_agent_error_diagnostic_structure(self):
@@ -3007,7 +3007,7 @@ class TestDirectAgentWakeBridge:
                 "ok": False,
                 "error": "Unauthorized",
                 "method": method,
-                "url": "http://channels.test/api/gateway/direct-agent-messages",
+                "url": "http://channels.test/api/direct-agent-events",
                 "base_url": "http://channels.test",
                 "endpoint": path,
             }
@@ -3020,36 +3020,36 @@ class TestDirectAgentWakeBridge:
         )
 
         assert result["ok"] is False
-        assert result["failure_category"] == "worker_wake_bridge_auth_error"
+        assert result["failure_category"] == "worker_wake_channels_auth_error"
         assert "error" in result
         assert "diagnostic" in result
         assert "channels.test" in result["diagnostic"]
     def test_direct_agent_url_normalization_uses_shared_helper(self):
         assert join_api_url(
             "http://channels.test/api/gateway",
-            "/api/gateway/direct-agent-messages",
-        ) == "http://channels.test/api/gateway/direct-agent-messages"
+            "/api/direct-agent-events",
+        ) == "http://channels.test/api/direct-agent-events"
         assert join_api_url(
             "http://channels.test/api",
-            "/api/gateway/direct-agent-messages",
-        ) == "http://channels.test/api/gateway/direct-agent-messages"
+            "/api/direct-agent-events",
+        ) == "http://channels.test/api/direct-agent-events"
 
     def test_direct_agent_failure_category_classifies_common_urllib_errors(self):
         from email.message import Message
         from urllib.error import HTTPError, URLError
 
-        assert _classify_channels_error_text("Unauthorized") == "worker_wake_bridge_auth_error"
-        assert _classify_channels_error_text("Connection refused") == "worker_wake_bridge_connection_error"
-        assert _classify_channels_error_text("Name or service not known") == "worker_wake_bridge_dns_error"
-        assert _classify_channels_error_text("timed out") == "worker_wake_bridge_timeout"
+        assert _classify_channels_error_text("Unauthorized") == "worker_wake_channels_auth_error"
+        assert _classify_channels_error_text("Connection refused") == "worker_wake_channels_connection_error"
+        assert _classify_channels_error_text("Name or service not known") == "worker_wake_channels_dns_error"
+        assert _classify_channels_error_text("timed out") == "worker_wake_channels_timeout"
         assert _classify_url_request_failure(HTTPError(
-            "http://channels.test/api/gateway/direct-agent-messages",
+            "http://channels.test/api/direct-agent-events",
             404,
             "Not Found",
             hdrs=Message(),
             fp=None,
-        )) == "worker_wake_bridge_route_error"
-        assert _classify_url_request_failure(URLError(TimeoutError("timed out"))) == "worker_wake_bridge_timeout"
+        )) == "worker_wake_channels_route_error"
+        assert _classify_url_request_failure(URLError(TimeoutError("timed out"))) == "worker_wake_channels_timeout"
 
 
 

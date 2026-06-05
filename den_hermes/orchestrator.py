@@ -144,23 +144,23 @@ def _classify_url_request_failure(exc: BaseException) -> str:
     if isinstance(exc, HTTPError):
         return _classify_channels_http_status(getattr(exc, "code", None))
     if isinstance(exc, TimeoutError):
-        return "worker_wake_bridge_timeout"
+        return "worker_wake_channels_timeout"
     if isinstance(exc, URLError):
         reason = getattr(exc, "reason", exc)
         if isinstance(reason, TimeoutError):
-            return "worker_wake_bridge_timeout"
+            return "worker_wake_channels_timeout"
         return _classify_channels_error_text(str(reason or exc))
     return _classify_channels_error_text(str(exc))
 
 
 def _classify_channels_http_status(status: int | None) -> str:
     if status in {401, 403}:
-        return "worker_wake_bridge_auth_error"
+        return "worker_wake_channels_auth_error"
     if status == 404:
-        return "worker_wake_bridge_route_error"
+        return "worker_wake_channels_route_error"
     if status is not None:
-        return f"worker_wake_bridge_http_{status}"
-    return "worker_wake_bridge_client_error"
+        return f"worker_wake_channels_http_{status}"
+    return "worker_wake_channels_client_error"
 
 
 def _classify_channels_error_text(error_text: str) -> str:
@@ -170,16 +170,16 @@ def _classify_channels_error_text(error_text: str) -> str:
             if str(status) in msg:
                 return _classify_channels_http_status(status)
     if "unauthorized" in msg or "forbidden" in msg:
-        return "worker_wake_bridge_auth_error"
+        return "worker_wake_channels_auth_error"
     if "not found" in msg or "404" in msg:
-        return "worker_wake_bridge_route_error"
+        return "worker_wake_channels_route_error"
     if "timed out" in msg or "timeout" in msg:
-        return "worker_wake_bridge_timeout"
+        return "worker_wake_channels_timeout"
     if "name or service not known" in msg or "nodename nor servname" in msg or "dns" in msg or "resolve" in msg:
-        return "worker_wake_bridge_dns_error"
+        return "worker_wake_channels_dns_error"
     if "connection refused" in msg or "connection reset" in msg or "network is unreachable" in msg:
-        return "worker_wake_bridge_connection_error"
-    return "worker_wake_bridge_client_error"
+        return "worker_wake_channels_connection_error"
+    return "worker_wake_channels_client_error"
 
 
 @dataclass(frozen=True)
@@ -827,11 +827,11 @@ class DenWorkflowAdapter:
     ) -> Mapping[str, Any]:
         """Send a direct-agent message to wake a pool worker through Den Channels.
 
-        Posts to ``POST /api/gateway/direct-agent-messages``.
+        Posts to canonical Channels ``POST /api/direct-agent-events``.
 
         Includes concrete target metadata (assignmentId, workerRunId,
         workerRole, poolMemberId, profileIdentity) when available so the
-        Gateway can route the wake to the correct pool member.
+        Channels can correlate the wake with the correct pool member.
         Task #1911.
         """
         payload: dict[str, Any] = {
@@ -858,14 +858,14 @@ class DenWorkflowAdapter:
         if profile_identity:
             payload["profileIdentity"] = str(profile_identity)
 
-        result = dict(self._channels_request("POST", "/api/gateway/direct-agent-messages", json_payload=payload))
+        result = dict(self._channels_request("POST", "/api/direct-agent-events", json_payload=payload))
         if not result.get("ok") and result.get("error"):
             result["failure_category"] = result.get("failure_category") or _classify_channels_error_text(
                 str(result.get("error") or ""),
             )
             actual_url = result.get("url") or join_api_url(
                 self.channels_url or "",
-                "/api/gateway/direct-agent-messages",
+                "/api/direct-agent-events",
             )
             result["diagnostic"] = f"POST {actual_url} failed: {result.get('error')}"
         return result

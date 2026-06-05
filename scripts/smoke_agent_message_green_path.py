@@ -3,7 +3,7 @@
 
 Default mode is non-mutating: resolve channel, preflight active agent membership,
 and print the evidence that would be used for a direct-agent wake. Pass --send to
-actually POST /api/gateway/direct-agent-messages.
+actually POST /api/direct-agent-events.
 """
 
 from __future__ import annotations
@@ -35,7 +35,7 @@ def get_memberships(base_url: str, *, project_id: str | None, channel_id: int | 
         query = urllib.parse.urlencode({"projectId": project_id})
     else:
         query = urllib.parse.urlencode({"channelId": AGENT_COMMONS_CHANNEL_ID})
-    return request_json("GET", f"{base_url}/api/gateway/memberships?{query}")
+    return request_json("GET", f"{base_url}/api/channel-memberships?{query}")
 
 
 def active_member(memberships: dict[str, Any], member_identity: str) -> dict[str, Any] | None:
@@ -74,7 +74,7 @@ def main(argv: list[str] | None = None) -> int:
         "projectId": memberships.get("projectId"),
         "membershipStatus": member.get("membershipStatus") if member else None,
         "wakePolicy": member.get("wakePolicy") if member else None,
-        "gatewayEventsUrl": f"{base_url}/api/gateway/events?{urllib.parse.urlencode({'channelId': channel_id, 'afterId': 0})}",
+        "directAgentEventsUrl": f"{base_url}/api/direct-agent-events?{urllib.parse.urlencode({'channelId': channel_id, 'afterId': 0})}",
     }
     if not member:
         result["diagnostic"] = f"{args.member_identity} is not an active agent member of channel {channel_id} ({channel_slug})"
@@ -87,14 +87,14 @@ def main(argv: list[str] | None = None) -> int:
             "body": args.body,
             "senderIdentity": args.sender_identity,
         }
-        response = request_json("POST", f"{base_url}/api/gateway/direct-agent-messages", payload)
+        response = request_json("POST", f"{base_url}/api/direct-agent-events", payload)
         message_id = response.get("messageId") or (response.get("message") or {}).get("id") or response.get("id")
         result.update(
             {
                 "status": "sent",
                 "messageId": message_id,
                 "sendResponse": response,
-                "gatewayMessageUrl": f"{base_url}/api/gateway/messages/{message_id}" if message_id else None,
+                "directAgentEventUrl": f"{base_url}/api/direct-agent-events/{message_id}" if message_id else None,
             }
         )
     print(json.dumps(result, indent=2, sort_keys=True))

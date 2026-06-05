@@ -11,11 +11,11 @@ from __future__ import annotations
 def join_api_url(base_url: str, path: str) -> str:
     """Join an operator-configured Den API base URL to an absolute API path.
 
-    Older profile configs have used bare origins (``http://host:18080``) and
-    API-prefixed values (``http://host:18080/api`` or ``.../api/gateway``).
+    Older profile configs have used bare origins (``http://host:18081``) and
+    API-prefixed values (``http://host:18081/api`` or legacy ``.../api/gateway``).
     Callers pass absolute API paths, so strip common API suffixes before joining
     to avoid double-path 404s such as
-    ``/api/gateway/api/gateway/direct-agent-messages``.
+    ``/api/api/direct-agent-events``.
     """
     normalized = base_url.rstrip("/")
     for suffix in ("/api/gateway", "/api"):

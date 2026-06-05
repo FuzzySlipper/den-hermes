@@ -67,8 +67,8 @@ def test_send_agent_message_resolves_explicit_channel_and_returns_evidence():
     assert result.channel_slug == "project-den-hermes-bridge"
     assert result.message_id == 321
     assert result.delivery_request_id == 654
-    assert result.gateway_message_url == "http://den.test/api/gateway/messages/321"
-    assert result.gateway_events_url == "http://den.test/api/gateway/events?channelId=5&afterId=0"
+    assert result.direct_agent_event_url == "http://den.test/api/direct-agent-events/321"
+    assert result.direct_agent_events_url == "http://den.test/api/direct-agent-events?channelId=5&afterId=0"
     assert result.delivery_status == "recorded_pending_claim"
     assert tools.last_events_query == {"channel_id": 5, "after_id": 320, "limit": 50}
     assert tools.sent == [

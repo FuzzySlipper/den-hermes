@@ -5,11 +5,11 @@ This script simulates the full wake-bridge path the Runner uses to wake a
 pool worker via Den Channels direct-agent messages.
 
 It does NOT require a live Den service. All network calls are faked or
-validated locally.  Pass ``--live`` to smoke against a real Gateway URL.
+validated locally.  Pass ``--live`` to smoke against a real Channels URL.
 
 The smoke verifies:
 
-  1. URL construction matches the expected Gateway endpoint.
+  1. URL construction matches the expected Channels endpoint.
   2. Payload shape includes concrete target metadata (assignmentId,
      workerRunId, workerRole, poolMemberId, profileIdentity).
   3. _channels_request error diagnostics include method, url, base_url,
@@ -40,7 +40,7 @@ from den_hermes.api_urls import join_api_url
 from den_hermes.orchestrator import DenWorkflowAdapter
 
 
-EXPECTED_GATEWAY_PATH = "/api/gateway/direct-agent-messages"
+EXPECTED_DIRECT_AGENT_PATH = "/api/direct-agent-events"
 DEFAULT_CHANNELS_URL = "http://channels.test"
 TEST_MEMBER = "pool-coder-01"
 TEST_CHANNEL_ID = 42
@@ -75,16 +75,16 @@ def smoke_url_construction() -> list[str]:
     """Verify _channels_request constructs the correct URL from different base URLs."""
     errors: list[str] = []
     cases = [
-        ("http://host.test", f"http://host.test{EXPECTED_GATEWAY_PATH}"),
-        ("http://host.test/", f"http://host.test{EXPECTED_GATEWAY_PATH}"),
-        ("http://192.168.1.10:18080", f"http://192.168.1.10:18080{EXPECTED_GATEWAY_PATH}"),
+        ("http://host.test", f"http://host.test{EXPECTED_DIRECT_AGENT_PATH}"),
+        ("http://host.test/", f"http://host.test{EXPECTED_DIRECT_AGENT_PATH}"),
+        ("http://192.168.1.10:18080", f"http://192.168.1.10:18080{EXPECTED_DIRECT_AGENT_PATH}"),
         # Historical profile configs may include API suffixes. The bridge must
         # normalize these before appending an absolute API endpoint.
-        ("http://host.test/api", f"http://host.test{EXPECTED_GATEWAY_PATH}"),
-        ("http://host.test/api/gateway", f"http://host.test{EXPECTED_GATEWAY_PATH}"),
+        ("http://host.test/api", f"http://host.test{EXPECTED_DIRECT_AGENT_PATH}"),
+        ("http://host.test/api", f"http://host.test{EXPECTED_DIRECT_AGENT_PATH}"),
     ]
     for base, expected in cases:
-        actual = join_api_url(base, EXPECTED_GATEWAY_PATH)
+        actual = join_api_url(base, EXPECTED_DIRECT_AGENT_PATH)
         if actual != expected:
             errors.append(
                 f"shared URL mismatch: base={base!r}\n"
@@ -159,7 +159,7 @@ def smoke_error_diagnostics() -> list[str]:
             "ok": False,
             "error": "HTTP Error 404: Not Found",
             "method": method,
-            "url": f"{DEFAULT_CHANNELS_URL}{EXPECTED_GATEWAY_PATH}",
+            "url": f"{DEFAULT_CHANNELS_URL}{EXPECTED_DIRECT_AGENT_PATH}",
             "base_url": DEFAULT_CHANNELS_URL,
             "endpoint": path,
         }
@@ -174,9 +174,9 @@ def smoke_error_diagnostics() -> list[str]:
 
     if result.get("ok") is not False:
         errors.append("Expected ok=False on error response")
-    if result.get("failure_category") != "worker_wake_bridge_route_error":
+    if result.get("failure_category") != "worker_wake_channels_route_error":
         errors.append(
-            f"Expected failure_category='worker_wake_bridge_route_error', "
+            f"Expected failure_category='worker_wake_channels_route_error', "
             f"got {result.get('failure_category')!r}"
         )
     if "direct-agent-messages" not in str(result.get("diagnostic", "")):
@@ -207,15 +207,15 @@ def smoke_plugin_handler_error_diagnostics() -> list[str]:
     # Test failure classification against different exception types
     test_cases = [
         # Simulated 404
-        ("httpx.HTTPStatusError", 404, "worker_wake_bridge_route_404"),
+        ("httpx.HTTPStatusError", 404, "worker_wake_channels_route_404"),
         # Simulated 401
-        ("httpx.HTTPStatusError", 401, "worker_wake_bridge_auth_error"),
+        ("httpx.HTTPStatusError", 401, "worker_wake_channels_auth_error"),
         # Simulated 403
-        ("httpx.HTTPStatusError", 403, "worker_wake_bridge_auth_error"),
+        ("httpx.HTTPStatusError", 403, "worker_wake_channels_auth_error"),
         # Simulated 500
-        ("httpx.HTTPStatusError", 500, "worker_wake_bridge_http_500"),
+        ("httpx.HTTPStatusError", 500, "worker_wake_channels_http_500"),
         # Connection refused text
-        ("ConnectionError", 0, "worker_wake_bridge_connection_error"),
+        ("ConnectionError", 0, "worker_wake_channels_connection_error"),
     ]
 
     for exc_type_str, status, expected_category in test_cases:
@@ -270,12 +270,12 @@ def smoke_base_url_resolution() -> list[str]:
     #
     # The plugin handler resolves:
     #   channels_url = os.getenv("DEN_CHANNELS_URL") or ""
-    #   gateway_url  = os.getenv("DEN_GATEWAY_URL") or ""
-    #   base_url = channels_url or gateway_url
+    #   channels_url  = os.getenv("DEN_GATEWAY_URL") or ""
+    #   base_url = channels_url or channels_url
     #
     # Both fall back the same way: DEN_CHANNELS_URL first, then DEN_GATEWAY_URL.
     # If DEN_GATEWAY_URL is set to a path-prefixed URL (e.g., includes
-    # /api/gateway), the plugin handler would construct a double-path endpoint.
+    # /api), the plugin handler would construct a double-path endpoint.
     # This smoke validates the correct pattern.
 
     base_live = os.environ.get("DEN_CHANNELS_URL") or os.environ.get("DEN_GATEWAY_URL")
@@ -284,15 +284,15 @@ def smoke_base_url_resolution() -> list[str]:
         return errors
 
     base = base_live.rstrip("/")
-    if base.endswith("/api") or base.endswith("/api/gateway"):
+    if base.endswith("/api") or base.endswith("/api"):
         errors.append(
             f"DEN_GATEWAY_URL appears to be path-prefixed: {base!r}. "
             f"This will cause double-path when appended to "
-            f"/api/gateway/direct-agent-messages. Expected bare host URL "
+            f"/api/direct-agent-events. Expected bare host URL "
             f"(e.g. http://192.168.1.10:18080)."
         )
     else:
-        expected_url = f"{base}{EXPECTED_GATEWAY_PATH}"
+        expected_url = f"{base}{EXPECTED_DIRECT_AGENT_PATH}"
         errors.append(
             f"LIVE BASE URL: {base_live!r}\n"
             f"  Expected endpoint: {expected_url}\n"
@@ -310,7 +310,7 @@ def main(argv: list[str] | None = None) -> int:
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--live", action="store_true",
-                        help="Also smoke against a live Gateway (requires DEN_CHANNELS_URL)")
+                        help="Also smoke against a live Channels (requires DEN_CHANNELS_URL)")
     parser.add_argument("--json", action="store_true",
                         help="Emit structured JSON report")
     args = parser.parse_args(argv)
@@ -351,7 +351,7 @@ def main(argv: list[str] | None = None) -> int:
             import urllib.error
 
             base = base_live.rstrip("/")
-            url = f"{base}{EXPECTED_GATEWAY_PATH}"
+            url = f"{base}{EXPECTED_DIRECT_AGENT_PATH}"
             payload = json.dumps({
                 "channelId": TEST_CHANNEL_ID,
                 "memberIdentity": "smoke-test-agent",
@@ -372,7 +372,7 @@ def main(argv: list[str] | None = None) -> int:
                     "url": url,
                     "note": (
                         "Live wake bridge path succeeded. "
-                        "The 201 confirms the Gateway route works with the "
+                        "The 201 confirms the Channels route works with the "
                         "same request shape the Runner uses."
                         if status in (200, 201) else
                         "Live smoke returned unexpected status."
@@ -408,16 +408,16 @@ def main(argv: list[str] | None = None) -> int:
                 "The Runner's 404 on direct-agent wake is most likely caused by "
                 "a base URL resolution mismatch. The orchestrator adapter and plugin "
                 "handler both use DEN_CHANNELS_URL or DEN_GATEWAY_URL. If DEN_GATEWAY_URL "
-                "is set to a path-prefixed URL (e.g. http://host:port/api/gateway), "
+                "is set to a path-prefixed URL (e.g. http://host:port/api), "
                 "the plugin handler constructs a double-path endpoint "
-                "(e.g. http://host:port/api/gateway/api/gateway/direct-agent-messages) "
+                "(e.g. http://host:port/api/api/direct-agent-events) "
                 "which returns 404. The planner's curl bypasses this by using the "
                 "bare host URL directly. The fix is to ensure DEN_GATEWAY_URL is the "
                 "bare host (http://192.168.1.10:18080) and let the code append "
-                "/api/gateway/direct-agent-messages."
+                "/api/direct-agent-events."
             ),
             "request_shape_summary": (
-                "POST /api/gateway/direct-agent-messages with JSON body: "
+                "POST /api/direct-agent-events with JSON body: "
                 "channelId, memberIdentity, senderIdentity, body + optional "
                 "assignmentId, workerRunId, workerRole, poolMemberId, "
                 "profileIdentity, sourceProjectId, targetTaskId. "
