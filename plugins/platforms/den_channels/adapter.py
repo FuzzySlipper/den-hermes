@@ -989,15 +989,21 @@ class DenChannelsAdapter(BasePlatformAdapter):
                     default=str,
                 ),
             }
-            try:
-                await self.gateway_client.mark_completed(context.delivery_request_id, completed_payload)
+            if self.gateway_client is None:
+                # Channels-owned direct-agent polling does not have a legacy
+                # Gateway delivery lifecycle endpoint to complete. The visible
+                # gateway_delivery reply itself is the terminal Channels evidence.
                 self._terminal_delivery_ids.add(context.delivery_request_id)
-            except Exception:
-                logger.warning(
-                    "[DenChannels] posted reply for delivery %s but failed to mark completed",
-                    context.delivery_request_id,
-                    exc_info=True,
-                )
+            else:
+                try:
+                    await self.gateway_client.mark_completed(context.delivery_request_id, completed_payload)
+                    self._terminal_delivery_ids.add(context.delivery_request_id)
+                except Exception:
+                    logger.warning(
+                        "[DenChannels] posted reply for delivery %s but failed to mark completed",
+                        context.delivery_request_id,
+                        exc_info=True,
+                    )
             return SendResult(success=True, message_id=str(message_id), raw_response=posted)
         except Exception as exc:
             if is_terminal_reply:
@@ -1621,6 +1627,13 @@ class DenChannelsAdapter(BasePlatformAdapter):
                 default=str,
             )[:4000],
         }
+        if self.gateway_client is None:
+            logger.debug(
+                "[DenChannels] no Gateway delivery client configured; skipping delivery %s failed marker",
+                context.delivery_request_id,
+            )
+            self._terminal_delivery_ids.add(context.delivery_request_id)
+            return
         try:
             await self.gateway_client.mark_failed(context.delivery_request_id, payload)
             self._terminal_delivery_ids.add(context.delivery_request_id)

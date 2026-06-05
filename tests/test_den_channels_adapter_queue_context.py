@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import json
+import logging
 import os
 import sys
 from pathlib import Path
@@ -119,6 +120,26 @@ def _adapter(gateway: FakeGatewayClient, channels: FakeChannelsClient) -> DenCha
             },
         ),
         gateway_client=gateway,
+        channels_client=channels,
+    )
+
+
+def _channels_only_adapter(channels: FakeChannelsClient) -> DenChannelsAdapter:
+    return DenChannelsAdapter(
+        PlatformConfig(
+            enabled=True,
+            token="***",
+            extra={
+                "channels_url": "http://192.168.1.10:18081",
+                "project_id": "goblinbench",
+                "agent_identity": "goblin-overseer",
+                "role": "agent",
+                "profile": "goblin-overseer",
+                "adapter_instance_id": "test-host:goblin-overseer:agent:gateway",
+                "start_claim_loop": False,
+                "start_poll_loop": False,
+            },
+        ),
         channels_client=channels,
     )
 
@@ -1063,6 +1084,41 @@ async def test_final_send_calls_complete_with_ack_kind() -> None:
     assert completed_payload.get("adapter_kind") == "hermes_profile"
     assert completed_payload.get("session_id") is not None
     assert completed_payload.get("external_message_id") is not None
+
+
+@pytest.mark.asyncio
+async def test_channels_only_direct_event_final_reply_does_not_warn_when_gateway_client_absent(caplog: pytest.LogCaptureFixture) -> None:
+    """Direct-agent polling uses Channels evidence, not legacy Gateway completion endpoints."""
+    channels = FakeChannelsClient()
+    adapter = _channels_only_adapter(channels)
+    delivery = adapter._event_to_delivery({
+        "id": 2395,
+        "channelId": 601,
+        "sourceProjectId": "goblinbench",
+        "sourceKind": "wake_event",
+        "sourceId": "direct-agent-message:601:goblin-overseer:abc",
+        "senderIdentity": "Patch",
+        "summary": "Direct agent request to goblin-overseer: recorded, pending claim/completion",
+        "body": "smoke direct reply completion bookkeeping",
+        "metadataJson": json.dumps({"channel_slug": "project-goblinbench"}),
+    })
+    event = await adapter.delivery_to_event(delivery)
+    await adapter.on_processing_start(event)
+
+    with caplog.at_level(logging.WARNING):
+        result = await adapter.send(
+            event.source.chat_id,
+            "Visible final reply.",
+            metadata={"delivery_request_id": 2395, "notify": True},
+        )
+
+    assert result.success is True
+    assert channels.posts
+    posted_channel_id, posted_payload = channels.posts[-1]
+    assert posted_channel_id == 601
+    assert posted_payload["sourceKind"] == "gateway_delivery"
+    assert posted_payload["sourceId"] == "2395"
+    assert "failed to mark completed" not in caplog.text
 
 
 @pytest.mark.asyncio
