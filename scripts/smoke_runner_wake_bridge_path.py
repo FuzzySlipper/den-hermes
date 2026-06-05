@@ -179,9 +179,10 @@ def smoke_error_diagnostics() -> list[str]:
             f"Expected failure_category='worker_wake_channels_route_error', "
             f"got {result.get('failure_category')!r}"
         )
-    if "direct-agent-messages" not in str(result.get("diagnostic", "")):
+    if "direct-agent-events" not in str(result.get("diagnostic", "")):
         errors.append(
-            f"Diagnostic missing endpoint path: {result.get('diagnostic')}"
+            "diagnostic should mention canonical direct-agent-events endpoint: "
+            f"{result.get('diagnostic')}"
         )
     if DEFAULT_CHANNELS_URL not in str(result.get("diagnostic", "")):
         errors.append(
