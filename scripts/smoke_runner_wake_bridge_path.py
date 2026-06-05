@@ -284,7 +284,7 @@ def smoke_base_url_resolution() -> list[str]:
         return errors
 
     base = base_live.rstrip("/")
-    if base.endswith("/api") or base.endswith("/api"):
+    if base.endswith("/api"):
         errors.append(
             f"DEN_GATEWAY_URL appears to be path-prefixed: {base!r}. "
             f"This will cause double-path when appended to "
