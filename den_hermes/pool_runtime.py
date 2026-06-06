@@ -21,7 +21,7 @@ from __future__ import annotations
 import enum
 import re
 from dataclasses import dataclass, field
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 
 # ---------------------------------------------------------------------------
@@ -1127,3 +1127,111 @@ class PoolWorkerProfileGuide:
             raise PoolRuntimeError(
                 f"Invalid pool worker profile guide: {'; '.join(errors)}"
             )
+
+
+# ---------------------------------------------------------------------------
+# Operational wiring: post-terminal reconciliation and profile health check
+# ---------------------------------------------------------------------------
+
+
+def reconcile_pool_members(
+    *,
+    members: Sequence[Mapping[str, Any]],
+    active_assignments_by_member: Mapping[str, int] | None = None,
+) -> list[PostTerminalBusyLeak]:
+    """Reconcile pool members, detecting post-terminal busy-without-active-assignment leaks.
+
+    Each member dict should contain at least: ``member_id`` (str), ``state`` (str or
+    PoolRuntimeState), and optionally ``role``, ``assignment_id``.  Returns a list of
+    ``PostTerminalBusyLeak`` detected objects (may be empty).
+
+    This is fakeable: just pass mapped member dicts and assignment counts.
+    """
+    assignment_counts = dict(active_assignments_by_member or {})
+    leaks: list[PostTerminalBusyLeak] = []
+    for member in members:
+        member_id = str(member.get("member_id") or member.get("worker_id") or "")
+        if not member_id:
+            continue
+        state_raw = member.get("state", "")
+        if isinstance(state_raw, PoolRuntimeState):
+            state = state_raw
+        else:
+            try:
+                state = PoolRuntimeState(str(state_raw))
+            except ValueError:
+                continue
+        if state not in PoolRuntimeState.busy_leak_states():
+            continue
+        active_count = assignment_counts.get(member_id, 0)
+        if active_count > 0:
+            continue
+        leak = PostTerminalBusyLeak(
+            member_id=member_id,
+            state=state.value,
+            role=str(member.get("role") or ""),
+            assignment_id=str(member.get("assignment_id") or ""),
+            active_assignment_count=active_count,
+        )
+        leaks.append(leak)
+    return leaks
+
+
+# Fakeable profile health check result (no real provider calls).
+@dataclass(frozen=True)
+class ProfileHealthResult:
+    """Result of a fakeable profile/provider health check."""
+
+    profile: str
+    provider: str
+    model: str
+    healthy: bool
+    category: str | None = None
+    detail: str = ""
+
+    def is_healthy(self) -> bool:
+        return self.healthy
+
+    def to_diagnostic(self, *, member_id: str) -> PoolMemberDiagnostic | None:
+        if self.healthy:
+            return None
+        return PoolMemberDiagnostic(
+            category=self.category or "auth_unhealthy",
+            member_id=member_id,
+            evidence={
+                "profile": self.profile,
+                "provider": self.provider,
+                "model": self.model,
+                "detail": self.detail,
+            },
+            recovery="Refresh OAuth token, rotate API key, or check provider status",
+        )
+
+
+def check_profile_health(
+    *,
+    profile: str,
+    provider: str,
+    model: str,
+    health_fn: Callable[[str, str, str], tuple[bool, str]] | None = None,
+) -> ProfileHealthResult:
+    """Check profile/provider health (fakeable).
+
+    In production the ``health_fn`` callable can make a lightweight provider
+    health check (e.g. list-models, small preflight call).  In tests, pass a
+    fake that returns ``(True, "")`` or ``(False, "expired token")``.
+    """
+    if health_fn is None:
+        return ProfileHealthResult(
+            profile=profile, provider=provider, model=model,
+            healthy=True, detail="health check not configured",
+        )
+    healthy, detail = health_fn(profile, provider, model)
+    return ProfileHealthResult(
+        profile=profile,
+        provider=provider,
+        model=model,
+        healthy=healthy,
+        category="auth_unhealthy" if not healthy else None,
+        detail=detail,
+    )

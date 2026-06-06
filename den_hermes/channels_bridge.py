@@ -13,7 +13,21 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Mapping, Protocol
 
+from den_hermes.pool_runtime import CANONICAL_FAILURE_CATEGORIES, PoolMemberDiagnostic
+
 SECRETISH_PATTERN = re.compile(r"(?i)(bearer\s+\S+|sk-[a-z0-9_.-]{8,}|api[_-]?key|auth[_-]?token|\btoken\b|authorization|password|secret)")
+
+# Map legacy internal failure categories to canonical diagnostic taxonomy.
+# Unknown mappings stay as-is; known ones use the canonical category name.
+LEGACY_TO_CANONICAL_FAILURE_CATEGORY: dict[str, str] = {
+    "missing_binding": "membership_not_active",
+    "missing_profile": "membership_not_active",
+    "concrete_binding_not_found": "membership_not_active",
+    "ambiguous_binding": "membership_not_active",
+    "ambiguous_concrete_binding": "membership_not_active",
+    "missing_target_role": "membership_not_active",
+    "hermes_transport_failure": "wake_route_404",
+}
 
 
 @dataclass(frozen=True)
@@ -620,6 +634,10 @@ class DenChannelsWakeBridge:
         agent_identity = _required_str(target, "agent_identity")
         role = _optional_str(target.get("role"))
         safe_diagnostic = _redact(diagnostic)
+
+        # Map to canonical failure category for structured diagnostics
+        canonical_category = LEGACY_TO_CANONICAL_FAILURE_CATEGORY.get(failure_category, failure_category)
+
         self.den_tools.mcp_den_send_agent_stream_message(
             sender="den-hermes-bridge",
             event_type="note",
@@ -635,7 +653,8 @@ class DenChannelsWakeBridge:
                 "dedupe_key": dedupe_key,
                 "correlation_id": correlation_id,
                 "adapter_instance_id": adapter_instance_id,
-                "failure_category": failure_category,
+                "failure_category": canonical_category,
+                "legacy_failure_category": failure_category,
                 "binding_count": binding_count,
             },
             dedup_key=f"wake-diagnostic:{dedupe_key}:failed",
@@ -647,6 +666,35 @@ class DenChannelsWakeBridge:
             correlation_id=correlation_id,
             adapter_instance_id=adapter_instance_id,
             diagnostic=safe_diagnostic,
+        )
+
+    def emit_diagnostic(
+        self,
+        *,
+        diagnostic: PoolMemberDiagnostic,
+        project_id: str,
+        agent_identity: str,
+        role: str | None = None,
+        task_id: int | None = None,
+    ) -> None:
+        """Emit a structured PoolMemberDiagnostic as a bridge agent-stream note."""
+        self.den_tools.mcp_den_send_agent_stream_message(
+            sender="den-hermes-bridge",
+            event_type="note",
+            body=diagnostic.summary(),
+            project_id=project_id,
+            task_id=task_id,
+            recipient_agent=agent_identity,
+            recipient_role=role,
+            delivery_mode="record_only",
+            metadata={
+                "type": "hermes_pool_member_diagnostic",
+                "diagnostic_category": diagnostic.category,
+                "member_id": diagnostic.member_id,
+                "severity": diagnostic.severity,
+                "evidence": diagnostic.evidence,
+            },
+            dedup_key=f"diag:{diagnostic.category}:{diagnostic.member_id}",
         )
 
 

@@ -1171,6 +1171,100 @@ class TestProfileGuideMembershipPreflight:
 # ---------------------------------------------------------------------------
 
 
+from den_hermes.pool_runtime import (  # noqa: E402
+    ProfileHealthResult,
+    check_profile_health,
+    reconcile_pool_members,
+)
+
+
+class TestReconcilePoolMembers:
+
+    def test_detects_completed_member_without_assignment(self):
+        members = [
+            {"member_id": "pool-packet-auditor-03", "state": "completed",
+             "role": "packet_auditor", "assignment_id": "assign-491"},
+        ]
+        leaks = reconcile_pool_members(members=members, active_assignments_by_member={})
+        assert len(leaks) == 1
+        assert leaks[0].member_id == "pool-packet-auditor-03"
+        assert leaks[0].category == "post_terminal_pool_state_leak"
+
+    def test_skips_member_with_active_assignment(self):
+        members = [
+            {"member_id": "pool-packet-auditor-03", "state": "completed",
+             "role": "packet_auditor"},
+        ]
+        leaks = reconcile_pool_members(
+            members=members,
+            active_assignments_by_member={"pool-packet-auditor-03": 1},
+        )
+        assert len(leaks) == 0
+
+    def test_skips_released_members(self):
+        members = [
+            {"member_id": "pool-coder-01", "state": "released", "role": "coder"},
+        ]
+        leaks = reconcile_pool_members(members=members)
+        assert len(leaks) == 0
+
+    def test_detects_multiple_leaks(self):
+        members = [
+            {"member_id": "auditor-1", "state": "failed", "role": "packet_auditor"},
+            {"member_id": "coder-1", "state": "completed", "role": "coder"},
+            {"member_id": "reviewer-1", "state": "released", "role": "reviewer"},
+        ]
+        leaks = reconcile_pool_members(members=members)
+        assert len(leaks) == 2
+        leak_ids = {l.member_id for l in leaks}
+        assert leak_ids == {"auditor-1", "coder-1"}
+
+
+class TestProfileHealthCheck:
+
+    def test_default_health_check_is_healthy(self):
+        result = check_profile_health(
+            profile="spawned-packet-auditor",
+            provider="openai",
+            model="gpt-5",
+        )
+        assert result.is_healthy()
+        assert result.to_diagnostic(member_id="test") is None
+
+    def test_unhealthy_check_produces_diagnostic(self):
+        def fake_health(_p, _r, _m):
+            return (False, "expired OAuth token")
+
+        result = check_profile_health(
+            profile="spawned-packet-auditor",
+            provider="openai",
+            model="gpt-5",
+            health_fn=fake_health,
+        )
+        assert not result.is_healthy()
+        assert result.category == "auth_unhealthy"
+
+        diag = result.to_diagnostic(member_id="pool-packet-auditor-03")
+        assert diag is not None
+        assert diag.category == "auth_unhealthy"
+        assert diag.member_id == "pool-packet-auditor-03"
+        assert "expired OAuth token" in diag.summary()
+        assert "openai" in diag.summary()
+
+    def test_healthy_check_returns_none_diagnostic(self):
+        def fake_health(_p, _r, _m):
+            return (True, "ok")
+
+        result = check_profile_health(
+            profile="spawned-packet-auditor",
+            provider="openai",
+            model="gpt-5",
+            health_fn=fake_health,
+        )
+        assert result.is_healthy()
+        assert result.to_diagnostic(member_id="test") is None
+
+
 def _to_interpretation_approved(runtime: PoolWorkerRuntime) -> PoolWorkerRuntime:
     ackd = runtime.acknowledge(interpretation_summary="Test")
     interp = ackd.post_interpretation(

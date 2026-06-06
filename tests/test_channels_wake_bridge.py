@@ -187,7 +187,8 @@ def test_transport_failure_records_visible_diagnostic_and_no_secret_values():
     assert result.status == "failed"
     assert "[REDACTED]" in result.diagnostic
     assert "sk-secret" not in result.diagnostic
-    assert tools.agent_stream_messages[0]["metadata"]["failure_category"] == "hermes_transport_failure"
+    # Canonical category via LEGACY_TO_CANONICAL_FAILURE_CATEGORY mapping (#2071)
+    assert tools.agent_stream_messages[0]["metadata"]["failure_category"] == "wake_route_404"
     assert "sk-secret" not in json.dumps(tools.agent_stream_messages[0])
 
 
@@ -674,7 +675,7 @@ def test_shared_profile_ambiguous_without_concrete_target_fails_closed():
     assert "ambiguous" in (result.diagnostic or "").lower()
     assert "disambiguate" in (result.diagnostic or "")
     assert transport.wakes == []
-    assert tools.agent_stream_messages[0]["metadata"]["failure_category"] == "ambiguous_binding"
+    assert tools.agent_stream_messages[0]["metadata"]["failure_category"] == "membership_not_active"
 
 
 def test_shared_profile_with_pool_member_id_resolves_concrete_binding():
@@ -747,7 +748,7 @@ def test_shared_profile_concrete_target_no_match_fails_closed():
             or "no active binding" in (result.diagnostic or "").lower())
     assert "pool-coder-99" in (result.diagnostic or "")
     assert transport.wakes == []
-    assert tools.agent_stream_messages[0]["metadata"]["failure_category"] == "concrete_binding_not_found"
+    assert tools.agent_stream_messages[0]["metadata"]["failure_category"] == "membership_not_active"
 
 
 def test_shared_profile_concrete_target_matching_multiple_bindings_fails_closed():
@@ -764,7 +765,7 @@ def test_shared_profile_concrete_target_matching_multiple_bindings_fails_closed(
     assert result.status == "failed"
     assert "matched multiple active bindings" in (result.diagnostic or "")
     assert transport.wakes == []
-    assert tools.agent_stream_messages[0]["metadata"]["failure_category"] == "ambiguous_concrete_binding"
+    assert tools.agent_stream_messages[0]["metadata"]["failure_category"] == "membership_not_active"
     assert tools.agent_stream_messages[0]["metadata"]["binding_count"] == 2
 
 
@@ -866,3 +867,58 @@ def test_transport_env_pool_member_id_empty_when_binding_lacks_one():
     assert len(launches) == 1
     env = launches[0].env
     assert env.get("DEN_HERMES_POOL_MEMBER_ID") == ""
+
+
+# ---------------------------------------------------------------------------
+# Canonical failure category mapping (#2071 wiring)
+# ---------------------------------------------------------------------------
+
+
+def test_missing_binding_maps_to_membership_not_active():
+    tools = RecordingDenTools(bindings=[])
+    bridge = DenChannelsWakeBridge(den_tools=tools, hermes_transport=RecordingHermesTransport(), store=InMemoryWakeStore())
+    result = bridge.handle_delivery(delivery())
+    assert result.status == "failed"
+    diag = tools.agent_stream_messages[0]
+    assert diag["metadata"]["failure_category"] == "membership_not_active"
+    assert diag["metadata"]["legacy_failure_category"] == "missing_binding"
+
+
+def test_transport_failure_maps_to_wake_route_404():
+    class FailingTransport:
+        def wake_profile(self, *, binding, envelope):
+            raise RuntimeError("route 404")
+
+    tools = RecordingDenTools([active_binding()])
+    bridge = DenChannelsWakeBridge(den_tools=tools, hermes_transport=FailingTransport(), store=InMemoryWakeStore())
+    result = bridge.handle_delivery(delivery())
+    assert result.status == "failed"
+    diag = tools.agent_stream_messages[0]
+    assert diag["metadata"]["failure_category"] == "wake_route_404"
+
+
+def test_emit_diagnostic_sends_structured_member_diagnostic():
+    from den_hermes.pool_runtime import PoolMemberDiagnostic
+
+    tools = RecordingDenTools([active_binding()])
+    bridge = DenChannelsWakeBridge(den_tools=tools, hermes_transport=RecordingHermesTransport(), store=InMemoryWakeStore())
+
+    diag = PoolMemberDiagnostic(
+        category="membership_not_active",
+        member_id="pool-packet-auditor-03",
+        evidence={"channel_id": 672},
+        recovery="Restore membership",
+    )
+    bridge.emit_diagnostic(
+        diagnostic=diag,
+        project_id="den-core",
+        agent_identity="spawned-packet-auditor",
+        role="packet_auditor",
+        task_id=1982,
+    )
+
+    msg = tools.agent_stream_messages[0]
+    assert msg["metadata"]["type"] == "hermes_pool_member_diagnostic"
+    assert msg["metadata"]["diagnostic_category"] == "membership_not_active"
+    assert msg["metadata"]["member_id"] == "pool-packet-auditor-03"
+    assert "pool-packet-auditor-03" in msg["body"]
