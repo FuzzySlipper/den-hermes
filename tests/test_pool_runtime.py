@@ -1360,6 +1360,90 @@ class TestWorkerClaimTimeoutCanonical:
         assert "pool-packet-auditor-03" in diag.summary()
 
 
+class TestProvisionPreflightDefaults:
+    """Tests that provisioning applies role-specific preflight defaults."""
+
+    def test_packet_auditor_preflight_defaults_in_resolve_runtime(self):
+        """packet_auditor gets requires_channel_membership=True, target_channel_id=672
+        even when the role entry has no preflight section."""
+        import sys, os
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
+        from provision_pool_workers import resolve_role_runtime, build_pool_member, ROLE_PREFLIGHT_DEFAULTS
+
+        # Simulate a minimal registry where packet_auditor has no preflight
+        defaults = {
+            "substrate": "spawned_hermes",
+            "profile_required": True,
+            "provider_required": True,
+            "model_required": True,
+            "toolsets": [],
+            "timeout_seconds": 900,
+        }
+        roles = {
+            "packet_auditor": {
+                "runtime_id": "pa-primary",
+                "profile": "spawned-packet-auditor",
+                "provider": "openai",
+                "model": "gpt-5",
+                "timeout_seconds": 600,
+                # No preflight section — relies on ROLE_PREFLIGHT_DEFAULTS
+            },
+        }
+        registry = {"role_aliases": {}, "schema_version": 1, "defaults": defaults, "roles": roles, "registry_id": "test"}
+
+        runtime = resolve_role_runtime("packet_auditor", registry, defaults, roles)
+
+        # Before applying ROLE_PREFLIGHT_DEFAULTS, values come from registry only
+        assert runtime["requires_channel_membership"] is False
+        assert runtime["target_channel_id"] is None
+
+        # Apply ROLE_PREFLIGHT_DEFAULTS (this is what run_provision does)
+        pfd = ROLE_PREFLIGHT_DEFAULTS.get("packet_auditor", {})
+        if pfd:
+            for key, value in pfd.items():
+                runtime[key] = value
+
+        assert runtime["requires_channel_membership"] is True
+        assert runtime["target_channel_id"] == 672
+
+        # Now build the member to verify it carries the fields
+        member = build_pool_member("packet_auditor", runtime, slot_number=1)
+        assert member.requires_channel_membership is True
+        assert member.target_channel_id == 672
+
+    def test_coder_has_no_preflight_defaults(self):
+        """coder should NOT have membership preflight defaults."""
+        import sys, os
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
+        from provision_pool_workers import resolve_role_runtime, build_pool_member, ROLE_PREFLIGHT_DEFAULTS
+
+        # coder has no preflight default override
+        assert ROLE_PREFLIGHT_DEFAULTS.get("coder") is None
+
+        defaults = {
+            "substrate": "spawned_hermes",
+            "profile_required": True,
+            "provider_required": True,
+            "model_required": True,
+            "toolsets": [],
+            "timeout_seconds": 900,
+        }
+        roles = {
+            "coder": {
+                "runtime_id": "coder-primary",
+                "profile": "spawned-coder",
+                "provider": "openai",
+                "model": "gpt-5",
+            },
+        }
+        registry = {"role_aliases": {}, "schema_version": 1, "defaults": defaults, "roles": roles, "registry_id": "test"}
+        runtime = resolve_role_runtime("coder", registry, defaults, roles)
+        member = build_pool_member("coder", runtime, slot_number=1)
+
+        assert member.requires_channel_membership is False
+        assert member.target_channel_id is None
+
+
 def _to_interpretation_approved(runtime: PoolWorkerRuntime) -> PoolWorkerRuntime:
     ackd = runtime.acknowledge(interpretation_summary="Test")
     interp = ackd.post_interpretation(

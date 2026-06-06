@@ -118,6 +118,16 @@ ROLE_CAPABILITIES: dict[str, list[str]] = {
     "project_orchestrator": ["planning", "task-shaping", "den-coordination", "worker-routing", "checkpointing"],
 }
 
+# Role-specific preflight defaults that override or supplement the central
+# runtime registry.  packet_auditor requires an active Channels membership
+# in the #den-system control lane (channel 672) so worker wakes do not 404.
+ROLE_PREFLIGHT_DEFAULTS: dict[str, dict[str, Any]] = {
+    "packet_auditor": {
+        "requires_channel_membership": True,
+        "target_channel_id": 672,
+    },
+}
+
 
 # ---------------------------------------------------------------------------
 # Data structures
@@ -434,6 +444,14 @@ def run_provision(
     for role in target_roles:
         try:
             runtime = resolve_role_runtime(role, registry, defaults, roles_block)
+
+            # Apply role-specific preflight defaults for roles that require
+            # explicit membership/wakeability guarantees (packet_auditor → #den-system 672).
+            pfd = ROLE_PREFLIGHT_DEFAULTS.get(role)
+            if pfd:
+                for key, value in pfd.items():
+                    runtime[key] = value
+
             profile = runtime["profile"]
 
             # 3a. Check profile is not forbidden
