@@ -172,6 +172,11 @@ CANONICAL_FAILURE_CATEGORIES: dict[str, str] = {
         "Pool member is in a terminal state but has no active Core assignment. "
         "The member should be released back to available or quarantined."
     ),
+    "worker_claim_timeout": (
+        "Worker claim/wake timed out. The delivery was posted but the worker "
+        "did not acknowledge within the expected window. Check worker runtime "
+        "health and retry or reassign."
+    ),
 }
 
 
@@ -1235,3 +1240,65 @@ def check_profile_health(
         category="auth_unhealthy" if not healthy else None,
         detail=detail,
     )
+
+
+def pre_assignment_health_check(
+    *,
+    guide: PoolWorkerProfileGuide,
+    member_id: str,
+    health_fn: Callable[[str, str, str], tuple[bool, str]] | None = None,
+) -> PoolMemberDiagnostic | None:
+    """Run pre-assignment health checks for a pool worker.
+
+    Checks profile/provider health via ``check_profile_health`` and returns
+    an ``auth_required`` / ``auth_unhealthy`` diagnostic if the profile is
+    unhealthy.  If the profile needs membership preflight and is healthy,
+    returns ``None`` (caller is expected to verify membership separately).
+
+    If unhealthy, the worker MUST NOT be assigned until the issue is resolved.
+    """
+    health = check_profile_health(
+        profile=guide.profile,
+        provider=guide.provider,
+        model=guide.model,
+        health_fn=health_fn,
+    )
+    if not health.is_healthy():
+        return health.to_diagnostic(member_id=member_id)
+    return None
+
+
+def terminal_cleanup_reconciliation(
+    *,
+    members: Sequence[Mapping[str, Any]],
+    active_assignments_by_member: Mapping[str, int] | None = None,
+) -> tuple[list[PostTerminalBusyLeak], list[PoolMemberDiagnostic]]:
+    """Reconcile terminal assignments and emit diagnostics for busy leaks.
+
+    Returns a tuple of (leaks, diagnostics).  Each detected leak also has a
+    corresponding ``PoolMemberDiagnostic``.  The caller (orchestrator/runner)
+    should release or quarantine each leaking member.
+    """
+    leaks = reconcile_pool_members(
+        members=members,
+        active_assignments_by_member=active_assignments_by_member,
+    )
+    diagnostics: list[PoolMemberDiagnostic] = []
+    for leak in leaks:
+        diagnostics.append(
+            PoolMemberDiagnostic(
+                category="post_terminal_pool_state_leak",
+                member_id=leak.member_id,
+                evidence={
+                    "state": leak.state,
+                    "role": leak.role,
+                    "assignment_id": leak.assignment_id,
+                    "active_assignment_count": leak.active_assignment_count,
+                },
+                recovery=(
+                    f"Release or quarantine {leak.member_id}. "
+                    "It is in a terminal state with no active assignment."
+                ),
+            )
+        )
+    return leaks, diagnostics

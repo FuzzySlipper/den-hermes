@@ -1174,7 +1174,9 @@ class TestProfileGuideMembershipPreflight:
 from den_hermes.pool_runtime import (  # noqa: E402
     ProfileHealthResult,
     check_profile_health,
+    pre_assignment_health_check,
     reconcile_pool_members,
+    terminal_cleanup_reconciliation,
 )
 
 
@@ -1263,6 +1265,99 @@ class TestProfileHealthCheck:
         )
         assert result.is_healthy()
         assert result.to_diagnostic(member_id="test") is None
+
+
+class TestPreAssignmentHealthCheck:
+
+    def test_unhealthy_profile_blocks_assignment(self):
+        guide = PoolWorkerProfileGuide(
+            role="packet_auditor",
+            runtime_id="r1",
+            profile="spawned-packet-auditor",
+            provider="openai",
+            model="gpt-5",
+            requires_channel_membership=True,
+            target_channel_id=672,
+        )
+
+        def fake_health(_p, _r, _m):
+            return (False, "expired OAuth token")
+
+        diag = pre_assignment_health_check(
+            guide=guide,
+            member_id="pool-packet-auditor-03",
+            health_fn=fake_health,
+        )
+        assert diag is not None
+        assert diag.category == "auth_unhealthy"
+        assert "expired OAuth token" in diag.summary()
+
+    def test_healthy_profile_returns_none(self):
+        guide = PoolWorkerProfileGuide(
+            role="packet_auditor",
+            runtime_id="r1",
+            profile="spawned-packet-auditor",
+            provider="openai",
+            model="gpt-5",
+            requires_channel_membership=True,
+            target_channel_id=672,
+        )
+
+        def fake_health(_p, _r, _m):
+            return (True, "healthy")
+
+        diag = pre_assignment_health_check(
+            guide=guide,
+            member_id="pool-packet-auditor-03",
+            health_fn=fake_health,
+        )
+        assert diag is None
+
+
+class TestTerminalCleanupReconciliation:
+    """Tests for terminal_cleanup_reconciliation (wired reconciliation path)."""
+
+    def test_detects_leak_and_produces_diagnostic(self):
+        members = [
+            {"member_id": "pool-packet-auditor-03", "state": "completed",
+             "role": "packet_auditor", "assignment_id": "assign-491"},
+        ]
+        leaks, diagnostics = terminal_cleanup_reconciliation(
+            members=members,
+            active_assignments_by_member={},
+        )
+        assert len(leaks) == 1
+        assert len(diagnostics) == 1
+        assert diagnostics[0].category == "post_terminal_pool_state_leak"
+        assert "Release or quarantine" in diagnostics[0].recovery
+
+    def test_no_leaks_no_diagnostics(self):
+        members = [
+            {"member_id": "pool-coder-01", "state": "released", "role": "coder"},
+        ]
+        leaks, diagnostics = terminal_cleanup_reconciliation(
+            members=members,
+        )
+        assert len(leaks) == 0
+        assert len(diagnostics) == 0
+
+
+class TestWorkerClaimTimeoutCanonical:
+
+    def test_worker_claim_timeout_in_canonical_categories(self):
+        canon = PoolMemberDiagnostic.canonical_failure_categories()
+        assert "worker_claim_timeout" in canon
+        assert "claim" in canon["worker_claim_timeout"].lower()
+
+    def test_create_diagnostic_for_claim_timeout(self):
+        diag = PoolMemberDiagnostic(
+            category="worker_claim_timeout",
+            member_id="pool-packet-auditor-03",
+            evidence={"delivery_request_id": 123, "elapsed_seconds": 900},
+            recovery="Retry delivery or reassign to another worker",
+        )
+        assert diag.category == "worker_claim_timeout"
+        assert "pool-packet-auditor-03" in diag.summary()
 
 
 def _to_interpretation_approved(runtime: PoolWorkerRuntime) -> PoolWorkerRuntime:

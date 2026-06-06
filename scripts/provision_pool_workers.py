@@ -144,6 +144,8 @@ class ResolvedPoolMember:
     provisioning_source: str = "den-worker"
     provisioning_repo: str | None = None
     provisioning_registry_fingerprint: str | None = None
+    requires_channel_membership: bool = False
+    target_channel_id: int | None = None
 
 
 @dataclass
@@ -201,6 +203,7 @@ def resolve_role_runtime(
         raise RuntimeError(f"Role {role!r} missing required 'model'")
 
     launch = role_entry.get("launch") or {}
+    preflight = role_entry.get("preflight") or {}
     return {
         "role": canonical,
         "runtime_id": role_entry.get("runtime_id", f"{canonical}-primary"),
@@ -210,6 +213,10 @@ def resolve_role_runtime(
         "toolsets": role_entry.get("toolsets", defaults.get("toolsets", [])),
         "timeout_seconds": role_entry.get("timeout_seconds", defaults.get("timeout_seconds", 900)),
         "provisioning_source": launch.get("source", "den-worker"),
+        "requires_channel_membership": bool(
+            preflight.get("requires_channel_membership", False)
+        ),
+        "target_channel_id": preflight.get("target_channel_id"),
     }
 
 
@@ -292,6 +299,8 @@ def build_pool_member(
         timeout_seconds=runtime["timeout_seconds"],
         status="ready",
         provisioning_source=runtime.get("provisioning_source", "den-worker"),
+        requires_channel_membership=runtime.get("requires_channel_membership", False),
+        target_channel_id=runtime.get("target_channel_id"),
     )
 
 
@@ -490,6 +499,8 @@ def _emit_apply_payloads(result: ProvisioningResult) -> None:
                 "slot_number": member.slot_number,
                 "desired_role_capacity": member.desired_role_capacity,
                 "agent_instance_id_template": member.agent_instance_id_template,
+                "requires_channel_membership": member.requires_channel_membership,
+                "target_channel_id": member.target_channel_id,
                 "provisioning": {
                     "source": member.provisioning_source,
                     "repo": member.provisioning_repo,

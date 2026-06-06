@@ -27,6 +27,7 @@ LEGACY_TO_CANONICAL_FAILURE_CATEGORY: dict[str, str] = {
     "ambiguous_concrete_binding": "membership_not_active",
     "missing_target_role": "membership_not_active",
     "hermes_transport_failure": "wake_route_404",
+    "worker_claim_timeout": "worker_claim_timeout",
 }
 
 
