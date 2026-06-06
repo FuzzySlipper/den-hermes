@@ -145,6 +145,97 @@ class PoolRuntimeState(str, enum.Enum):
     def success_states(cls) -> frozenset[PoolRuntimeState]:
         return frozenset({cls.COMPLETED, cls.CLEANED_UP, cls.RELEASED})
 
+    @classmethod
+    def busy_leak_states(cls) -> frozenset[PoolRuntimeState]:
+        """Terminal states where a pool member with no active assignment is a leak."""
+        return frozenset({cls.COMPLETED, cls.BLOCKED, cls.FAILED, cls.QUARANTINED})
+
+
+# ---------------------------------------------------------------------------
+# Diagnostic taxonomy for packet-auditor / worker-pool operational failures
+# ---------------------------------------------------------------------------
+
+CANONICAL_FAILURE_CATEGORIES: dict[str, str] = {
+    "membership_not_active": (
+        "Worker's target channel membership is not active. Restore membership "
+        "in the target lane or re-provision with active wake policy."
+    ),
+    "wake_route_404": (
+        "Wake bridge route returned 404. The endpoint or delivery path may be "
+        "missing, or the target channel/member is not in a wakeable state."
+    ),
+    "auth_unhealthy": (
+        "Profile auth/provider health check failed. The worker's OAuth token or "
+        "API key may be expired, or the model provider is unreachable."
+    ),
+    "post_terminal_pool_state_leak": (
+        "Pool member is in a terminal state but has no active Core assignment. "
+        "The member should be released back to available or quarantined."
+    ),
+}
+
+
+@dataclass(frozen=True)
+class PostTerminalBusyLeak:
+    """Evidence that a pool member is stuck busy without an active assignment."""
+
+    member_id: str
+    state: str
+    role: str | None = None
+    assignment_id: str | None = None
+    active_assignment_count: int = 0
+
+    @property
+    def category(self) -> str:
+        return "post_terminal_pool_state_leak"
+
+    def __str__(self) -> str:
+        return (
+            f"PostTerminalBusyLeak(member={self.member_id}, state={self.state}, "
+            f"role={self.role}, assignment={self.assignment_id}, "
+            f"active_assignments={self.active_assignment_count})"
+        )
+
+
+@dataclass(frozen=True)
+class PoolMemberDiagnostic:
+    """Structured diagnostic for a worker-pool operational failure.
+
+    Categories are drawn from CANONICAL_FAILURE_CATEGORIES.
+    """
+
+    category: str
+    member_id: str
+    evidence: Mapping[str, Any] = field(default_factory=dict)
+    recovery: str = ""
+    severity: str = "critical"
+
+    def __post_init__(self) -> None:
+        if self.category not in CANONICAL_FAILURE_CATEGORIES:
+            raise ValueError(
+                f"Unknown failure category: {self.category!r}. "
+                f"Known: {', '.join(sorted(CANONICAL_FAILURE_CATEGORIES))}"
+            )
+
+    @staticmethod
+    def canonical_failure_categories() -> dict[str, str]:
+        return dict(CANONICAL_FAILURE_CATEGORIES)
+
+    def summary(self) -> str:
+        desc = CANONICAL_FAILURE_CATEGORIES.get(self.category, self.category)
+        parts = [
+            f"[{self.category}] {self.member_id}",
+            f"  Description: {desc}",
+        ]
+        if self.evidence:
+            parts.append(f"  Evidence: {self.evidence}")
+        if self.recovery:
+            parts.append(f"  Recovery: {self.recovery}")
+        return "\n".join(parts)
+
+    def __str__(self) -> str:
+        return self.summary()
+
 
 # ---------------------------------------------------------------------------
 # Exceptions
@@ -933,6 +1024,28 @@ class PoolWorkerRuntime:
         return self.state in PoolRuntimeState.terminal_states() and \
             self.cleanup_evidence is None
 
+    def detect_post_terminal_busy(
+        self, *, active_assignment_count: int
+    ) -> PostTerminalBusyLeak | None:
+        """Detect post-terminal pool-state leaks.
+
+        A pool member in a terminal busy-leak state (COMPLETED, BLOCKED,
+        FAILED, QUARANTINED) with zero active Core assignments is a leak.
+        Members in RELEASED or CLEANED_UP are expected to have no active
+        assignments and are not flagged.
+        """
+        if self.state not in PoolRuntimeState.busy_leak_states():
+            return None
+        if active_assignment_count > 0:
+            return None
+        return PostTerminalBusyLeak(
+            member_id=self.worker_id,
+            state=self.state.value,
+            role=self.assignment.role,
+            assignment_id=self.assignment.assignment_id,
+            active_assignment_count=active_assignment_count,
+        )
+
     def status_summary(self) -> str:
         if self.completion:
             return (
@@ -981,6 +1094,12 @@ class PoolWorkerProfileGuide:
         "blocked_needs_input",
     )
     cleanup_policy: str = "full"  # "full" | "minimal" | "manual"
+    requires_channel_membership: bool = False
+    target_channel_id: int | None = None
+
+    def needs_membership_preflight(self) -> bool:
+        """True if this role requires an active Channels membership preflight."""
+        return self.requires_channel_membership and self.target_channel_id is not None
 
     def validate(self) -> None:
         errors: list[str] = []
@@ -999,6 +1118,10 @@ class PoolWorkerProfileGuide:
             errors.append(
                 f"cleanup_policy must be 'full', 'minimal', or 'manual'; "
                 f"got {self.cleanup_policy!r}"
+            )
+        if self.requires_channel_membership and self.target_channel_id is None:
+            errors.append(
+                "requires_channel_membership is True but target_channel_id is not set"
             )
         if errors:
             raise PoolRuntimeError(

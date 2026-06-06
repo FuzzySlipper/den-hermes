@@ -963,6 +963,210 @@ class TestPoolWorkerProfileGuide:
 
 
 # ---------------------------------------------------------------------------
+# Diagnostic taxonomy, post-terminal busy detection, membership preflight
+# ---------------------------------------------------------------------------
+
+from den_hermes.pool_runtime import PoolMemberDiagnostic, PostTerminalBusyLeak  # noqa: E402
+
+
+class TestDiagnosticTaxonomy:
+
+    def test_canonical_failure_categories_recognized(self):
+        """All canonical categories are defined and have non-empty descriptions."""
+        canon = PoolMemberDiagnostic.canonical_failure_categories()
+        assert "membership_not_active" in canon
+        assert "wake_route_404" in canon
+        assert "auth_unhealthy" in canon
+        assert "post_terminal_pool_state_leak" in canon
+        assert len(canon) >= 4
+        for category, description in canon.items():
+            assert isinstance(category, str) and category
+            assert isinstance(description, str) and description
+
+    def test_create_diagnostic_with_known_category(self):
+        diag = PoolMemberDiagnostic(
+            category="membership_not_active",
+            member_id="pool-packet-auditor-03",
+            evidence={"channel_id": 672, "membership_status": "inactive"},
+            recovery="Restore active membership for spawned-packet-auditor in #den-system",
+        )
+        assert diag.category == "membership_not_active"
+        assert diag.severity == "critical"
+        assert "pool-packet-auditor-03" in str(diag)
+
+    def test_create_diagnostic_with_auth_category(self):
+        diag = PoolMemberDiagnostic(
+            category="auth_unhealthy",
+            member_id="pool-packet-auditor-03",
+            evidence={"auth_status": "expired", "provider": "openai"},
+            recovery="Refresh OAuth token or rotate API key",
+        )
+        assert diag.category == "auth_unhealthy"
+        assert diag.severity == "critical"
+
+    def test_unknown_category_raises(self):
+        with pytest.raises(ValueError, match="Unknown failure category"):
+            PoolMemberDiagnostic(
+                category="bogus_reason",
+                member_id="worker-1",
+                evidence={},
+                recovery="fix it",
+            )
+
+    def test_diagnostic_summary_includes_all_fields(self):
+        diag = PoolMemberDiagnostic(
+            category="wake_route_404",
+            member_id="pool-packet-auditor-03",
+            evidence={"route": "/api/direct-agent-events"},
+            recovery="Check channel membership",
+        )
+        text = diag.summary()
+        assert "wake_route_404" in text
+        assert "pool-packet-auditor-03" in text
+        assert "Check channel membership" in text
+
+
+class TestPostTerminalBusyDetection:
+
+    def test_completed_no_active_assignment_detected_as_leak(self):
+        """A runtime in COMPLETED with no active assignment is a post-terminal leak."""
+        assignment = AssignmentPointer(
+            assignment_id="assign-001",
+            task_id=2071,
+            run_id="piw_test",
+            role="packet_auditor",
+            project_id="den-core",
+        )
+        runtime = PoolWorkerRuntime(assignment=assignment, worker_id="pool-packet-auditor-03",
+                                    state=PoolRuntimeState.COMPLETED)
+        leak = runtime.detect_post_terminal_busy(active_assignment_count=0)
+        assert leak is not None
+        assert leak.member_id == "pool-packet-auditor-03"
+        assert leak.category == "post_terminal_pool_state_leak"
+        assert "pool-packet-auditor-03" in str(leak)
+        assert "completed" in str(leak)
+        assert "active_assignments=0" in str(leak)
+
+    def test_completed_with_active_assignment_no_leak(self):
+        """A runtime in COMPLETED but with an active assignment is fine."""
+        assignment = AssignmentPointer(
+            assignment_id="assign-001",
+            task_id=2071,
+            run_id="piw_test",
+            role="packet_auditor",
+        )
+        runtime = PoolWorkerRuntime(assignment=assignment, worker_id="pool-packet-auditor-03",
+                                    state=PoolRuntimeState.COMPLETED)
+        leak = runtime.detect_post_terminal_busy(active_assignment_count=1)
+        assert leak is None
+
+    def test_non_terminal_state_not_a_leak(self):
+        """A non-terminal state should never be flagged as a leak."""
+        assignment = AssignmentPointer(
+            assignment_id="assign-001",
+            task_id=2071,
+            run_id="piw_test",
+            role="packet_auditor",
+        )
+        runtime = PoolWorkerRuntime(assignment=assignment, worker_id="pool-packet-auditor-03",
+                                    state=PoolRuntimeState.IMPLEMENTING)
+        leak = runtime.detect_post_terminal_busy(active_assignment_count=0)
+        assert leak is None
+
+    def test_failed_state_without_active_assignment_leak(self):
+        """FAILED with no active assignment should be detected as leak."""
+        assignment = AssignmentPointer(
+            assignment_id="assign-001",
+            task_id=2071,
+            run_id="piw_test",
+            role="packet_auditor",
+        )
+        runtime = PoolWorkerRuntime(assignment=assignment, worker_id="pool-packet-auditor-03",
+                                    state=PoolRuntimeState.FAILED)
+        leak = runtime.detect_post_terminal_busy(active_assignment_count=0)
+        assert leak is not None
+        assert leak.category == "post_terminal_pool_state_leak"
+
+    def test_released_state_no_active_assignment_not_leak(self):
+        """RELEASED with no active assignments is normal — not a leak."""
+        assignment = AssignmentPointer(
+            assignment_id="assign-001",
+            task_id=2071,
+            run_id="piw_test",
+            role="packet_auditor",
+        )
+        runtime = PoolWorkerRuntime(assignment=assignment, worker_id="pool-packet-auditor-03",
+                                    state=PoolRuntimeState.RELEASED)
+        leak = runtime.detect_post_terminal_busy(active_assignment_count=0)
+        assert leak is None
+
+
+class TestProfileGuideMembershipPreflight:
+
+    def test_packet_auditor_requires_channel_membership(self):
+        guide = PoolWorkerProfileGuide(
+            role="packet_auditor",
+            runtime_id="r1",
+            profile="spawned-packet-auditor",
+            provider="openai",
+            model="gpt-5",
+            requires_channel_membership=True,
+            target_channel_id=672,
+        )
+        assert guide.requires_channel_membership is True
+        assert guide.target_channel_id == 672
+
+    def test_coder_does_not_require_membership_by_default(self):
+        guide = PoolWorkerProfileGuide(
+            role="coder",
+            runtime_id="r1",
+            profile="spawned-coder",
+            provider="openai",
+            model="gpt-5",
+        )
+        assert guide.requires_channel_membership is False
+        assert guide.target_channel_id is None
+
+    def test_membership_preflight_packet_auditor(self):
+        """packet_auditor with target_channel_id set requires membership check."""
+        guide = PoolWorkerProfileGuide(
+            role="packet_auditor",
+            runtime_id="r1",
+            profile="spawned-packet-auditor",
+            provider="openai",
+            model="gpt-5",
+            requires_channel_membership=True,
+            target_channel_id=672,
+        )
+        assert guide.needs_membership_preflight() is True
+
+    def test_membership_preflight_coder_default(self):
+        """coder with default settings does not need membership preflight."""
+        guide = PoolWorkerProfileGuide(
+            role="coder",
+            runtime_id="r1",
+            profile="spawned-coder",
+            provider="openai",
+            model="gpt-5",
+        )
+        assert guide.needs_membership_preflight() is False
+
+    def test_validate_requires_membership_without_channel_rejected(self):
+        """requires_channel_membership=True without target_channel_id is invalid."""
+        with pytest.raises(PoolRuntimeError, match="requires.*channel_membership"):
+            guide = PoolWorkerProfileGuide(
+                role="packet_auditor",
+                runtime_id="r1",
+                profile="spawned-packet-auditor",
+                provider="openai",
+                model="gpt-5",
+                requires_channel_membership=True,
+                target_channel_id=None,
+            )
+            guide.validate()
+
+
+# ---------------------------------------------------------------------------
 # Helper functions to reach specific states
 # ---------------------------------------------------------------------------
 
