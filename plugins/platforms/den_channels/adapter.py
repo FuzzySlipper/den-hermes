@@ -1772,7 +1772,10 @@ _DIRECT_AGENT_MESSAGE_PARAMETERS = {
         },
         "member_identity": {
             "type": "string",
-            "description": "Target agent identity. Required — no broadcast. Must be an active Channels member.",
+            "description": (
+                "Logical active Channels member identity to wake, e.g. spawned-reviewer. "
+                "Do not pass a concrete pool member id here unless that exact id is an active membership."
+            ),
         },
         "body": {
             "type": "string",
@@ -1781,6 +1784,38 @@ _DIRECT_AGENT_MESSAGE_PARAMETERS = {
         "sender_identity": {
             "type": "string",
             "description": "Sending agent identity. Defaults to the active agent identity.",
+        },
+        "source_project_id": {
+            "type": "string",
+            "description": "Optional source project for work/wake attribution.",
+        },
+        "target_task_id": {
+            "type": "integer",
+            "description": "Optional Den task id for the target work item.",
+        },
+        "assignment_id": {
+            "type": "string",
+            "description": "Optional concrete Den worker assignment id for wake correlation.",
+        },
+        "worker_run_id": {
+            "type": "string",
+            "description": "Optional Den worker run id for wake correlation.",
+        },
+        "worker_role": {
+            "type": "string",
+            "description": "Optional worker role, e.g. coder or reviewer.",
+        },
+        "profile_identity": {
+            "type": "string",
+            "description": "Optional logical worker profile identity, e.g. spawned-reviewer.",
+        },
+        "pool_member_id": {
+            "type": "string",
+            "description": "Optional concrete pool member selector, e.g. pool-reviewer-03.",
+        },
+        "agent_instance_id": {
+            "type": "string",
+            "description": "Optional concrete agent instance selector for the selected pool member.",
         },
     },
     "required": ["member_identity", "body"],
@@ -1855,9 +1890,40 @@ async def _handle_direct_agent_message(args: dict[str, Any] | None = None, **kwa
     member_identity = merged_args.get("member_identity")
     body = merged_args.get("body")
     sender_identity = merged_args.get("sender_identity")
-    source_project_id = merged_args.get("source_project_id")
-    target_task_id = merged_args.get("target_task_id")
-    assignment_id = merged_args.get("assignment_id")
+    activity_context = _activity_context()
+    source_project_id = merged_args.get("source_project_id") or merged_args.get("sourceProjectId")
+    target_task_id = merged_args.get("target_task_id") or merged_args.get("targetTaskId")
+    assignment_id = merged_args.get("assignment_id") or merged_args.get("assignmentId")
+    worker_run_id = (
+        merged_args.get("worker_run_id")
+        or merged_args.get("workerRunId")
+        or activity_context.get("workerRunId")
+        or activity_context.get("worker_run_id")
+    )
+    worker_role = (
+        merged_args.get("worker_role")
+        or merged_args.get("workerRole")
+        or activity_context.get("workerRole")
+        or activity_context.get("worker_role")
+    )
+    pool_member_id = (
+        merged_args.get("pool_member_id")
+        or merged_args.get("poolMemberId")
+        or activity_context.get("poolMemberId")
+        or activity_context.get("pool_member_id")
+    )
+    profile_identity = (
+        merged_args.get("profile_identity")
+        or merged_args.get("profileIdentity")
+        or activity_context.get("profileIdentity")
+        or activity_context.get("profile_identity")
+    )
+    agent_instance_id = (
+        merged_args.get("agent_instance_id")
+        or merged_args.get("agentInstanceId")
+        or activity_context.get("agentInstanceId")
+        or activity_context.get("agent_instance_id")
+    )
 
     if not member_identity:
         return json.dumps({"status": "error", "error": "member_identity is required"})
@@ -1909,12 +1975,9 @@ async def _handle_direct_agent_message(args: dict[str, Any] | None = None, **kwa
     if assignment_id is not None:
         payload["assignmentId"] = str(assignment_id).strip()
 
-    # Include pool-member metadata from activity context so Channels
-    # can correlate the wake to the correct concrete worker.
-    worker_run_id = activity_context.get("workerRunId") or activity_context.get("worker_run_id")
-    worker_role = activity_context.get("workerRole") or activity_context.get("worker_role")
-    pool_member_id = activity_context.get("poolMemberId") or activity_context.get("pool_member_id")
-    profile_identity = activity_context.get("profileIdentity") or activity_context.get("profile_identity")
+    # Include selector metadata from explicit tool args first, then activity
+    # context fallback, so wakes can target a logical Channels member while
+    # still correlating to a concrete pool lane.
     if worker_run_id:
         payload["workerRunId"] = str(worker_run_id)
     if worker_role:
@@ -1923,6 +1986,8 @@ async def _handle_direct_agent_message(args: dict[str, Any] | None = None, **kwa
         payload["poolMemberId"] = str(pool_member_id)
     if profile_identity:
         payload["profileIdentity"] = str(profile_identity)
+    if agent_instance_id:
+        payload["agentInstanceId"] = str(agent_instance_id)
 
     endpoint_path = "/api/direct-agent-events"
     endpoint = join_api_url(base_url, endpoint_path)

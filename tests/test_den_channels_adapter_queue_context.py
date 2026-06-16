@@ -1502,6 +1502,90 @@ def test_direct_agent_message_handler_accepts_registry_args_dict(monkeypatch: py
     }
 
 
+def test_direct_agent_message_handler_forwards_explicit_worker_selectors(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Worker/reviewer wakes must use logical member identity plus concrete selectors."""
+    monkeypatch.delenv("DEN_CHANNELS_URL", raising=False)
+    monkeypatch.delenv("DEN_GATEWAY_URL", raising=False)
+    monkeypatch.delenv("DEN_GATEWAY_TOKEN", raising=False)
+    monkeypatch.delenv("DEN_CHANNELS_TOKEN", raising=False)
+    _adapter_module._DIRECT_AGENT_CONFIG_DEFAULTS.clear()
+    _adapter_module._remember_direct_agent_config(
+        channels_url="http://channels.test",
+        agent_identity="pi-crew-runner",
+    )
+
+    captured: dict[str, Any] = {}
+
+    class FakeResponse:
+        content = b"{}"
+
+        def raise_for_status(self) -> None:
+            pass
+
+        def json(self) -> dict[str, Any]:
+            return {"status": "recorded", "messageId": 789}
+
+    class FakeAsyncClient:
+        def __init__(self, *, timeout: float) -> None:
+            pass
+
+        async def __aenter__(self) -> "FakeAsyncClient":
+            return self
+
+        async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+            return None
+
+        async def post(self, url: str, *, json: dict[str, Any], headers: dict[str, str]) -> FakeResponse:
+            captured["url"] = url
+            captured["json"] = json
+            return FakeResponse()
+
+    import httpx
+
+    monkeypatch.setattr(httpx, "AsyncClient", FakeAsyncClient)
+
+    result = asyncio.run(_adapter_module._handle_direct_agent_message({
+        "channel_id": 604,
+        "member_identity": "spawned-reviewer",
+        "body": "review task 2528",
+        "target_task_id": 2528,
+        "assignment_id": "1375",
+        "worker_run_id": "piw-review-1375",
+        "worker_role": "reviewer",
+        "profile_identity": "spawned-reviewer",
+        "pool_member_id": "pool-reviewer-03",
+        "agent_instance_id": "hermes:den-k8:spawned-reviewer:pool-reviewer-03:live",
+    }))
+    parsed = json.loads(result)
+
+    assert parsed["status"] == "ok"
+    assert captured["url"] == "http://channels.test/api/direct-agent-events"
+    assert captured["json"] == {
+        "channelId": 604,
+        "memberIdentity": "spawned-reviewer",
+        "senderIdentity": "pi-crew-runner",
+        "body": "review task 2528",
+        "targetTaskId": 2528,
+        "assignmentId": "1375",
+        "workerRunId": "piw-review-1375",
+        "workerRole": "reviewer",
+        "profileIdentity": "spawned-reviewer",
+        "poolMemberId": "pool-reviewer-03",
+        "agentInstanceId": "hermes:den-k8:spawned-reviewer:pool-reviewer-03:live",
+    }
+
+
+def test_direct_agent_message_tool_schema_exposes_worker_selector_fields() -> None:
+    """The tool schema must let agents pass concrete selectors without abusing member_identity."""
+    properties = _adapter_module._DIRECT_AGENT_MESSAGE_SCHEMA["parameters"]["properties"]
+
+    assert properties["member_identity"]["description"].startswith("Logical active Channels member identity")
+    assert "pool_member_id" in properties
+    assert "agent_instance_id" in properties
+    assert "worker_run_id" in properties
+    assert "profile_identity" in properties
+
+
 @pytest.mark.asyncio
 async def test_same_channel_different_senders_share_session_key() -> None:
     """Different senders in the same Den Channels lane must share a session key.
