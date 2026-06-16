@@ -129,6 +129,43 @@ def _coerce_int_list(value: Any) -> list[int]:
     return result
 
 
+
+
+def _coerce_int_mapping(value: Any) -> dict[int, int]:
+    """Parse a config mapping of channel id -> initial after id cursors."""
+    if value is None or value == "":
+        return {}
+    raw: dict[Any, Any] = {}
+    if isinstance(value, dict):
+        raw = value
+    elif isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return {}
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, dict):
+                raw = parsed
+            else:
+                return {}
+        except Exception:
+            for part in text.replace(";", ",").split(","):
+                if ":" not in part:
+                    continue
+                key, item = part.split(":", 1)
+                raw[key.strip()] = item.strip()
+    else:
+        return {}
+
+    result: dict[int, int] = {}
+    for key, item in raw.items():
+        channel_id = _coerce_int(key)
+        after_id = _coerce_int(item)
+        if channel_id is None or channel_id <= 0 or after_id is None or after_id < 0:
+            continue
+        result[channel_id] = after_id
+    return result
+
 def _redact(value: Any) -> Any:
     """Recursively redact secret-looking keys and placeholder secret values."""
     if isinstance(value, dict):
@@ -654,10 +691,15 @@ class DenGatewayClient:
 class _DirectAgentEventPoller:
     """Cursor-tracked poller for direct-agent wake events from Den Channels."""
 
-    def __init__(self, channels_client: "DenChannelsClient", agent_identity: str):
+    def __init__(
+        self,
+        channels_client: "DenChannelsClient",
+        agent_identity: str,
+        initial_after_ids: dict[int, int] | None = None,
+    ):
         self._channels_client = channels_client
         self._agent_identity = agent_identity
-        self._cursor_by_channel: dict[int, int] = {}
+        self._cursor_by_channel: dict[int, int] = dict(initial_after_ids or {})
 
     async def poll(self, channel_id: int, limit: int = 10) -> list[dict[str, Any]]:
         after_id = self._cursor_by_channel.get(channel_id, 0)
@@ -723,6 +765,24 @@ class DenChannelsClient:
             "GET",
             f"/api/direct-agent-events?channelId={channel_id}&afterId={after_id}&limit={limit}",
         )
+
+    async def get_channel_memberships(
+        self,
+        *,
+        member_identity: str,
+        include_left: bool = False,
+        include_ordinary_memberships: bool = True,
+        limit: int = 200,
+    ) -> dict[str, Any]:
+        from urllib.parse import urlencode
+
+        query = urlencode({
+            "memberIdentity": member_identity,
+            "includeLeft": str(include_left).lower(),
+            "includeOrdinaryMemberships": str(include_ordinary_memberships).lower(),
+            "limit": limit,
+        })
+        return await self._request("GET", f"/api/channel-memberships?{query}")
 
     async def get_gateway_message(self, message_id: str | int) -> dict[str, Any]:
         return await self._request("GET", f"/api/gateway/messages/{message_id}")
@@ -801,6 +861,11 @@ class DenChannelsAdapter(BasePlatformAdapter):
             or os.getenv("DEN_CHANNELS_CHANNEL_IDS")
             or os.getenv("DEN_CHANNELS_CHANNEL_ID")
         )
+        self.poll_initial_after_ids = _coerce_int_mapping(
+            extra.get("poll_initial_after_ids")
+            or extra.get("poll_initial_after_id_by_channel")
+            or os.getenv("DEN_CHANNELS_POLL_INITIAL_AFTER_IDS")
+        )
         self._sleep = sleep or asyncio.sleep
         token = str(extra.get("token") or os.getenv("DEN_GATEWAY_TOKEN") or "").strip() or None
         channels_token = str(extra.get("channels_token") or os.getenv("DEN_CHANNELS_TOKEN") or token or "").strip() or None
@@ -817,7 +882,11 @@ class DenChannelsAdapter(BasePlatformAdapter):
         self.channels_client = channels_client or DenChannelsClient(self.channels_url, token=channels_token)
         self._claim_task: asyncio.Task | None = None
         self._event_task: asyncio.Task | None = None
-        self._event_poller = _DirectAgentEventPoller(self.channels_client, self.agent_identity)
+        self._event_poller = _DirectAgentEventPoller(
+            self.channels_client,
+            self.agent_identity,
+            self.poll_initial_after_ids,
+        )
         self._polled_channels: set[int] = set()
         self._last_channel_discovery = 0.0
         self._channel_discovery_interval = float(extra.get("channel_discovery_interval_seconds") or 30.0)
@@ -1361,10 +1430,7 @@ class DenChannelsAdapter(BasePlatformAdapter):
 
         if not self.channels_url or not self.agent_identity:
             return []
-        if self.poll_channel_ids:
-            for channel_id in self.poll_channel_ids:
-                self._polled_channels.add(channel_id)
-            return list(self.poll_channel_ids)
+        static_channels = set(self.poll_channel_ids)
         now = _time.time()
         if self._polled_channels and now - self._last_channel_discovery < self._channel_discovery_interval:
             return sorted(self._polled_channels)
@@ -1378,11 +1444,17 @@ class DenChannelsAdapter(BasePlatformAdapter):
             headers["Authorization"] = f"Bearer {channels_token}"
 
         discovered_channels: set[int] = set()
+        member_discovery_succeeded = False
 
         async def _check_memberships(query: dict[str, Any]) -> None:
             from urllib.parse import urlencode
 
-            scoped = {"memberIdentity": self.agent_identity, "includeLeft": "false", "limit": "200"}
+            scoped = {
+                "memberIdentity": self.agent_identity,
+                "includeLeft": "false",
+                "includeOrdinaryMemberships": "true",
+                "limit": "200",
+            }
             scoped.update(query)
             async with httpx.AsyncClient(timeout=10.0) as client:
                 response = await client.get(
@@ -1403,13 +1475,26 @@ class DenChannelsAdapter(BasePlatformAdapter):
             response_body: dict[str, Any] = {}
             getter = getattr(self.channels_client, "get_channel_memberships", None)
             if callable(getter):
-                result = getter(member_identity=self.agent_identity, include_left=False, limit=200)
+                try:
+                    result = getter(
+                        member_identity=self.agent_identity,
+                        include_left=False,
+                        include_ordinary_memberships=True,
+                        limit=200,
+                    )
+                except TypeError:
+                    result = getter(member_identity=self.agent_identity, include_left=False, limit=200)
                 maybe_body = await result if inspect.isawaitable(result) else result
                 response_body = maybe_body if isinstance(maybe_body, dict) else {}
             else:
                 from urllib.parse import urlencode
 
-                query = urlencode({"memberIdentity": self.agent_identity, "includeLeft": "false", "limit": "200"})
+                query = urlencode({
+                    "memberIdentity": self.agent_identity,
+                    "includeLeft": "false",
+                    "includeOrdinaryMemberships": "true",
+                    "limit": "200",
+                })
                 async with httpx.AsyncClient(timeout=10.0) as client:
                     response = await client.get(f"{self.channels_url}/api/channel-memberships?{query}", headers=headers)
                     if response.status_code != 200:
@@ -1425,17 +1510,25 @@ class DenChannelsAdapter(BasePlatformAdapter):
 
         try:
             await _discover_member_channels()
+            member_discovery_succeeded = True
         except Exception:
             logger.debug("[DenChannels] member channel discovery failed", exc_info=True)
-        if discovered_channels:
-            self._polled_channels = set(discovered_channels)
-            logger.info("[DenChannels] poll channels discovered from member memberships: %s", sorted(self._polled_channels))
+        if discovered_channels or static_channels:
+            self._polled_channels = set(discovered_channels) | static_channels
+            logger.info(
+                "[DenChannels] poll channels resolved from static config/memberships: %s",
+                sorted(self._polled_channels),
+            )
             return sorted(self._polled_channels)
 
         # Den system/direct-agent channels are common control channels; project_id can
         # discover a project default channel when configured. Worker profiles should
         # prefer explicit poll_channel_ids/channel_ids so #worker-pool (or another
         # neutral control channel) is not confused with a project waystation.
+        if member_discovery_succeeded:
+            self._polled_channels = set(static_channels)
+            return sorted(self._polled_channels)
+
         for cid in (672,):
             try:
                 await _check_memberships({"channelId": cid})
@@ -1446,8 +1539,8 @@ class DenChannelsAdapter(BasePlatformAdapter):
                 await _check_memberships({"projectId": self.project_id})
             except Exception:
                 logger.debug("[DenChannels] project channel discovery failed", exc_info=True)
-        if discovered_channels:
-            self._polled_channels = set(discovered_channels)
+        self._polled_channels = set(discovered_channels) | static_channels
+        if self._polled_channels:
             logger.info("[DenChannels] poll channels discovered: %s", sorted(self._polled_channels))
         return sorted(self._polled_channels)
 

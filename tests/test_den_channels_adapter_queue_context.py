@@ -79,8 +79,20 @@ class FakeChannelsClient:
         self.event_requests.append((channel_id, after_id, limit))
         return dict(self.events_by_channel.get(channel_id, {"items": [], "nextAfterId": after_id}))
 
-    async def get_channel_memberships(self, *, member_identity: str, include_left: bool = False, limit: int = 200) -> dict[str, Any]:
-        self.membership_requests.append({"member_identity": member_identity, "include_left": include_left, "limit": limit})
+    async def get_channel_memberships(
+        self,
+        *,
+        member_identity: str,
+        include_left: bool = False,
+        include_ordinary_memberships: bool = False,
+        limit: int = 200,
+    ) -> dict[str, Any]:
+        self.membership_requests.append({
+            "member_identity": member_identity,
+            "include_left": include_left,
+            "include_ordinary_memberships": include_ordinary_memberships,
+            "limit": limit,
+        })
         return dict(self.membership_discovery)
 
     async def get_gateway_message(self, message_id: str | int) -> dict[str, Any]:
@@ -233,7 +245,7 @@ async def test_direct_agent_event_poller_filters_target_and_advances_cursor() ->
 
 
 @pytest.mark.asyncio
-async def test_configured_poll_channel_ids_are_used_for_worker_pool_control() -> None:
+async def test_configured_poll_channel_ids_are_used_with_membership_discovery() -> None:
     gateway = FakeGatewayClient()
     channels = FakeChannelsClient()
     adapter = DenChannelsAdapter(
@@ -261,7 +273,12 @@ async def test_configured_poll_channel_ids_are_used_for_worker_pool_control() ->
 
     assert first == [604, 672]
     assert second == [604, 672]
-    assert channels.membership_requests == []
+    assert channels.membership_requests == [{
+        "member_identity": "spawned-coder",
+        "include_left": False,
+        "include_ordinary_memberships": True,
+        "limit": 200,
+    }]
 
 
 @pytest.mark.asyncio
@@ -301,7 +318,12 @@ async def test_member_identity_membership_discovery_finds_worker_pool_and_target
 
     assert first == [1, 604]
     assert second == [1, 604]
-    assert channels.membership_requests == [{"member_identity": "spawned-coder", "include_left": False, "limit": 200}]
+    assert channels.membership_requests == [{
+        "member_identity": "spawned-coder",
+        "include_left": False,
+        "include_ordinary_memberships": True,
+        "limit": 200,
+    }]
 
 
 @pytest.mark.asyncio
@@ -348,9 +370,125 @@ async def test_member_identity_membership_discovery_refreshes_after_interval() -
     assert first == [604]
     assert second == [1, 604]
     assert channels.membership_requests == [
-        {"member_identity": "spawned-reviewer", "include_left": False, "limit": 200},
-        {"member_identity": "spawned-reviewer", "include_left": False, "limit": 200},
+        {
+            "member_identity": "spawned-reviewer",
+            "include_left": False,
+            "include_ordinary_memberships": True,
+            "limit": 200,
+        },
+        {
+            "member_identity": "spawned-reviewer",
+            "include_left": False,
+            "include_ordinary_memberships": True,
+            "limit": 200,
+        },
     ]
+
+
+
+
+@pytest.mark.asyncio
+async def test_poll_scope_hybrids_static_ids_with_runtime_membership_discovery() -> None:
+    gateway = FakeGatewayClient()
+    channels = FakeChannelsClient()
+    channels.membership_discovery = {
+        "memberIdentity": "den-mcp-runner",
+        "memberships": [
+            {"channelId": 697, "channelSlug": "project-den-memory", "membershipStatus": "active", "membershipPurpose": None},
+            {"channelId": 698, "channelSlug": "old-project", "membershipStatus": "left", "membershipPurpose": None},
+        ],
+    }
+    adapter = DenChannelsAdapter(
+        PlatformConfig(
+            enabled=True,
+            token="***",
+            extra={
+                "channels_url": "http://192.168.1.10:18081",
+                "project_id": "",
+                "agent_identity": "den-mcp-runner",
+                "role": "runner",
+                "profile": "den-mcp-runner",
+                "adapter_instance_id": "test-host:den-mcp-runner:runner:gateway",
+                "poll_channel_ids": [672],
+                "start_claim_loop": False,
+                "start_poll_loop": False,
+            },
+        ),
+        gateway_client=gateway,
+        channels_client=channels,
+    )
+
+    channels_to_poll = await adapter._resolve_poll_channels()
+
+    assert channels_to_poll == [672, 697]
+    assert channels.membership_requests == [{
+        "member_identity": "den-mcp-runner",
+        "include_left": False,
+        "include_ordinary_memberships": True,
+        "limit": 200,
+    }]
+
+
+
+
+@pytest.mark.asyncio
+async def test_membership_discovery_clears_removed_dynamic_channels_after_refresh() -> None:
+    gateway = FakeGatewayClient()
+    channels = FakeChannelsClient()
+    channels.membership_discovery = {
+        "memberIdentity": "den-mcp-runner",
+        "memberships": [
+            {"channelId": 697, "channelSlug": "project-den-memory", "membershipStatus": "active", "membershipPurpose": None},
+        ],
+    }
+    adapter = DenChannelsAdapter(
+        PlatformConfig(
+            enabled=True,
+            token="***",
+            extra={
+                "channels_url": "http://192.168.1.10:18081",
+                "project_id": "",
+                "agent_identity": "den-mcp-runner",
+                "role": "runner",
+                "profile": "den-mcp-runner",
+                "adapter_instance_id": "test-host:den-mcp-runner:runner:gateway",
+                "channel_discovery_interval_seconds": 30,
+                "start_claim_loop": False,
+                "start_poll_loop": False,
+            },
+        ),
+        gateway_client=gateway,
+        channels_client=channels,
+    )
+
+    first = await adapter._resolve_poll_channels()
+    adapter._last_channel_discovery -= adapter._channel_discovery_interval + 1
+    channels.membership_discovery = {"memberIdentity": "den-mcp-runner", "memberships": []}
+    second = await adapter._resolve_poll_channels()
+
+    assert first == [697]
+    assert second == []
+
+@pytest.mark.asyncio
+async def test_poll_initial_after_ids_seed_direct_event_cursors() -> None:
+    channels = FakeChannelsClient()
+    channels.events_by_channel[697] = {
+        "items": [
+            {"id": 5411, "channelId": 697, "sourceId": "direct-agent-message:697:den-mcp-runner:old", "body": "old"},
+            {"id": 5412, "channelId": 697, "sourceId": "direct-agent-message:697:den-mcp-runner:new", "body": "new"},
+        ],
+        "nextAfterId": 5412,
+    }
+    poller = _adapter_module._DirectAgentEventPoller(
+        channels,
+        "den-mcp-runner",
+        initial_after_ids={697: 5411},
+    )
+
+    events = await poller.poll(697, limit=10)
+
+    assert [event["id"] for event in events] == [5412]
+    assert channels.event_requests == [(697, 5411, 10)]
 
 
 @pytest.mark.asyncio
