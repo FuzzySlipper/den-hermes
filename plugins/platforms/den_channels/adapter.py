@@ -699,7 +699,67 @@ class _DirectAgentEventPoller:
     ):
         self._channels_client = channels_client
         self._agent_identity = agent_identity
-        self._cursor_by_channel: dict[int, int] = dict(initial_after_ids or {})
+        self._cursor_state_path = os.path.join(
+            os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes"),
+            "state",
+            "den_channels_event_cursors.json",
+        )
+        self._cursor_by_channel: dict[int, int] = self._load_cursors()
+        init_skipped: list[str] = []
+        for channel_id, after_id in dict(initial_after_ids or {}).items():
+            # Treat config as a floor, not as an override of a newer persisted cursor.
+            current = self._cursor_by_channel.get(channel_id, 0)
+            if after_id > current:
+                self._cursor_by_channel[channel_id] = after_id
+            elif after_id and after_id <= current:
+                init_skipped.append(f"ch{channel_id}:cfg={after_id} < persisted={current}")
+        self._save_cursors()
+        cursors_log = {str(k): v for k, v in sorted(self._cursor_by_channel.items())}
+        if cursors_log:
+            logger.info(
+                "[DenChannels] direct-agent event cursors initialized: %s",
+                json.dumps(cursors_log),
+            )
+        if init_skipped:
+            logger.info(
+                "[DenChannels] config initial_after_ids overridden by newer persisted cursors: %s",
+                "; ".join(init_skipped),
+            )
+
+    def _load_cursors(self) -> dict[int, int]:
+        try:
+            with open(self._cursor_state_path, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except FileNotFoundError:
+            return {}
+        except Exception:
+            logger.exception("[DenChannels] Failed to load direct-agent event cursor file")
+            return {}
+        cursors = payload.get("cursors") if isinstance(payload, dict) else None
+        if not isinstance(cursors, dict):
+            return {}
+        loaded: dict[int, int] = {}
+        for raw_channel_id, raw_after_id in cursors.items():
+            channel_id = _coerce_int(raw_channel_id)
+            after_id = _coerce_int(raw_after_id)
+            if channel_id is not None and after_id is not None:
+                loaded[channel_id] = after_id
+        return loaded
+
+    def _save_cursors(self) -> None:
+        try:
+            os.makedirs(os.path.dirname(self._cursor_state_path), exist_ok=True)
+            payload = {
+                "agentIdentity": self._agent_identity,
+                "cursors": {str(k): v for k, v in sorted(self._cursor_by_channel.items())},
+            }
+            tmp_path = f"{self._cursor_state_path}.tmp"
+            with open(tmp_path, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, indent=2, sort_keys=True)
+                handle.write("\n")
+            os.replace(tmp_path, self._cursor_state_path)
+        except Exception:
+            logger.exception("[DenChannels] Failed to save direct-agent event cursor file")
 
     async def poll(self, channel_id: int, limit: int = 10) -> list[dict[str, Any]]:
         after_id = self._cursor_by_channel.get(channel_id, 0)
@@ -708,21 +768,34 @@ class _DirectAgentEventPoller:
         )
         items = page.get("items") or page.get("eventItems") or []
         my_events: list[dict[str, Any]] = []
+        cursor_changed = False
+        skipped_stale = 0
         for event in items:
             event_id = _coerce_int(event.get("id") or event.get("eventId"))
             if event_id is None:
                 continue
             if event_id <= after_id:
+                skipped_stale += 1
                 continue
             if self._is_targeting_me(event):
                 my_events.append(event)
             if event_id > self._cursor_by_channel.get(channel_id, 0):
                 self._cursor_by_channel[channel_id] = event_id
+                cursor_changed = True
         next_after = _coerce_int(page.get("nextAfterId") or page.get("next_after_id"))
         if next_after is not None:
             current = self._cursor_by_channel.get(channel_id, 0)
             if next_after > current:
                 self._cursor_by_channel[channel_id] = next_after
+                cursor_changed = True
+        if cursor_changed:
+            self._save_cursors()
+        if skipped_stale or (items and not my_events):
+            logger.debug(
+                "[DenChannels] ch%d poll: cursor=%d, returned=%d, stale_skipped=%d, total=%d",
+                channel_id, self._cursor_by_channel.get(channel_id, 0),
+                len(my_events), skipped_stale, len(items),
+            )
         return my_events
 
     def _is_targeting_me(self, event: dict[str, Any]) -> bool:
@@ -1226,6 +1299,12 @@ class DenChannelsAdapter(BasePlatformAdapter):
         context = self._context_for_event(event)
         if context is not None:
             self._set_activity_environment(context)
+            logger.info(
+                "[DenChannels] processing delivery %d on ch%d session=%s",
+                context.delivery_request_id,
+                context.channel_id,
+                context.session_key,
+            )
 
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
         task = asyncio.current_task()

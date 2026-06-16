@@ -224,7 +224,7 @@ async def test_direct_agent_event_to_delivery_preserves_body_and_summary_evidenc
 
 
 @pytest.mark.asyncio
-async def test_direct_agent_event_poller_filters_target_and_advances_cursor() -> None:
+async def test_direct_agent_event_poller_filters_target_and_advances_cursor(tmp_path: Path) -> None:
     channels = FakeChannelsClient()
     channels.events_by_channel[672] = {
         "items": [
@@ -234,14 +234,22 @@ async def test_direct_agent_event_poller_filters_target_and_advances_cursor() ->
         ],
         "nextAfterId": 12,
     }
-    poller = _adapter_module._DirectAgentEventPoller(channels, "den-mcp-runner")
+    old_home = os.environ.get("HERMES_HOME")
+    os.environ["HERMES_HOME"] = str(tmp_path)
+    try:
+        poller = _adapter_module._DirectAgentEventPoller(channels, "den-mcp-runner")
 
-    first = await poller.poll(672, limit=10)
-    second = await poller.poll(672, limit=10)
+        first = await poller.poll(672, limit=10)
+        second = await poller.poll(672, limit=10)
 
-    assert [event["id"] for event in first] == [11, 12]
-    assert second == []
-    assert channels.event_requests == [(672, 0, 10), (672, 12, 10)]
+        assert [event["id"] for event in first] == [11, 12]
+        assert second == []
+        assert channels.event_requests == [(672, 0, 10), (672, 12, 10)]
+    finally:
+        if old_home is None:
+            os.environ.pop("HERMES_HOME", None)
+        else:
+            os.environ["HERMES_HOME"] = old_home
 
 
 @pytest.mark.asyncio
@@ -470,7 +478,7 @@ async def test_membership_discovery_clears_removed_dynamic_channels_after_refres
     assert second == []
 
 @pytest.mark.asyncio
-async def test_poll_initial_after_ids_seed_direct_event_cursors() -> None:
+async def test_poll_initial_after_ids_seed_direct_event_cursors(tmp_path: Path) -> None:
     channels = FakeChannelsClient()
     channels.events_by_channel[697] = {
         "items": [
@@ -479,16 +487,66 @@ async def test_poll_initial_after_ids_seed_direct_event_cursors() -> None:
         ],
         "nextAfterId": 5412,
     }
-    poller = _adapter_module._DirectAgentEventPoller(
-        channels,
-        "den-mcp-runner",
-        initial_after_ids={697: 5411},
-    )
+    old_home = os.environ.get("HERMES_HOME")
+    os.environ["HERMES_HOME"] = str(tmp_path)
+    try:
+        poller = _adapter_module._DirectAgentEventPoller(
+            channels,
+            "den-mcp-runner",
+            initial_after_ids={697: 5411},
+        )
 
-    events = await poller.poll(697, limit=10)
+        events = await poller.poll(697, limit=10)
 
-    assert [event["id"] for event in events] == [5412]
-    assert channels.event_requests == [(697, 5411, 10)]
+        assert [event["id"] for event in events] == [5412]
+        assert channels.event_requests == [(697, 5411, 10)]
+    finally:
+        if old_home is None:
+            os.environ.pop("HERMES_HOME", None)
+        else:
+            os.environ["HERMES_HOME"] = old_home
+
+
+@pytest.mark.asyncio
+async def test_direct_agent_event_poller_cursor_persists_across_restart(tmp_path: Path) -> None:
+    """Simulate gateway restart: cursor file survives, old events not replayed."""
+    import tempfile
+
+    hermes_home = str(tmp_path)
+    old_env = os.environ.get("HERMES_HOME")
+    os.environ["HERMES_HOME"] = hermes_home
+    try:
+        channels = FakeChannelsClient()
+        channels.events_by_channel[672] = {
+            "items": [
+                {"id": 10, "channelId": 672, "sourceId": "direct-agent-message:672:den-mcp-runner:a"},
+                {"id": 11, "channelId": 672, "sourceId": "direct-agent-message:672:den-mcp-runner:b"},
+                {"id": 12, "channelId": 672, "sourceId": "direct-agent-message:672:den-mcp-runner:c"},
+            ],
+            "nextAfterId": 12,
+        }
+
+        # First poller instance — processes events, advances cursor, persists.
+        poller1 = _adapter_module._DirectAgentEventPoller(channels, "den-mcp-runner")
+        first = await poller1.poll(672, limit=10)
+        assert [e["id"] for e in first] == [10, 11, 12]
+        assert channels.event_requests == [(672, 0, 10)]
+
+        # Second poller instance — simulates restart, loads persisted cursors.
+        poller2 = _adapter_module._DirectAgentEventPoller(channels, "den-mcp-runner")
+        second = await poller2.poll(672, limit=10)
+
+        # After restart, old events 10-12 should NOT be replayed.
+        assert second == []
+        assert channels.event_requests == [
+            (672, 0, 10),  # first poller start
+            (672, 12, 10),  # second poller start — cursor loaded from file
+        ]
+    finally:
+        if old_env is None:
+            os.environ.pop("HERMES_HOME", None)
+        else:
+            os.environ["HERMES_HOME"] = old_env
 
 
 @pytest.mark.asyncio
