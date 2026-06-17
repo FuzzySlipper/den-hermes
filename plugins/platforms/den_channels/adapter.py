@@ -689,16 +689,28 @@ class DenGatewayClient:
 
 
 class _DirectAgentEventPoller:
-    """Cursor-tracked poller for direct-agent wake events from Den Channels."""
+    """Cursor-tracked poller for direct-agent wake events from Den Channels.
+
+    Supports server-side cursor sync via subscription_ids (task #2554).
+    The subscription_id maps a channel to a concrete subscription row on the
+    server; after each poll the cursor is synced back so the server becomes
+    the authoritative cursor store.
+    """
 
     def __init__(
         self,
         channels_client: "DenChannelsClient",
         agent_identity: str,
         initial_after_ids: dict[int, int] | None = None,
+        *,
+        subscription_ids: dict[int, int] | None = None,
+        sync_cursors_to_server: bool = True,
     ):
         self._channels_client = channels_client
         self._agent_identity = agent_identity
+        # subscription_ids maps channel_id -> subscription_id for server-side cursor sync
+        self._subscription_ids: dict[int, int] = dict(subscription_ids or {})
+        self._sync_cursors_to_server = sync_cursors_to_server
         self._cursor_state_path = os.path.join(
             os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes"),
             "state",
@@ -790,6 +802,22 @@ class _DirectAgentEventPoller:
                 cursor_changed = True
         if cursor_changed:
             self._save_cursors()
+            if self._sync_cursors_to_server:
+                sub_id = self._subscription_ids.get(channel_id)
+                if sub_id is not None:
+                    try:
+                        import asyncio
+                        asyncio.ensure_future(
+                            self._channels_client.upsert_subscription_cursor(
+                                subscription_id=sub_id,
+                                last_seen_id=self._cursor_by_channel.get(channel_id, 0),
+                            )
+                        )
+                    except Exception:
+                        logger.debug(
+                            "[DenChannels] failed to sync cursor for ch%d sub%d",
+                            channel_id, sub_id,
+                        )
         if skipped_stale or (items and not my_events):
             logger.debug(
                 "[DenChannels] ch%d poll: cursor=%d, returned=%d, stale_skipped=%d, total=%d",
@@ -808,6 +836,48 @@ class _DirectAgentEventPoller:
             if len(parts) >= 3:
                 return parts[2] == self._agent_identity
         return False
+
+    def update_subscription_mapping(self, subscription_id: int, channel_id: int) -> None:
+        """Update the channel -> subscription_id mapping at runtime.
+        Called when channels are discovered via subscriptions."""
+        self._subscription_ids[channel_id] = subscription_id
+
+    def remove_subscription_mapping(self, channel_id: int) -> None:
+        """Remove a channel from the subscription mapping.
+        Called when a subscription is released."""
+        self._subscription_ids.pop(channel_id, None)
+
+    async def initialize_cursors_from_server(self) -> None:
+        """Fetch cursors from the server for all known subscription IDs.
+        Only advances cursors (never rewinds), consistent with the floor semantics."""
+        if not self._sync_cursors_to_server:
+            return
+        for channel_id, sub_id in list(self._subscription_ids.items()):
+            try:
+                cursors = await self._channels_client.list_subscription_cursors(
+                    subscription_id=sub_id
+                )
+                if isinstance(cursors, list):
+                    for cursor in cursors:
+                        stream = cursor.get("streamKind") or cursor.get("stream_kind") or ""
+                        if stream != "direct_agent_events" and stream != "":
+                            continue
+                        server_last_seen = _coerce_int(
+                            cursor.get("lastSeenId") or cursor.get("last_seen_id") or 0
+                        ) or 0
+                        current = self._cursor_by_channel.get(channel_id, 0)
+                        if server_last_seen > current:
+                            self._cursor_by_channel[channel_id] = server_last_seen
+                            logger.info(
+                                "[DenChannels] cursor advanced from server: ch%d sub%d %d -> %d",
+                                channel_id, sub_id, current, server_last_seen,
+                            )
+            except Exception:
+                logger.debug(
+                    "[DenChannels] failed to init cursor from server for ch%d sub%d",
+                    channel_id, sub_id,
+                )
+        self._save_cursors()
 
 
 class DenChannelsClient:
@@ -865,6 +935,62 @@ class DenChannelsClient:
 
     async def add_reaction(self, message_id: str | int, payload: dict[str, Any]) -> dict[str, Any]:
         return await self._request("POST", f"/api/channel-messages/{message_id}/reactions", payload)
+
+    # ------------------------------------------------------------------
+    # Subscription API methods (task #2554)
+    # ------------------------------------------------------------------
+
+    async def get_subscriptions(
+        self,
+        *,
+        member_identity: str,
+        profile_identity: str | None = None,
+        channel_id: int | None = None,
+        subscription_purpose: str | None = None,
+        include_inactive: bool = False,
+        limit: int = 200,
+    ) -> dict[str, Any]:
+        """Discover active subscriptions for a member and/or profile."""
+        from urllib.parse import urlencode
+        params = {"memberIdentity": member_identity, "limit": str(limit)}
+        if profile_identity:
+            params["profileIdentity"] = profile_identity
+        if channel_id is not None:
+            params["channelId"] = str(channel_id)
+        if subscription_purpose:
+            params["subscriptionPurpose"] = subscription_purpose
+        if include_inactive:
+            params["includeInactive"] = "true"
+        query = urlencode(params)
+        return await self._request("GET", f"/api/channel-subscriptions?{query}")
+
+    async def upsert_subscription_cursor(
+        self,
+        *,
+        subscription_id: int,
+        stream_kind: str = "direct_agent_events",
+        last_seen_id: int,
+        cursor_json: str | None = None,
+    ) -> dict[str, Any]:
+        """Persist a subscription cursor (poll position) on the server."""
+        payload: dict[str, Any] = {
+            "subscriptionId": subscription_id,
+            "streamKind": stream_kind,
+            "lastSeenId": last_seen_id,
+        }
+        if cursor_json is not None:
+            payload["cursorJson"] = cursor_json
+        return await self._request("PUT", "/api/channel-subscription-cursors", payload)
+
+    async def list_subscription_cursors(
+        self,
+        *,
+        subscription_id: int,
+    ) -> list[dict[str, Any]]:
+        """Get subscription cursors from the server for a subscription."""
+        return await self._request(
+            "GET", f"/api/channel-subscriptions/{subscription_id}/cursors"
+        )
 
 
 class DenChannelsAdapter(BasePlatformAdapter):
@@ -959,10 +1085,22 @@ class DenChannelsAdapter(BasePlatformAdapter):
             self.channels_client,
             self.agent_identity,
             self.poll_initial_after_ids,
+            subscription_ids=None,  # populated during subscription discovery
+            sync_cursors_to_server=self._sync_cursors_to_server,
         )
         self._polled_channels: set[int] = set()
         self._last_channel_discovery = 0.0
         self._channel_discovery_interval = float(extra.get("channel_discovery_interval_seconds") or 30.0)
+        # Subscription-based channel discovery (task #2554)
+        # Maps subscription_id -> channel_id for cursor sync with server.
+        self._subscription_cache: dict[int, int] = {}
+        self._last_subscription_discovery = 0.0
+        self._subscription_discovery_interval = float(
+            extra.get("subscription_discovery_interval_seconds") or 60.0
+        )
+        self._sync_cursors_to_server = _coerce_bool(
+            extra.get("sync_cursors_to_server"), True
+        )
         self._contexts_by_session: dict[str, _DeliveryContext] = {}
         self._contexts_by_chat: dict[str, _DeliveryContext] = {}
         self._contexts_by_lane: dict[tuple[str, str | None], _DeliveryContext] = {}
@@ -999,6 +1137,16 @@ class DenChannelsAdapter(BasePlatformAdapter):
                 self._event_task = asyncio.create_task(self._event_poll_loop())
             except RuntimeError:
                 self._event_task = None
+
+        # Initialize subscriptions and cursors from the server (task #2554).
+        # This runs on connect so newly added channels are discovered immediately
+        # without waiting for the first poll loop cycle.
+        if self.channels_url and self.agent_identity:
+            try:
+                await self._discover_and_sync_subscriptions()
+            except Exception:
+                logger.debug("[DenChannels] subscription init failed on connect", exc_info=True)
+
         return True
 
     async def disconnect(self) -> None:
@@ -1479,6 +1627,9 @@ class DenChannelsAdapter(BasePlatformAdapter):
         """Poll Channels for direct-agent wake events targeted at this agent."""
         while self._running:
             try:
+                # Periodically discover subscriptions and sync cursors from server
+                await self._discover_and_sync_subscriptions()
+
                 channels_to_poll = await self._resolve_poll_channels()
                 for channel_id in channels_to_poll:
                     events = await self._event_poller.poll(channel_id, limit=self.poll_limit)
@@ -1501,6 +1652,70 @@ class DenChannelsAdapter(BasePlatformAdapter):
             except Exception:
                 logger.warning("[DenChannels] event poll loop failed", exc_info=True)
                 await self._maybe_sleep(self.poll_interval_seconds)
+
+    async def _discover_and_sync_subscriptions(self) -> None:
+        """Discover active subscriptions for this agent from the server,
+        update the subscription cache, and initialize event poller cursors.
+
+        Called on connect and periodically during the poll loop (task #2554).
+        This is the green path that makes GUI-added memberships produce
+        runtime poll subscriptions without profile config edits.
+        """
+        import time as _time
+        now = _time.time()
+        if (self._subscription_cache
+                and now - self._last_subscription_discovery < self._subscription_discovery_interval):
+            return
+
+        self._last_subscription_discovery = now
+        subscription_identity = self.agent_identity
+
+        try:
+            resp = await self.channels_client.get_subscriptions(
+                member_identity=subscription_identity,
+                include_inactive=False,
+            )
+        except Exception:
+            logger.debug("[DenChannels] subscription discovery failed", exc_info=True)
+            return
+
+        subscriptions = (
+            (resp if isinstance(resp, dict) else {})
+            .get("subscriptions") or []
+        )
+        if not subscriptions:
+            return
+
+        # Build a set of channel_ids from active subscriptions
+        sub_channel_ids: set[int] = set()
+        sub_mapping: dict[int, int] = {}  # channel_id -> subscription_id
+
+        for sub in subscriptions:
+            sub_id = _coerce_int(sub.get("id"))
+            ch_id = _coerce_int(sub.get("channelId") or sub.get("channel_id"))
+            status = str(sub.get("subscriptionStatus") or sub.get("subscription_status") or "").lower()
+            if sub_id is not None and ch_id is not None and status == "active":
+                sub_channel_ids.add(ch_id)
+                sub_mapping[ch_id] = sub_id
+
+        # Update subscription cache
+        self._subscription_cache = dict(sub_mapping)
+
+        # Update event poller subscription mappings
+        for ch_id, sub_id in sub_mapping.items():
+            self._event_poller.update_subscription_mapping(sub_id, ch_id)
+
+        # Initialize cursors from server for all discovered subscriptions
+        await self._event_poller.initialize_cursors_from_server()
+
+        # Merge with polled_channels
+        self._polled_channels |= sub_channel_ids
+
+        if sub_mapping:
+            logger.info(
+                "[DenChannels] subscription discovery: %d subscriptions, channels: %s",
+                len(sub_mapping), sorted(sub_channel_ids),
+            )
 
     async def _resolve_poll_channels(self) -> list[int]:
         """Return channel IDs this adapter should poll for direct-agent events."""
