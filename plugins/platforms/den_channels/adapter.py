@@ -1081,6 +1081,9 @@ class DenChannelsAdapter(BasePlatformAdapter):
         self.channels_client = channels_client or DenChannelsClient(self.channels_url, token=channels_token)
         self._claim_task: asyncio.Task | None = None
         self._event_task: asyncio.Task | None = None
+        self._sync_cursors_to_server = _coerce_bool(
+            extra.get("sync_cursors_to_server"), True
+        )
         self._event_poller = _DirectAgentEventPoller(
             self.channels_client,
             self.agent_identity,
@@ -1095,11 +1098,9 @@ class DenChannelsAdapter(BasePlatformAdapter):
         # Maps subscription_id -> channel_id for cursor sync with server.
         self._subscription_cache: dict[int, int] = {}
         self._last_subscription_discovery = 0.0
+        self._subscription_discovery_ever_ran = False
         self._subscription_discovery_interval = float(
             extra.get("subscription_discovery_interval_seconds") or 60.0
-        )
-        self._sync_cursors_to_server = _coerce_bool(
-            extra.get("sync_cursors_to_server"), True
         )
         self._contexts_by_session: dict[str, _DeliveryContext] = {}
         self._contexts_by_chat: dict[str, _DeliveryContext] = {}
@@ -1654,22 +1655,25 @@ class DenChannelsAdapter(BasePlatformAdapter):
                 await self._maybe_sleep(self.poll_interval_seconds)
 
     async def _discover_and_sync_subscriptions(self) -> None:
-        """Discover active subscriptions for this agent from the server,
-        update the subscription cache, and initialize event poller cursors.
+        """Discover active server subscriptions for this agent, update cache,
+        remove disappeared channels from poller/poll-set, and init cursors.
 
         Called on connect and periodically during the poll loop (task #2554).
         This is the green path that makes GUI-added memberships produce
         runtime poll subscriptions without profile config edits.
+
+        When subscriptions return empty, clears subscription-derived channels
+        from the poll set and removes poller mappings so released/deactivated
+        subscriptions stop being polled. Static config channels are never removed.
         """
         import time as _time
         now = _time.time()
-        if (self._subscription_cache
-                and now - self._last_subscription_discovery < self._subscription_discovery_interval):
+        if now - self._last_subscription_discovery < self._subscription_discovery_interval:
             return
-
         self._last_subscription_discovery = now
         subscription_identity = self.agent_identity
 
+        # Discover active subscriptions from server
         try:
             resp = await self.channels_client.get_subscriptions(
                 member_identity=subscription_identity,
@@ -1679,42 +1683,59 @@ class DenChannelsAdapter(BasePlatformAdapter):
             logger.debug("[DenChannels] subscription discovery failed", exc_info=True)
             return
 
-        subscriptions = (
+        subscriptions: list[dict[str, Any]] = (
             (resp if isinstance(resp, dict) else {})
             .get("subscriptions") or []
         )
-        if not subscriptions:
-            return
 
-        # Build a set of channel_ids from active subscriptions
-        sub_channel_ids: set[int] = set()
-        sub_mapping: dict[int, int] = {}  # channel_id -> subscription_id
+        # Build the new subscription-derived channel set
+        new_sub_channel_ids: set[int] = set()
+        new_sub_mapping: dict[int, int] = {}  # channel_id -> subscription_id
 
         for sub in subscriptions:
             sub_id = _coerce_int(sub.get("id"))
             ch_id = _coerce_int(sub.get("channelId") or sub.get("channel_id"))
             status = str(sub.get("subscriptionStatus") or sub.get("subscription_status") or "").lower()
             if sub_id is not None and ch_id is not None and status == "active":
-                sub_channel_ids.add(ch_id)
-                sub_mapping[ch_id] = sub_id
+                new_sub_channel_ids.add(ch_id)
+                new_sub_mapping[ch_id] = sub_id
+
+        # Determine which subscription channels were REMOVED since last discovery
+        # _subscription_cache maps channel_id -> subscription_id; keys() are channel IDs
+        old_sub_channel_ids: set[int] = set(self._subscription_cache.keys())
+        removed_channels = old_sub_channel_ids - new_sub_channel_ids
+
+        # Remove mappings for disappeared subscriptions from the poller
+        for ch_id in removed_channels:
+            self._event_poller.remove_subscription_mapping(ch_id)
+
+        # Remove disappeared subscription channels from the poll set
+        # (static config channels are never removed here — they live in poll_channel_ids)
+        self._polled_channels -= removed_channels
 
         # Update subscription cache
-        self._subscription_cache = dict(sub_mapping)
+        self._subscription_cache = dict(new_sub_mapping)
 
-        # Update event poller subscription mappings
-        for ch_id, sub_id in sub_mapping.items():
+        # Add/update poller mappings for new or still-active subscriptions
+        for ch_id, sub_id in new_sub_mapping.items():
             self._event_poller.update_subscription_mapping(sub_id, ch_id)
 
-        # Initialize cursors from server for all discovered subscriptions
-        await self._event_poller.initialize_cursors_from_server()
+        # Initialize cursors from server for all active subscriptions
+        if new_sub_mapping:
+            try:
+                await self._event_poller.initialize_cursors_from_server()
+            except Exception:
+                logger.debug("[DenChannels] cursor init from server failed, using local cursors", exc_info=True)
 
-        # Merge with polled_channels
-        self._polled_channels |= sub_channel_ids
+        # Add subscription-derived channels to poll set
+        self._polled_channels |= new_sub_channel_ids
 
-        if sub_mapping:
+        self._subscription_discovery_ever_ran = True
+
+        if new_sub_mapping or removed_channels:
             logger.info(
-                "[DenChannels] subscription discovery: %d subscriptions, channels: %s",
-                len(sub_mapping), sorted(sub_channel_ids),
+                "[DenChannels] subscription discovery: %d active, %d removed, channels: %s",
+                len(new_sub_mapping), len(removed_channels), sorted(new_sub_channel_ids),
             )
 
     async def _resolve_poll_channels(self) -> list[int]:
@@ -1807,6 +1828,14 @@ class DenChannelsAdapter(BasePlatformAdapter):
             member_discovery_succeeded = True
         except Exception:
             logger.debug("[DenChannels] member channel discovery failed", exc_info=True)
+
+        if self._subscription_discovery_ever_ran:
+            # Subscription discovery is authoritative for runtime poll scope.
+            # Membership discovery should NOT add channels back that subscription
+            # release/removal removed.  Static config channels are always preserved.
+            self._polled_channels |= static_channels
+            return sorted(self._polled_channels)
+
         if discovered_channels or static_channels:
             self._polled_channels = set(discovered_channels) | static_channels
             logger.info(
