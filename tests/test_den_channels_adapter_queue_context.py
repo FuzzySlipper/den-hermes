@@ -74,6 +74,11 @@ class FakeChannelsClient:
         self.posts: list[tuple[str | int, dict[str, Any]]] = []
         self.reactions: list[tuple[str | int, dict[str, Any]]] = []
         self._next_post_id = 9000
+        self.subscription_discovery: dict[str, Any] = {"subscriptions": []}
+        self.subscription_requests: list[dict[str, Any]] = []
+        self.subscription_cursors: dict[int, list[dict[str, Any]]] = {}
+        self.cursor_requests: list[int] = []
+        self.fail_cursor_list: list[int] | None = None  # subscription IDs to fail
 
     async def get_direct_agent_events(self, *, channel_id: int, after_id: int = 0, limit: int = 10) -> dict[str, Any]:
         self.event_requests.append((channel_id, after_id, limit))
@@ -112,6 +117,46 @@ class FakeChannelsClient:
             "reactorIdentity": payload["reactorIdentity"],
             "reactionKey": payload["reactionKey"],
         }
+
+    async def get_subscriptions(
+        self,
+        *,
+        member_identity: str,
+        profile_identity: str | None = None,
+        channel_id: int | None = None,
+        subscription_purpose: str | None = None,
+        include_inactive: bool = False,
+        limit: int = 200,
+    ) -> dict[str, Any]:
+        self.subscription_requests.append({
+            "member_identity": member_identity,
+            "profile_identity": profile_identity,
+            "channel_id": channel_id,
+            "subscription_purpose": subscription_purpose,
+            "include_inactive": include_inactive,
+            "limit": limit,
+        })
+        return dict(self.subscription_discovery)
+
+    async def upsert_subscription_cursor(
+        self,
+        *,
+        subscription_id: int,
+        stream_kind: str = "direct_agent_events",
+        last_seen_id: int,
+        cursor_json: str | None = None,
+    ) -> dict[str, Any]:
+        return {"ok": True}
+
+    async def list_subscription_cursors(
+        self,
+        *,
+        subscription_id: int,
+    ) -> list[dict[str, Any]]:
+        self.cursor_requests.append(subscription_id)
+        if self.fail_cursor_list is not None and subscription_id in self.fail_cursor_list:
+            raise RuntimeError(f"Simulated cursor failure for sub {subscription_id}")
+        return list(self.subscription_cursors.get(subscription_id, []))
 
 
 def _adapter(gateway: FakeGatewayClient, channels: FakeChannelsClient) -> DenChannelsAdapter:
@@ -2070,3 +2115,236 @@ async def test_pool_member_adapter_full_flow_end_to_end() -> None:
     assert len(gateway.completed) == 1
     assert gateway.completed[0][0] == 900
     assert gateway.completed[0][1]["adapter_instance_id"] == "hermes:den-k8:spawned-coder:pool-coder-02:live"
+
+
+# =============================================================================
+# Subscription discovery adapter tests (task #2554)
+# =============================================================================
+
+
+@pytest.mark.asyncio
+async def test_subscription_discovery_without_static_config() -> None:
+    """Adapter discovers active subscriptions and uses them as poll channels."""
+    gateway = FakeGatewayClient()
+    channels = FakeChannelsClient()
+    channels.subscription_discovery = {
+        "memberIdentity": "den-mcp-runner",
+        "subscriptions": [
+            {"id": 301, "channelId": 111, "subscriptionStatus": "active", "subscriptionPurpose": "ordinary_channel"},
+            {"id": 302, "channelId": 222, "subscriptionStatus": "active", "subscriptionPurpose": "ordinary_channel"},
+        ],
+    }
+    adapter = DenChannelsAdapter(
+        PlatformConfig(
+            enabled=True, token="***",
+            extra={
+                "channels_url": "http://192.168.1.10:18081",
+                "agent_identity": "den-mcp-runner",
+                "role": "runner",
+                "profile": "den-mcp-runner",
+                "adapter_instance_id": "test-host:den-mcp-runner:runner:gateway",
+                "start_claim_loop": False,
+                "start_poll_loop": False,
+            },
+        ),
+        gateway_client=gateway,
+        channels_client=channels,
+    )
+
+    # Run subscription discovery
+    assert not adapter._subscription_discovery_ever_ran
+    await adapter._discover_and_sync_subscriptions()
+    assert adapter._subscription_discovery_ever_ran
+    assert adapter._subscription_cache == {111: 301, 222: 302}
+
+    # Resolve poll channels — should return subscription-derived channels
+    channels_list = await adapter._resolve_poll_channels()
+    assert sorted(channels_list) == [111, 222]
+
+
+@pytest.mark.asyncio
+async def test_subscription_discovery_active_to_reduced_removes_channel() -> None:
+    """When subscriptions reduce, the removed channel stops being polled."""
+    gateway = FakeGatewayClient()
+    channels = FakeChannelsClient()
+    channels.subscription_discovery = {
+        "memberIdentity": "den-mcp-runner",
+        "subscriptions": [
+            {"id": 301, "channelId": 111, "subscriptionStatus": "active", "subscriptionPurpose": "ordinary_channel"},
+            {"id": 302, "channelId": 222, "subscriptionStatus": "active", "subscriptionPurpose": "ordinary_channel"},
+        ],
+    }
+    adapter = DenChannelsAdapter(
+        PlatformConfig(
+            enabled=True, token="***",
+            extra={
+                "channels_url": "http://192.168.1.10:18081",
+                "agent_identity": "den-mcp-runner",
+                "role": "runner",
+                "profile": "den-mcp-runner",
+                "adapter_instance_id": "test-host:den-mcp-runner:runner:gateway",
+                "start_claim_loop": False,
+                "start_poll_loop": False,
+            },
+        ),
+        gateway_client=gateway,
+        channels_client=channels,
+    )
+
+    # First discovery: both channels
+    await adapter._discover_and_sync_subscriptions()
+    assert adapter._subscription_cache == {111: 301, 222: 302}
+    first_channels = await adapter._resolve_poll_channels()
+    assert sorted(first_channels) == [111, 222]
+
+    # Second discovery: only channel 222 remains
+    # Expire the discovery interval so next call re-discovers
+    adapter._last_subscription_discovery = 0.0
+    channels.subscription_discovery = {
+        "memberIdentity": "den-mcp-runner",
+        "subscriptions": [
+            {"id": 302, "channelId": 222, "subscriptionStatus": "active", "subscriptionPurpose": "ordinary_channel"},
+        ],
+    }
+
+    await adapter._discover_and_sync_subscriptions()
+    assert adapter._subscription_cache == {222: 302}
+    removed_channels = await adapter._resolve_poll_channels()
+    assert sorted(removed_channels) == [222]
+
+    # Verify poller mapping for channel 111 was removed
+    assert 111 not in adapter._event_poller._subscription_ids
+
+
+@pytest.mark.asyncio
+async def test_subscription_discovery_zero_subscriptions_suppresses_membership() -> None:
+    """When subscriptions go to zero, membership fallback does not re-add channels."""
+    gateway = FakeGatewayClient()
+    channels = FakeChannelsClient()
+    # Membership reports channel 111 as active
+    channels.membership_discovery = {
+        "memberIdentity": "den-mcp-runner",
+        "memberships": [
+            {"channelId": 111, "channelSlug": "project-test", "membershipStatus": "active", "membershipPurpose": None},
+        ],
+    }
+    # Initially: active subscription for 111
+    channels.subscription_discovery = {
+        "memberIdentity": "den-mcp-runner",
+        "subscriptions": [
+            {"id": 301, "channelId": 111, "subscriptionStatus": "active", "subscriptionPurpose": "ordinary_channel"},
+        ],
+    }
+    adapter = DenChannelsAdapter(
+        PlatformConfig(
+            enabled=True, token="***",
+            extra={
+                "channels_url": "http://192.168.1.10:18081",
+                "agent_identity": "den-mcp-runner",
+                "role": "runner",
+                "profile": "den-mcp-runner",
+                "adapter_instance_id": "test-host:den-mcp-runner:runner:gateway",
+                "start_claim_loop": False,
+                "start_poll_loop": False,
+            },
+        ),
+        gateway_client=gateway,
+        channels_client=channels,
+    )
+
+    # Run subscription discovery — 111 active
+    await adapter._discover_and_sync_subscriptions()
+    first = await adapter._resolve_poll_channels()
+    assert sorted(first) == [111]
+
+    # Now subscriptions go to zero
+    adapter._last_subscription_discovery = 0.0
+    channels.subscription_discovery = {
+        "memberIdentity": "den-mcp-runner",
+        "subscriptions": [],
+    }
+
+    await adapter._discover_and_sync_subscriptions()
+    # Subscription cache is empty
+    assert adapter._subscription_cache == {}
+    # Membership is still active but subscription discovery has run,
+    # so membership fallback should be suppressed.
+    second = await adapter._resolve_poll_channels()
+    assert sorted(second) == [], f"Expected no channels, got {second}"
+
+
+@pytest.mark.asyncio
+async def test_subscription_discovery_static_config_remains_fallback() -> None:
+    """Static poll_channel_ids remain polled even when subscriptions are empty."""
+    gateway = FakeGatewayClient()
+    channels = FakeChannelsClient()
+    channels.subscription_discovery = {
+        "memberIdentity": "den-mcp-runner",
+        "subscriptions": [],
+    }
+    adapter = DenChannelsAdapter(
+        PlatformConfig(
+            enabled=True, token="***",
+            extra={
+                "channels_url": "http://192.168.1.10:18081",
+                "agent_identity": "den-mcp-runner",
+                "role": "runner",
+                "profile": "den-mcp-runner",
+                "adapter_instance_id": "test-host:den-mcp-runner:runner:gateway",
+                "poll_channel_ids": [999],
+                "start_claim_loop": False,
+                "start_poll_loop": False,
+            },
+        ),
+        gateway_client=gateway,
+        channels_client=channels,
+    )
+
+    assert adapter.poll_channel_ids == [999]
+
+    # Subscription discovery returns zero
+    await adapter._discover_and_sync_subscriptions()
+    assert adapter._subscription_cache == {}
+
+    # Static config channel 999 should still be polled
+    channels_list = await adapter._resolve_poll_channels()
+    assert sorted(channels_list) == [999]
+
+
+@pytest.mark.asyncio
+async def test_subscription_discovery_cursor_init_failure_degrades_gracefully() -> None:
+    """Cursor init failure from server should not crash discovery or poll loop."""
+    gateway = FakeGatewayClient()
+    channels = FakeChannelsClient()
+    channels.subscription_discovery = {
+        "memberIdentity": "den-mcp-runner",
+        "subscriptions": [
+            {"id": 301, "channelId": 111, "subscriptionStatus": "active", "subscriptionPurpose": "ordinary_channel"},
+        ],
+    }
+    # Simulate cursor list failure for subscription 301
+    channels.fail_cursor_list = [301]
+    adapter = DenChannelsAdapter(
+        PlatformConfig(
+            enabled=True, token="***",
+            extra={
+                "channels_url": "http://192.168.1.10:18081",
+                "agent_identity": "den-mcp-runner",
+                "role": "runner",
+                "profile": "den-mcp-runner",
+                "adapter_instance_id": "test-host:den-mcp-runner:runner:gateway",
+                "start_claim_loop": False,
+                "start_poll_loop": False,
+            },
+        ),
+        gateway_client=gateway,
+        channels_client=channels,
+    )
+
+    # Discovery should not raise despite cursor failure
+    await adapter._discover_and_sync_subscriptions()
+    assert adapter._subscription_cache == {111: 301}
+
+    # Poll channels should still work
+    channels_list = await adapter._resolve_poll_channels()
+    assert sorted(channels_list) == [111]
