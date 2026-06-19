@@ -100,7 +100,7 @@ class FakeChannelsClient:
         })
         return dict(self.membership_discovery)
 
-    async def get_gateway_message(self, message_id: str | int) -> dict[str, Any]:
+    async def get_message_readback(self, message_id: str | int) -> dict[str, Any]:
         return dict(self.messages[int(message_id)])
 
     async def post_channel_message(self, channel_id: str | int, payload: dict[str, Any]) -> dict[str, Any]:
@@ -868,7 +868,7 @@ def test_activity_emitter_preserves_hermes_session_key(monkeypatch: pytest.Monke
 
     _adapter_module._emit_activity_event(
         {
-            "gatewayUrl": "http://gateway.test",
+            "channelsUrl": "http://gateway.test",
             "channelId": 42,
             "projectId": "den-hermes-bridge",
             "agentIdentity": "den-mcp-runner",
@@ -909,7 +909,7 @@ def test_activity_emitter_forwards_spawned_worker_context(monkeypatch: pytest.Mo
 
     _adapter_module._emit_activity_event(
         {
-            "gatewayUrl": "http://gateway.test",
+            "channelsUrl": "http://gateway.test",
             "channelId": 42,
             "projectId": "den-hermes-bridge",
             "taskId": 1565,
@@ -982,8 +982,52 @@ def test_activity_emitter_accepts_channels_url_only(monkeypatch: pytest.MonkeyPa
     assert body["agentIdentity"] == "den-mcp-runner"
 
 
-def test_activity_emitter_prefers_channels_over_gateway(monkeypatch: pytest.MonkeyPatch) -> None:
-    """When both channels_url and gatewayUrl are set, channels_url is preferred."""
+def test_activity_emitter_prefers_observation_over_channels(monkeypatch: pytest.MonkeyPatch) -> None:
+    """When both observationUrl and channelsUrl are set, observationUrl is preferred."""
+    posted: list[dict[str, Any]] = []
+
+    class FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+    class FakeClient:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        def __enter__(self) -> "FakeClient":
+            return self
+
+        def __exit__(self, *args: Any) -> None:
+            return None
+
+        def post(self, url: str, *, json: dict[str, Any], headers: dict[str, str]) -> FakeResponse:
+            posted.append((url, json))
+            return FakeResponse()
+
+    class FakeHttpx:
+        Client = FakeClient
+
+    monkeypatch.setitem(sys.modules, "httpx", FakeHttpx)
+
+    _adapter_module._emit_activity_event(
+        {
+            "observationUrl": "http://obs.test",
+            "channelsUrl": "http://channels.test",
+            "channelId": 42,
+            "projectId": "den-hermes-bridge",
+            "agentIdentity": "den-mcp-runner",
+        },
+        normalize_tool_activity("terminal", {"command": "date"}),
+    )
+
+    assert len(posted) == 1
+    url, _body = posted[0]
+    assert url == "http://obs.test/api/channel-activity-events"
+    assert "channels.test" not in url
+
+
+def test_activity_emitter_falls_back_to_channels_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    """When only channelsUrl is set (no observationUrl), channelsUrl is used as fallback."""
     posted: list[dict[str, Any]] = []
 
     class FakeResponse:
@@ -1012,7 +1056,6 @@ def test_activity_emitter_prefers_channels_over_gateway(monkeypatch: pytest.Monk
     _adapter_module._emit_activity_event(
         {
             "channelsUrl": "http://channels.test",
-            "gatewayUrl": "http://gateway.test",
             "channelId": 42,
             "projectId": "den-hermes-bridge",
             "agentIdentity": "den-mcp-runner",
@@ -1023,49 +1066,6 @@ def test_activity_emitter_prefers_channels_over_gateway(monkeypatch: pytest.Monk
     assert len(posted) == 1
     url, _body = posted[0]
     assert url == "http://channels.test/api/channel-activity-events"
-    assert "gateway.test" not in url
-
-
-def test_activity_emitter_falls_back_to_gateway_url(monkeypatch: pytest.MonkeyPatch) -> None:
-    """When only gatewayUrl is set (no channels_url), gatewayUrl is used as fallback."""
-    posted: list[dict[str, Any]] = []
-
-    class FakeResponse:
-        def raise_for_status(self) -> None:
-            return None
-
-    class FakeClient:
-        def __init__(self, *args: Any, **kwargs: Any) -> None:
-            pass
-
-        def __enter__(self) -> "FakeClient":
-            return self
-
-        def __exit__(self, *args: Any) -> None:
-            return None
-
-        def post(self, url: str, *, json: dict[str, Any], headers: dict[str, str]) -> FakeResponse:
-            posted.append((url, json))
-            return FakeResponse()
-
-    class FakeHttpx:
-        Client = FakeClient
-
-    monkeypatch.setitem(sys.modules, "httpx", FakeHttpx)
-
-    _adapter_module._emit_activity_event(
-        {
-            "gatewayUrl": "http://gateway.test",
-            "channelId": 42,
-            "projectId": "den-hermes-bridge",
-            "agentIdentity": "den-mcp-runner",
-        },
-        normalize_tool_activity("terminal", {"command": "date"}),
-    )
-
-    assert len(posted) == 1
-    url, _body = posted[0]
-    assert url == "http://gateway.test/api/channel-activity-events"
 
 
 def test_canonical_spawned_worker_activity_payload_shape_1567(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1102,7 +1102,7 @@ def test_canonical_spawned_worker_activity_payload_shape_1567(monkeypatch: pytes
 
     _adapter_module._emit_activity_event(
         {
-            "gatewayUrl": "http://gateway.test",
+            "channelsUrl": "http://gateway.test",
             "channelId": 42,
             "projectId": "den-hermes-bridge",
             "taskId": 1567,
@@ -1147,7 +1147,7 @@ def test_spawned_worker_activity_streams_and_dedupe_are_worker_scoped(monkeypatc
     _ACTIVITY_CONTEXT_VAR.set({})
 
     base = {
-        "gatewayUrl": "http://gateway.test",
+        "channelsUrl": "http://gateway.test",
         "channelId": 42,
         "displayBlockId": "parent-1567",
         "parentHermesSessionKey": "parent-session-1567",
@@ -1196,7 +1196,7 @@ async def test_tool_activity_context_is_isolated_between_concurrent_deliveries(m
 
     async def run_delivery(delivery_id: int, session_key: str, tool_name: str) -> None:
         _ACTIVITY_CONTEXT_VAR.set({
-            "gatewayUrl": "http://gateway.test",
+            "channelsUrl": "http://gateway.test",
             "channelId": 42,
             "projectId": "den-hermes-bridge",
             "agentIdentity": "den-mcp-runner",
@@ -1240,7 +1240,7 @@ def test_tool_activity_normalization_redacts_truncates_and_counts() -> None:
 def test_tool_activity_hooks_coalesce_adjacent_duplicate_calls(monkeypatch: pytest.MonkeyPatch) -> None:
     emitted: list[dict[str, Any]] = []
     monkeypatch.setenv(_ACTIVITY_CONTEXT_ENV, json.dumps({
-        "gatewayUrl": "http://gateway.test",
+        "channelsUrl": "http://gateway.test",
         "channelId": 42,
         "projectId": "den-hermes-bridge",
         "agentIdentity": "den-mcp-runner",
@@ -1264,7 +1264,7 @@ def test_tool_activity_hooks_coalesce_adjacent_duplicate_calls(monkeypatch: pyte
 
 def test_tool_activity_hook_failures_are_isolated(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv(_ACTIVITY_CONTEXT_ENV, json.dumps({
-        "gatewayUrl": "http://gateway.test",
+        "channelsUrl": "http://gateway.test",
         "channelId": 42,
         "deliveryRequestId": 1528,
         "sessionKey": "session-1528",
@@ -1461,7 +1461,7 @@ def test_direct_agent_message_handler_checks_config_availability(monkeypatch: py
     ))
     parsed = json.loads(result)
     assert parsed["status"] == "error"
-    assert parsed.get("error") == "DEN_CHANNELS_URL or DEN_GATEWAY_URL is not configured"
+    assert parsed.get("error") == "DEN_DELIVERY_URL or DEN_GATEWAY_URL is not configured"
 
 
 def test_direct_agent_message_handler_available_check(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1470,10 +1470,10 @@ def test_direct_agent_message_handler_available_check(monkeypatch: pytest.Monkey
     monkeypatch.delenv("DEN_GATEWAY_URL", raising=False)
     _adapter_module._DIRECT_AGENT_CONFIG_DEFAULTS.clear()
     assert _adapter_module._check_direct_agent_message_available() is False
-    monkeypatch.setenv("DEN_CHANNELS_URL", "http://test:8080")
+    monkeypatch.setenv("DEN_DELIVERY_URL", "http://test:8080")
     assert _adapter_module._check_direct_agent_message_available() is True
-    monkeypatch.delenv("DEN_CHANNELS_URL", raising=False)
-    _adapter_module._remember_direct_agent_config(channels_url="http://profile-config.test")
+    monkeypatch.delenv("DEN_DELIVERY_URL", raising=False)
+    _adapter_module._remember_direct_agent_config(delivery_url="http://profile-config.test")
     assert _adapter_module._check_direct_agent_message_available() is True
 
 
@@ -1487,7 +1487,7 @@ def test_direct_agent_message_handler_uses_adapter_config_and_defaults_sender(mo
     monkeypatch.delenv("DEN_CHANNELS_TOKEN", raising=False)
     _adapter_module._DIRECT_AGENT_CONFIG_DEFAULTS.clear()
     _adapter_module._remember_direct_agent_config(
-        channels_url="http://channels.test",
+        delivery_url="http://channels.test",
         token="secret-token",
         agent_identity="profile-runner",
     )
@@ -1554,7 +1554,7 @@ def test_direct_agent_message_handler_accepts_registry_args_dict(monkeypatch: py
     monkeypatch.delenv("DEN_CHANNELS_TOKEN", raising=False)
     _adapter_module._DIRECT_AGENT_CONFIG_DEFAULTS.clear()
     _adapter_module._remember_direct_agent_config(
-        channels_url="http://channels.test",
+        delivery_url="http://channels.test",
         agent_identity="profile-runner",
     )
 
@@ -1613,7 +1613,7 @@ def test_direct_agent_message_handler_forwards_explicit_worker_selectors(monkeyp
     monkeypatch.delenv("DEN_CHANNELS_TOKEN", raising=False)
     _adapter_module._DIRECT_AGENT_CONFIG_DEFAULTS.clear()
     _adapter_module._remember_direct_agent_config(
-        channels_url="http://channels.test",
+        delivery_url="http://channels.test",
         agent_identity="pi-crew-runner",
     )
 

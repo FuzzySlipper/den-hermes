@@ -76,7 +76,7 @@ class FakeChannelsClient:
         self.posts: list[tuple[str | int, dict[str, Any]]] = []
         self._next_post_id = 9000
 
-    async def get_gateway_message(self, message_id: str | int) -> dict[str, Any]:
+    async def get_message_readback(self, message_id: str | int) -> dict[str, Any]:
         return dict(self.messages[int(message_id)])
 
     async def post_channel_message(self, channel_id: str | int, payload: dict[str, Any]) -> dict[str, Any]:

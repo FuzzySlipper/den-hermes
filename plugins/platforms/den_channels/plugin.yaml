@@ -6,38 +6,72 @@ description: >
   Native Den Channels adapter for durable Hermes sessions. Polls canonical
   Channels direct-agent events, routes them through GatewayRunner/SessionStore,
   and posts visible replies back to Den Channels with sourceKind=gateway_delivery.
+  Config is split across three API bases — conversation, gateway/delivery, and
+  observation — to support future conversation-successor separation.
 author: Hermes Agent contributors
 requires_env:
   - name: DEN_CHANNELS_URL
-    description: "Den Channels service base URL used for direct-agent events and visible channel messages"
+    description: >
+      Den Channels conversation/channel API base. Used for: channel messages,
+      subscriptions, memberships, reactions, read cursors, transcripts, and
+      direct-conversation routes. This is the conversation/channel API base only
+      (see DEN_GATEWAY_URL or DEN_DELIVERY_URL for executable delivery).
     prompt: "Den Channels URL"
     password: false
 optional_env:
   - name: DEN_GATEWAY_URL
-    description: "Legacy Gateway compatibility base URL used only for old delivery-claim fallback"
-    prompt: "Legacy Den Gateway URL"
+    description: >
+      Gateway/delivery API base for executable actuation. Used for: delivery
+      claim/complete/fail, adapter binding heartbeat, and direct-agent event
+      management. Separate from the conversation/channel API base (DEN_CHANNELS_URL).
+      Must have a bearer token configured via DEN_CHANNELS_TOKEN or DEN_GATEWAY_TOKEN.
+    prompt: "Den Gateway/delivery URL"
+    password: false
+  - name: DEN_DELIVERY_URL
+    description: >
+      Alias for DEN_GATEWAY_URL. When both are set, DEN_DELIVERY_URL takes
+      precedence. Provided for clarity when configuring the delivery API base
+      separately from the general gateway URL. Also used for: delivery claim,
+      delivery complete/fail, adapter binding heartbeat, and direct-agent events.
+    prompt: "Den delivery API URL"
+    password: false
+  - name: DEN_OBSERVATION_URL
+    description: >
+      Den observation/activity API base. Used for: tool-activity event emission
+      (breadcrumbs), agent status/progress projection. If not set, falls back
+      to the conversation API base (DEN_CHANNELS_URL) for backward compatibility.
+    prompt: "Den observation URL"
     password: false
   - name: DEN_GATEWAY_TOKEN
-    description: "Legacy Gateway bearer token, if the fallback path is intentionally enabled"
-    prompt: "Legacy Den Gateway token"
+    description: >
+      Bearer token for the gateway/delivery API base. Required when the gateway
+      or delivery service is not on a private LAN address trusted by default.
+    prompt: "Den Gateway/delivery token"
     password: true
   - name: DEN_CHANNELS_TOKEN
-    description: "Bearer token for Den Channels APIs, if required"
+    description: >
+      Bearer token for Den Channels conversation API. Required when the channels
+      service is not on a private LAN address trusted by default. Also used as
+      fallback for the gateway/delivery API if DEN_GATEWAY_TOKEN is not set.
     prompt: "Den Channels token"
     password: true
   - name: DEN_CHANNELS_PROJECT_ID
-    description: "Optional project scope for claimed Den Channels deliveries"
+    description: >
+      Optional default project scope for claimed Den Channels deliveries.
     prompt: "Den Channels project id"
     password: false
   - name: DEN_CHANNELS_ADAPTER_INSTANCE_ID
-    description: "Stable adapter instance id; defaults to host:profile:role:gateway"
+    description: >
+      Stable adapter instance id; defaults to host:profile:role:gateway.
     prompt: "Adapter instance id"
     password: false
   - name: DEN_CHANNELS_ALLOWED_USERS
-    description: "Comma-separated Den identities allowed for non-internal messages"
+    description: >
+      Comma-separated Den identities allowed for non-internal messages.
     prompt: "Allowed Den users"
     password: false
   - name: DEN_CHANNELS_ALLOW_ALL_USERS
-    description: "Allow all Den users for non-internal messages"
+    description: >
+      Allow all Den users for non-internal messages.
     prompt: "Allow all Den users? (true/false)"
     password: false

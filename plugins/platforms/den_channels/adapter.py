@@ -302,15 +302,16 @@ def _json_dict_from_payload(value: Any) -> dict[str, Any]:
 def _emit_activity_event(context: dict[str, Any], payload: dict[str, Any]) -> None:
     """Post a tool-activity event to Den Channels.
 
-    Prefers ``channelsUrl`` / ``channels_url`` as the base URL.
-    Falls back to ``gatewayUrl`` / ``gateway_url`` for backward
-    compatibility with pre-#1944 Gateway-shaped configs.
-    The gateway fallback should be removed once deployed configs
-    have migrated to Channels-owned URLs.
+    Prefers ``observationUrl`` / ``observation_url`` / ``DEN_OBSERVATION_URL``
+    as the base URL for activity/observation events. Falls back to
+    ``channelsUrl`` / ``channels_url`` / ``DEN_CHANNELS_URL`` for backward
+    compatibility with profiles that have not yet migrated to an explicit
+    observation URL.
+    The ``gatewayUrl`` / ``gateway_url`` fallback is removed as of #2786.
     """
     base_url = str(
-        context.get("channelsUrl") or context.get("channels_url")
-        or context.get("gatewayUrl") or context.get("gateway_url")
+        context.get("observationUrl") or context.get("observation_url")
+        or context.get("channelsUrl") or context.get("channels_url")
         or ""
     ).rstrip("/")
     channel_id = context.get("channelId") or context.get("channel_id")
@@ -617,6 +618,8 @@ def _resolve_conversation_lane(
 def _remember_direct_agent_config(
     *,
     gateway_url: str = "",
+    delivery_url: str = "",
+    observation_url: str = "",
     channels_url: str = "",
     token: str | None = None,
     agent_identity: str = "",
@@ -630,6 +633,8 @@ def _remember_direct_agent_config(
     """
     updates = {
         "gateway_url": (gateway_url or "").rstrip("/"),
+        "delivery_url": (delivery_url or "").rstrip("/"),
+        "observation_url": (observation_url or "").rstrip("/"),
         "channels_url": (channels_url or "").rstrip("/"),
         "agent_identity": (agent_identity or "").strip(),
     }
@@ -927,7 +932,15 @@ class DenChannelsClient:
         })
         return await self._request("GET", f"/api/channel-memberships?{query}")
 
-    async def get_gateway_message(self, message_id: str | int) -> dict[str, Any]:
+    async def get_message_readback(self, message_id: str | int) -> dict[str, Any]:
+        """Readback only: fetch a single channel message by ID.
+
+        ``TODO(#2786)``: This calls the Gateway-shaped readback route because
+        Den Channels does not yet expose a standalone ``GET /api/messages/{id}``
+        route outside the Gateway compatibility prefix.  Once Channels has a
+        native non-gateway single-message route, this method should be switched.
+        This is a read-only compatibility call — no new actuation depends on it.
+        """
         return await self._request("GET", f"/api/gateway/messages/{message_id}")
 
     async def post_channel_message(self, channel_id: str | int, payload: dict[str, Any]) -> dict[str, Any]:
@@ -1024,6 +1037,20 @@ class DenChannelsAdapter(BasePlatformAdapter):
             config.extra.setdefault("thread_sessions_per_user", False)
         self.gateway_url = str(extra.get("gateway_url") or os.getenv("DEN_GATEWAY_URL") or "").rstrip("/")
         self.channels_url = str(extra.get("channels_url") or os.getenv("DEN_CHANNELS_URL") or "").rstrip("/")
+        self.delivery_url = str(
+            extra.get("delivery_url")
+            or extra.get("DELIVERY_URL")
+            or os.getenv("DEN_DELIVERY_URL")
+            or self.gateway_url
+            or ""
+        ).rstrip("/")
+        self.observation_url = str(
+            extra.get("observation_url")
+            or extra.get("OBSERVATION_URL")
+            or os.getenv("DEN_OBSERVATION_URL")
+            or self.channels_url
+            or ""
+        ).rstrip("/")
         self.project_id = str(extra.get("project_id") or os.getenv("DEN_CHANNELS_PROJECT_ID") or "").strip()
         self.agent_identity = str(extra.get("agent_identity") or os.getenv("HERMES_AGENT_IDENTITY") or os.getenv("HERMES_PROFILE") or "hermes").strip()
         self.role = str(extra.get("role") or os.getenv("HERMES_AGENT_ROLE") or "agent").strip()
@@ -1070,6 +1097,8 @@ class DenChannelsAdapter(BasePlatformAdapter):
         channels_token = str(extra.get("channels_token") or os.getenv("DEN_CHANNELS_TOKEN") or token or "").strip() or None
         _remember_direct_agent_config(
             gateway_url=self.gateway_url,
+            delivery_url=self.delivery_url,
+            observation_url=self.observation_url,
             channels_url=self.channels_url,
             token=channels_token or token,
             agent_identity=self.agent_identity,
@@ -1316,7 +1345,7 @@ class DenChannelsAdapter(BasePlatformAdapter):
         metadata = _json_obj(_first(delivery, "metadata_json", "metadataJson", "metadata", default={}))
         message: dict[str, Any] = {}
         if source_id and source_kind in {"channel_message", "channelMessage", "message", ""}:
-            message = await self.channels_client.get_gateway_message(source_id)
+            message = await self.channels_client.get_message_readback(source_id)
             if not isinstance(message, dict):
                 message = {}
 
@@ -1480,6 +1509,8 @@ class DenChannelsAdapter(BasePlatformAdapter):
     def _set_activity_environment(self, context: _DeliveryContext) -> None:
         payload = {
             "gatewayUrl": self.gateway_url,
+            "deliveryUrl": self.delivery_url,
+            "observationUrl": self.observation_url,
             "channelsUrl": self.channels_url,
             "token": self.gateway_client.token if isinstance(self.gateway_client, DenGatewayClient) else None,
             "channelId": context.channel_id,
@@ -2153,9 +2184,9 @@ _DIRECT_AGENT_MESSAGE_SCHEMA = {
 def _check_direct_agent_message_available() -> bool:
     """Return True if direct-agent message base URL is available."""
     return bool(
-        os.getenv("DEN_CHANNELS_URL")
+        os.getenv("DEN_DELIVERY_URL")
         or os.getenv("DEN_GATEWAY_URL")
-        or _DIRECT_AGENT_CONFIG_DEFAULTS.get("channels_url")
+        or _DIRECT_AGENT_CONFIG_DEFAULTS.get("delivery_url")
         or _DIRECT_AGENT_CONFIG_DEFAULTS.get("gateway_url")
     )
 
@@ -2256,9 +2287,9 @@ async def _handle_direct_agent_message(args: dict[str, Any] | None = None, **kwa
         return json.dumps({"status": "error", "error": "channel_id or project_id is required"})
 
     activity_context = _activity_context()
-    channels_url = (
-        os.getenv("DEN_CHANNELS_URL")
-        or _DIRECT_AGENT_CONFIG_DEFAULTS.get("channels_url")
+    delivery_url = (
+        os.getenv("DEN_DELIVERY_URL")
+        or _DIRECT_AGENT_CONFIG_DEFAULTS.get("delivery_url")
         or ""
     ).rstrip("/")
     gateway_url = (
@@ -2267,9 +2298,12 @@ async def _handle_direct_agent_message(args: dict[str, Any] | None = None, **kwa
         or str(activity_context.get("gatewayUrl") or "")
         or ""
     ).rstrip("/")
-    base_url = channels_url or gateway_url
+    # Use delivery_url as the primary base for this direct-agent wake.
+    # gateway_url is the fallback; channels_url is intentionally NOT used
+    # because this is an executable delivery/wake, not conversation.
+    base_url = delivery_url or gateway_url
     if not base_url:
-        return json.dumps({"status": "error", "error": "DEN_CHANNELS_URL or DEN_GATEWAY_URL is not configured"})
+        return json.dumps({"status": "error", "error": "DEN_DELIVERY_URL or DEN_GATEWAY_URL is not configured"})
 
     effective_sender = (
         str(sender_identity or "").strip()
