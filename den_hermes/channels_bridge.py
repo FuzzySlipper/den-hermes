@@ -7,6 +7,8 @@ import signal
 import subprocess
 import threading
 import time
+import urllib.error
+import urllib.request
 import uuid
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -342,11 +344,145 @@ class JsonFileWakeStore(InMemoryWakeStore):
         tmp.replace(self.path)
 
 
+@dataclass
+class ConversationConfig:
+    """Configuration for the Gateway/conversation successor message path.
+
+    When ``enabled`` is True, channel_message replies are posted through
+    the Gateway conversation successor instead of the legacy
+    ``gateway_client.post_channel_message`` path.  The legacy path
+    remains available for rollback when ``enabled`` is False or when
+    the successor write fails.
+    """
+
+    enabled: bool = False
+    """Set to True to enable the successor conversation write path."""
+
+    gateway_url: str = ""
+    """Gateway base URL, e.g. http://192.168.1.10:8079"""
+
+    write_token: str = ""
+    """Conversation write token for Gateway auth.  Not printed or logged."""
+
+    migrated_functions_header: str = "true"
+    """Value for the X-Den-Migrated-Functions header.  Defaults to 'true'."""
+
+    timeout_seconds: float = 15.0
+    """HTTP request timeout for conversation writes."""
+
+
+class ConversationClient:
+    """Synchronous HTTP client for Gateway conversation successor message writes.
+
+    POSTs channel messages to ``POST /v1/conversation/channels/{channel_id}/messages``
+    through the Gateway with the ``X-Den-Migrated-Functions`` header and
+    the configured write token.
+    """
+
+    def __init__(self, config: ConversationConfig) -> None:
+        self.config = config
+
+    def post_channel_message(
+        self,
+        *,
+        channel_id: str,
+        body: str,
+        metadata: Mapping[str, Any],
+        dedupe_key: str,
+    ) -> dict[str, Any]:
+        """POST a channel message through the Gateway conversation successor.
+
+        Returns the parsed JSON response on success (201).
+
+        Raises RuntimeError on transport failure or non-success status.
+        """
+        if not self.config.gateway_url:
+            raise RuntimeError("ConversationClient: gateway_url is not configured")
+        if not self.config.write_token:
+            raise RuntimeError("ConversationClient: write_token is not configured")
+
+        url = f"{self.config.gateway_url.rstrip('/')}/v1/conversation/channels/{channel_id}/messages"
+        payload = {
+            "sender_type": "agent",
+            "sender_identity": "den-hermes-bridge",
+            "body": body,
+            "message_kind": "agent_reply",
+            "source_kind": "hermes_bridge",
+            "metadata": json.dumps(dict(metadata)) if metadata else "{}",
+            "dedupe_key": dedupe_key,
+        }
+        data_bytes = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=data_bytes,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self.config.write_token}",
+                "X-Den-Migrated-Functions": self.config.migrated_functions_header,
+                "Idempotency-Key": dedupe_key,
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=self.config.timeout_seconds) as resp:
+                response_body = resp.read().decode("utf-8")
+                if resp.status != 201:
+                    raise RuntimeError(
+                        f"ConversationClient: expected 201, got {resp.status}: {response_body[:500]}"
+                    )
+                return json.loads(response_body)
+        except urllib.error.HTTPError as exc:
+            error_body = exc.read().decode("utf-8", errors="replace")[:500]
+            raise RuntimeError(
+                f"ConversationClient: HTTP {exc.code} from {url}: {error_body}"
+            ) from exc
+        except OSError as exc:
+            raise RuntimeError(
+                f"ConversationClient: transport error posting to {url}: {exc}"
+            ) from exc
+
+
 class DenChannelsResponseBridge:
-    def __init__(self, *, den_tools: Any, store: InMemoryWakeStore, gateway_client: Any | None = None):
+    def __init__(
+        self,
+        *,
+        den_tools: Any,
+        store: InMemoryWakeStore,
+        gateway_client: Any | None = None,
+        conversation_client: ConversationClient | None = None,
+        conversation_config: ConversationConfig | None = None,
+    ):
         self.den_tools = den_tools
         self.store = store
         self.gateway_client = gateway_client
+        self._conversation_client = conversation_client or (
+            ConversationClient(conversation_config) if (conversation_config and conversation_config.enabled) else None
+        )
+
+    def _post_channel_message(self, channel_id: str, body: str, metadata: Mapping[str, Any], dedupe_key: str) -> Any:
+        """Post a channel message, preferring the conversation successor path when configured."""
+        if self._conversation_client is not None:
+            try:
+                return self._conversation_client.post_channel_message(
+                    channel_id=channel_id,
+                    body=body,
+                    metadata=metadata,
+                    dedupe_key=dedupe_key,
+                )
+            except RuntimeError:
+                import logging
+                logging.getLogger(__name__).warning(
+                    "Conversation successor write failed, falling back to legacy gateway_client",
+                    exc_info=True,
+                )
+        if self.gateway_client is None:
+            raise RuntimeError("channel_message response target requires gateway_client (no conversation successor)")
+        return self.gateway_client.post_channel_message(
+            channel_id=channel_id,
+            body=body,
+            metadata=metadata,
+            dedupe_key=dedupe_key,
+        )
 
     def post_reply(self, delivery: Mapping[str, Any], *, body: str, run_id: str | None) -> ResponseResult:
         delivery_request_id = _required_int(delivery, "delivery_request_id")
@@ -410,9 +546,7 @@ class DenChannelsResponseBridge:
                 urgency=_optional_str(response_target.get("urgency")) or "normal",
             )
         elif target_kind == "channel_message":
-            if self.gateway_client is None:
-                raise RuntimeError("channel_message response target requires a gateway_client")
-            response = self.gateway_client.post_channel_message(
+            response = self._post_channel_message(
                 channel_id=_required_str(response_target, "channel_id"),
                 body=body,
                 metadata=metadata,

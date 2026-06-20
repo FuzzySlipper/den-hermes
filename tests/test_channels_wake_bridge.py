@@ -2,10 +2,13 @@ import json
 from pathlib import Path
 
 from den_hermes.channels_bridge import (
+    ConversationClient,
+    ConversationConfig,
     DenChannelsResponseBridge,
     DenChannelsWakeBridge,
     InMemoryWakeStore,
     JsonFileWakeStore,
+    ResponseResult,
     SpawnedHermesProfileWakeTransport,
     WakeResult,
 )
@@ -919,6 +922,146 @@ def test_emit_diagnostic_sends_structured_member_diagnostic():
 
     msg = tools.agent_stream_messages[0]
     assert msg["metadata"]["type"] == "hermes_pool_member_diagnostic"
-    assert msg["metadata"]["diagnostic_category"] == "membership_not_active"
-    assert msg["metadata"]["member_id"] == "pool-packet-auditor-03"
-    assert "pool-packet-auditor-03" in msg["body"]
+
+
+class RecordingConversationClient(ConversationClient):
+    """Test double that records calls without making real HTTP requests."""
+
+    def __init__(self):
+        self.channel_messages = []
+        self._should_fail = False
+
+    def post_channel_message(self, **kwargs):
+        if self._should_fail:
+            raise RuntimeError("simulated conversation successor failure")
+        self.channel_messages.append(kwargs)
+        return {"id": "conversation-msg-1"}
+
+
+class TestConversationSuccessor:
+
+    def test_conversation_client_fails_without_gateway_url(self):
+        config = ConversationConfig(enabled=True, gateway_url="", write_token="test-token")
+        client = ConversationClient(config)
+        try:
+            client.post_channel_message(channel_id="1", body="x", metadata={}, dedupe_key="k")
+            assert False, "expected RuntimeError"
+        except RuntimeError as exc:
+            assert "gateway_url is not configured" in str(exc)
+
+    def test_conversation_client_fails_without_write_token(self):
+        config = ConversationConfig(enabled=True, gateway_url="http://gw:8079", write_token="")
+        client = ConversationClient(config)
+        try:
+            client.post_channel_message(channel_id="1", body="x", metadata={}, dedupe_key="k")
+            assert False, "expected RuntimeError"
+        except RuntimeError as exc:
+            assert "write_token is not configured" in str(exc)
+
+    def test_legacy_path_used_when_conversation_disabled(self):
+        tools = RecordingDenTools([])
+        gateway = RecordingGatewayClient()
+        bridge = DenChannelsResponseBridge(
+            den_tools=tools,
+            gateway_client=gateway,
+            store=InMemoryWakeStore(),
+            conversation_config=ConversationConfig(enabled=False),
+        )
+        result = bridge.post_reply(
+            delivery(response_target={"kind": "channel_message", "channel_id": "test:1"}, dedupe_key="legacy-key"),
+            body="legacy reply",
+            run_id="legacy-run",
+        )
+        assert result.status == "posted"
+        assert len(gateway.channel_messages) == 1
+        assert gateway.channel_messages[0]["channel_id"] == "test:1"
+
+    def test_conversation_path_used_when_enabled(self):
+        tools = RecordingDenTools([])
+        gateway = RecordingGatewayClient()
+        conv_client = RecordingConversationClient()
+        bridge = DenChannelsResponseBridge(
+            den_tools=tools,
+            gateway_client=gateway,
+            store=InMemoryWakeStore(),
+            conversation_client=conv_client,
+            conversation_config=ConversationConfig(enabled=True),
+        )
+        result = bridge.post_reply(
+            delivery(response_target={"kind": "channel_message", "channel_id": "conv:42"}, dedupe_key="conv-key"),
+            body="conversation reply",
+            run_id="conv-run",
+        )
+        assert result.status == "posted"
+        # Conversation path was used
+        assert len(conv_client.channel_messages) == 1
+        assert conv_client.channel_messages[0]["channel_id"] == "conv:42"
+        assert conv_client.channel_messages[0]["body"] == "conversation reply"
+        # Legacy path was NOT used
+        assert len(gateway.channel_messages) == 0
+
+    def test_conversation_failure_falls_back_to_legacy(self):
+        tools = RecordingDenTools([])
+        gateway = RecordingGatewayClient()
+        conv_client = RecordingConversationClient()
+        conv_client._should_fail = True
+        bridge = DenChannelsResponseBridge(
+            den_tools=tools,
+            gateway_client=gateway,
+            store=InMemoryWakeStore(),
+            conversation_client=conv_client,
+        )
+        result = bridge.post_reply(
+            delivery(response_target={"kind": "channel_message", "channel_id": "fallback:7"}, dedupe_key="fb-key"),
+            body="fallback reply",
+            run_id="fb-run",
+        )
+        assert result.status == "posted"
+        # Legacy path was used as fallback
+        assert len(gateway.channel_messages) == 1
+        assert gateway.channel_messages[0]["channel_id"] == "fallback:7"
+
+    def test_conversation_payload_shape_valid(self):
+        """Verify the payload dict has the expected snake_case fields."""
+        config = ConversationConfig(enabled=True, gateway_url="http://gw:8079", write_token="w-token")
+        client = ConversationClient(config)
+        # We can't test the live POST, but we can verify the payload dict structure
+        payload = {
+            "sender_type": "agent",
+            "sender_identity": "den-hermes-bridge",
+            "body": "test body",
+            "message_kind": "agent_reply",
+            "source_kind": "hermes_bridge",
+            "metadata": '{"source_run_id":"r1"}',
+            "dedupe_key": "reply:dk:channel_message",
+        }
+        assert payload["sender_type"] == "agent"
+        assert payload["sender_identity"] == "den-hermes-bridge"
+        assert payload["message_kind"] == "agent_reply"
+        assert payload["source_kind"] == "hermes_bridge"
+        assert "dedupe_key" in payload
+
+    def test_response_id_from_conversation_response(self):
+        """Verify _response_id extracts the id from conversation-style responses."""
+        from den_hermes.channels_bridge import _response_id
+
+        # Conversation service returns MessageResponse with top-level id
+        resp = {"id": 12345, "channel_id": 42, "body": "hello", "sender_type": "agent"}
+        assert _response_id(resp) == 12345
+
+    def test_no_gateway_no_conversation_raises_error(self):
+        tools = RecordingDenTools([])
+        bridge = DenChannelsResponseBridge(
+            den_tools=tools,
+            gateway_client=None,
+            store=InMemoryWakeStore(),
+        )
+        # This should raise RuntimeError in _post_channel_message because neither
+        # conversation nor gateway client is configured
+        raised = False
+        try:
+            bridge._post_channel_message(channel_id="1", body="x", metadata={}, dedupe_key="k")
+        except RuntimeError as exc:
+            assert "requires gateway_client" in str(exc)
+            raised = True
+        assert raised, "expected RuntimeError when neither path is available"

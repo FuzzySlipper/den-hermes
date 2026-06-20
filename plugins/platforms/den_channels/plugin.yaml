@@ -42,6 +42,29 @@ optional_env:
       to the conversation API base (DEN_CHANNELS_URL) for backward compatibility.
     prompt: "Den observation URL"
     password: false
+  - name: DEN_CONVERSATION_URL
+    description: >
+      Gateway/conversation successor URL for channel-message writes. When
+      set and DEN_CONVERSATION_ENABLED=true, channel_message replies are
+      posted through the Gateway conversation successor (POST /v1/conversation/
+      channels/{id}/messages) instead of the legacy channels API. Requires
+      DEN_CONVERSATION_TOKEN for Gateway auth. Falls back to legacy path on
+      failure.
+    prompt: "Den conversation successor URL"
+    password: false
+  - name: DEN_CONVERSATION_TOKEN
+    description: >
+      Bearer token for the Gateway conversation successor write path.
+      Used with DEN_CONVERSATION_URL. Do not share this token — it has
+      conversation write authority.
+    prompt: "Den conversation token"
+    password: true
+  - name: DEN_CONVERSATION_ENABLED
+    description: >
+      Set to "true" to enable the conversation successor write path for
+      channel-message replies. Defaults to "false" for backward compatibility.
+    prompt: "Enable conversation successor? (true/false)"
+    password: false
   - name: DEN_GATEWAY_TOKEN
     description: >
       Bearer token for the gateway/delivery API base. Required when the gateway
