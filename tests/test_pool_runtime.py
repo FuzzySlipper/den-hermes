@@ -1017,7 +1017,7 @@ class TestDiagnosticTaxonomy:
         diag = PoolMemberDiagnostic(
             category="wake_route_404",
             member_id="pool-packet-auditor-03",
-            evidence={"route": "/api/direct-agent-events"},
+            evidence={"route": "/v1/delivery/intents"},
             recovery="Check channel membership",
         )
         text = diag.summary()

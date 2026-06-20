@@ -3,7 +3,7 @@
 
 Default mode is non-mutating: resolve channel, preflight active agent membership,
 and print the evidence that would be used for a direct-agent wake. Pass --send to
-actually POST /api/direct-agent-events.
+creates a Delivery intent via POST /v1/delivery/intents.
 """
 
 from __future__ import annotations
@@ -74,7 +74,7 @@ def main(argv: list[str] | None = None) -> int:
         "projectId": memberships.get("projectId"),
         "membershipStatus": member.get("membershipStatus") if member else None,
         "wakePolicy": member.get("wakePolicy") if member else None,
-        "directAgentEventsUrl": f"{base_url}/api/direct-agent-events?{urllib.parse.urlencode({'channelId': channel_id, 'afterId': 0})}",
+        "deliveryIntentsUrl": f"{base_url}/v1/delivery/intents?{urllib.parse.urlencode({'channelId': channel_id, 'afterId': 0})}",
     }
     if not member:
         result["diagnostic"] = f"{args.member_identity} is not an active agent member of channel {channel_id} ({channel_slug})"
@@ -87,14 +87,14 @@ def main(argv: list[str] | None = None) -> int:
             "body": args.body,
             "senderIdentity": args.sender_identity,
         }
-        response = request_json("POST", f"{base_url}/api/direct-agent-events", payload)
+        response = request_json("POST", f"{base_url}/v1/delivery/intents", payload)
         message_id = response.get("messageId") or (response.get("message") or {}).get("id") or response.get("id")
         result.update(
             {
                 "status": "sent",
                 "messageId": message_id,
                 "sendResponse": response,
-                "directAgentEventUrl": f"{base_url}/api/direct-agent-events/{message_id}" if message_id else None,
+                "deliveryIntentUrl": f"{base_url}/v1/delivery/intents/{message_id}" if message_id else None,
             }
         )
     print(json.dumps(result, indent=2, sort_keys=True))

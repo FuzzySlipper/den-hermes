@@ -825,47 +825,56 @@ class DenWorkflowAdapter:
         pool_member_id: str | None = None,
         profile_identity: str | None = None,
     ) -> Mapping[str, Any]:
-        """Send a direct-agent message to wake a pool worker through Den Channels.
+        """Send a direct-agent wake via a successor Delivery intent.
 
-        Posts to canonical Channels ``POST /api/direct-agent-events``.
+        Creates a delivery intent via ``POST /v1/delivery/intents``
+        instead of the legacy ``POST /api/direct-agent-events``.
 
-        Includes concrete target metadata (assignmentId, workerRunId,
-        workerRole, poolMemberId, profileIdentity) when available so the
-        Channels can correlate the wake with the correct pool member.
-        Task #1911.
+        Task #3031.
         """
-        payload: dict[str, Any] = {
-            "channelId": channel_id,
-            "memberIdentity": str(member_identity).strip(),
-            "body": str(body).strip(),
-        }
-        effective_sender = sender_identity or self.requested_by or "den-hermes-bridge"
-        payload["senderIdentity"] = str(effective_sender).strip()
-        if project_id:
-            payload["projectId"] = str(project_id).strip()
-        if source_project_id:
-            payload["sourceProjectId"] = str(source_project_id).strip()
-        if target_task_id is not None:
-            payload["targetTaskId"] = target_task_id
-        if assignment_id is not None:
-            payload["assignmentId"] = str(assignment_id)
-        if worker_run_id:
-            payload["workerRunId"] = str(worker_run_id)
-        if worker_role:
-            payload["workerRole"] = str(worker_role)
-        if pool_member_id:
-            payload["poolMemberId"] = str(pool_member_id)
-        if profile_identity:
-            payload["profileIdentity"] = str(profile_identity)
+        # Build target_identity from member_identity (profile) and the most
+        # specific concrete selector available for instance_id.
+        instance_id = pool_member_id or f"{member_identity}@orchestrator"
+        target_identity = {"profile": member_identity, "instance_id": instance_id}
 
-        result = dict(self._channels_request("POST", "/api/direct-agent-events", json_payload=payload))
+        # Deterministic idempotency key for dedup.
+        nonce = worker_run_id or str(uuid.uuid4())[:8]
+        idempotency_key = f"wake:ch{channel_id}:{member_identity}:{nonce}"
+
+        source_ref = f"wake://{member_identity}?body={body[:2000]}" if body else None
+
+        payload: dict[str, Any] = {
+            "target_identity": target_identity,
+            "idempotency_key": idempotency_key,
+            "source_ref": source_ref,
+            "ttl_seconds": 300,
+        }
+        payload["channel_id"] = channel_id
+        if project_id:
+            payload["project_id"] = str(project_id).strip()
+        if source_project_id:
+            payload["source_project_id"] = str(source_project_id).strip()
+        if target_task_id is not None:
+            payload["target_task_id"] = target_task_id
+        if assignment_id is not None:
+            payload["assignment_id"] = str(assignment_id)
+        if worker_run_id:
+            payload["worker_run_id"] = str(worker_run_id)
+        if worker_role:
+            payload["worker_role"] = str(worker_role)
+        if pool_member_id:
+            payload["pool_member_id"] = str(pool_member_id)
+        if profile_identity:
+            payload["profile_identity"] = str(profile_identity)
+
+        result = dict(self._channels_request("POST", "/v1/delivery/intents", json_payload=payload))
         if not result.get("ok") and result.get("error"):
             result["failure_category"] = result.get("failure_category") or _classify_channels_error_text(
                 str(result.get("error") or ""),
             )
             actual_url = result.get("url") or join_api_url(
                 self.channels_url or "",
-                "/api/direct-agent-events",
+                "/v1/delivery/intents",
             )
             result["diagnostic"] = f"POST {actual_url} failed: {result.get('error')}"
         return result

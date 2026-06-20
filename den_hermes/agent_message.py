@@ -26,6 +26,9 @@ class AgentMessageResult:
     delivery_request_id: int | str | None = None
     direct_agent_event_url: str | None = None
     direct_agent_events_url: str | None = None
+    delivery_intent_id: int | None = None
+    delivery_intent_url: str | None = None
+    delivery_intents_url: str | None = None
     delivery_status: str | None = None
     diagnostic: str | None = None
 
@@ -102,6 +105,7 @@ class DenChannelsAgentMessenger:
         response = self.tools.den_channels_send_direct_agent_message(**send_args)
         message_id = _extract_message_id(response)
         delivery_request_id = _extract_delivery_request_id(response)
+        delivery_intent_id = _extract_delivery_intent_id(response)
         message_payload = self._read_message(message_id)
         if delivery_request_id is None:
             delivery_request_id = _extract_delivery_request_id(message_payload)
@@ -124,8 +128,11 @@ class DenChannelsAgentMessenger:
             target_assignment_id=target_assignment_id,
             message_id=message_id,
             delivery_request_id=delivery_request_id,
-            direct_agent_event_url=self._direct_agent_event_url(message_id) if message_id is not None else None,
-            direct_agent_events_url=self._direct_agent_events_url(resolved_channel_id),
+            delivery_intent_id=delivery_intent_id,
+            direct_agent_event_url=None,
+            direct_agent_events_url=None,
+            delivery_intent_url=self._delivery_intent_url(delivery_intent_id) if delivery_intent_id is not None else None,
+            delivery_intents_url=self._delivery_intents_url(),
             delivery_status=delivery_status,
         )
 
@@ -153,6 +160,12 @@ class DenChannelsAgentMessenger:
             return self.tools.den_channels_get_events(channel_id=channel_id, after_id=after_id, limit=50)
         except Exception:  # noqa: BLE001 - evidence enrichment is best-effort after send.
             return None
+
+    def _delivery_intent_url(self, intent_id: int) -> str:
+        return f"{self.base_url}/v1/delivery/intents/{intent_id}"
+
+    def _delivery_intents_url(self) -> str:
+        return f"{self.base_url}/v1/delivery/intents"
 
     def _direct_agent_event_url(self, event_id: int | str) -> str:
         return f"{self.base_url}/api/direct-agent-events/{event_id}"
@@ -182,6 +195,28 @@ def _find_active_agent_member(memberships: Mapping[str, Any], member_identity: s
         if identity == member_identity and member_type == "agent" and status == "active":
             return member
     return None
+
+
+def _extract_delivery_intent_id(response: Any) -> int | None:
+    """Extract the delivery_intent_id from a den_channels_send_direct_agent_message response.
+
+    Looks for ``delivery_intent_id`` in the top-level JSON response dict.
+    Task #3031 — successor delivery intent migration.
+    """
+    if not isinstance(response, Mapping):
+        return None
+    raw = response.get("delivery_intent_id")
+    if raw is None:
+        # Also try inside nested 'message' envelope.
+        message = response.get("message")
+        if isinstance(message, Mapping):
+            raw = message.get("id")
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
 
 
 def _extract_message_id(response: Any) -> int | str | None:

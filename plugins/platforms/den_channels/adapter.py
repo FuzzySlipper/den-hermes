@@ -22,6 +22,7 @@ import logging
 import os
 import socket
 import threading
+import time
 from dataclasses import dataclass
 from typing import Any, Optional
 from urllib.parse import urlsplit
@@ -2413,16 +2414,51 @@ def _classify_direct_agent_failure(exc: Exception) -> str:
 
 
 
+def _build_target_identity(
+    member_identity: str,
+    pool_member_id: str | None = None,
+    agent_instance_id: str | None = None,
+) -> dict[str, str]:
+    """Build a Delivery target_identity from wake parameters.
+
+    ``profile`` is always the ``member_identity``.  ``instance_id`` prefers
+    the concrete worker selector (agent_instance_id or pool_member_id), then
+    falls back to ``{member_identity}@unknown``.
+    """
+    instance = agent_instance_id or pool_member_id or f"{member_identity}@unknown"
+    return {"profile": member_identity, "instance_id": str(instance).strip()}
+
+
+def _build_wake_idempotency_key(
+    member_identity: str,
+    channel_id: int | None = None,
+    project_id: str | None = None,
+    worker_run_id: str | None = None,
+) -> str:
+    """Build a deterministic idempotency key for a wake delivery intent.
+
+    Format: ``wake:{channel_or_project}:{profile}:{nonce}`` — matches the
+    delivery service's ``idempotency.Parse()`` contract.
+    """
+    channel_or_project = (
+        f"ch{channel_id}" if channel_id is not None
+        else f"pj{project_id}" if project_id
+        else "global"
+    )
+    nonce = worker_run_id or str(int(time.time()))
+    return f"wake:{channel_or_project}:{member_identity}:{nonce}"
+
+
 async def _handle_direct_agent_message(args: dict[str, Any] | None = None, **kwargs: Any) -> str:
     """Handler for the den_channels_send_direct_agent_message tool.
 
-    Posts a direct-agent event to canonical Den Channels
-    ``/api/direct-agent-events`` endpoint.
+    Creates a Delivery intent via ``POST /v1/delivery/intents`` to wake
+    a target runtime.  The wake body/context is carried in ``source_ref``
+    for traceability; durable human-facing evidence should go through the
+    Conversation successor before creating the intent (passing
+    ``channel_message_id``).
 
-    Forwards target-work metadata (assignmentId, workerRunId, workerRole,
-    poolMemberId, profileIdentity, targetTaskId, sourceProjectId) when
-    available so Channels/current-work projections can correlate the wake to the
-    correct concrete pool member.
+    Task #3031 — successor delivery service migration.
     """
     if isinstance(args, dict):
         merged_args = dict(args)
@@ -2477,7 +2513,6 @@ async def _handle_direct_agent_message(args: dict[str, Any] | None = None, **kwa
     if not channel_id and not project_id:
         return json.dumps({"status": "error", "error": "channel_id or project_id is required"})
 
-    activity_context = _activity_context()
     delivery_url = (
         os.getenv("DEN_DELIVERY_URL")
         or _DIRECT_AGENT_CONFIG_DEFAULTS.get("delivery_url")
@@ -2489,12 +2524,26 @@ async def _handle_direct_agent_message(args: dict[str, Any] | None = None, **kwa
         or str(activity_context.get("gatewayUrl") or "")
         or ""
     ).rstrip("/")
-    # Use delivery_url as the primary base for this direct-agent wake.
+    # Use delivery_url as the primary base for this delivery intent.
     # gateway_url is the fallback; channels_url is intentionally NOT used
-    # because this is an executable delivery/wake, not conversation.
+    # because this is an executable wake, not conversation.
     base_url = delivery_url or gateway_url
     if not base_url:
         return json.dumps({"status": "error", "error": "DEN_DELIVERY_URL or DEN_GATEWAY_URL is not configured"})
+
+    target_identity = _build_target_identity(member_identity, pool_member_id, agent_instance_id)
+    idempotency_key = _build_wake_idempotency_key(member_identity, channel_id, project_id, worker_run_id)
+
+    # Carry the wake body/context in source_ref for traceability.
+    # Format: wake://{profile}?body={encoded_context}
+    source_ref = f"wake://{member_identity}?body={body[:2000]}" if body else None
+
+    payload: dict[str, Any] = {
+        "target_identity": target_identity,
+        "idempotency_key": idempotency_key,
+        "source_ref": source_ref,
+        "ttl_seconds": 300,
+    }
 
     effective_sender = (
         str(sender_identity or "").strip()
@@ -2505,39 +2554,29 @@ async def _handle_direct_agent_message(args: dict[str, Any] | None = None, **kwa
         or "hermes"
     )
 
-    payload: dict[str, Any] = {
-        "memberIdentity": str(member_identity).strip(),
-        "senderIdentity": effective_sender,
-        "body": str(body).strip(),
-    }
+    # Include work-attribution metadata when present for correlation (#1911, #3031).
     if channel_id is not None:
-        payload["channelId"] = int(channel_id) if not isinstance(channel_id, int) else channel_id
+        payload["channel_id"] = int(channel_id) if not isinstance(channel_id, int) else channel_id
     if project_id:
-        payload["projectId"] = str(project_id).strip()
-
-    # Forward target-work attribution metadata when present (#1911).
+        payload["project_id"] = str(project_id).strip()
     if source_project_id:
-        payload["sourceProjectId"] = str(source_project_id).strip()
+        payload["source_project_id"] = str(source_project_id).strip()
     if target_task_id is not None:
-        payload["targetTaskId"] = int(target_task_id) if not isinstance(target_task_id, int) else target_task_id
+        payload["target_task_id"] = int(target_task_id) if not isinstance(target_task_id, int) else target_task_id
     if assignment_id is not None:
-        payload["assignmentId"] = str(assignment_id).strip()
-
-    # Include selector metadata from explicit tool args first, then activity
-    # context fallback, so wakes can target a logical Channels member while
-    # still correlating to a concrete pool lane.
+        payload["assignment_id"] = str(assignment_id).strip()
     if worker_run_id:
-        payload["workerRunId"] = str(worker_run_id)
+        payload["worker_run_id"] = str(worker_run_id)
     if worker_role:
-        payload["workerRole"] = str(worker_role)
+        payload["worker_role"] = str(worker_role)
     if pool_member_id:
-        payload["poolMemberId"] = str(pool_member_id)
+        payload["pool_member_id"] = str(pool_member_id)
     if profile_identity:
-        payload["profileIdentity"] = str(profile_identity)
+        payload["profile_identity"] = str(profile_identity)
     if agent_instance_id:
-        payload["agentInstanceId"] = str(agent_instance_id)
+        payload["agent_instance_id"] = str(agent_instance_id)
 
-    endpoint_path = "/api/direct-agent-events"
+    endpoint_path = "/v1/delivery/intents"
     endpoint = join_api_url(base_url, endpoint_path)
     headers = {"Content-Type": "application/json"}
     token = str(
@@ -2575,6 +2614,7 @@ async def _handle_direct_agent_message(args: dict[str, Any] | None = None, **kwa
 
     return json.dumps({
         "status": "ok",
+        "delivery_intent_id": data.get("id") if isinstance(data, dict) else None,
         "message": data,
     })
 

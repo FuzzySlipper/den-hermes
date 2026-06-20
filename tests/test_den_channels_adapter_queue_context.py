@@ -1535,15 +1535,12 @@ def test_direct_agent_message_handler_uses_adapter_config_and_defaults_sender(mo
     parsed = json.loads(result)
 
     assert parsed["status"] == "ok"
-    assert captured["url"] == "http://channels.test/api/direct-agent-events"
-    assert captured["json"] == {
-        "channelId": 569,
-        "memberIdentity": "reviewer",
-        "senderIdentity": "profile-runner",
-        "body": "please reply",
-    }
-    assert captured["headers"]["Authorization"] == "Bearer secret-token"
-    assert "secret-token" not in result
+    assert captured["url"] == "http://channels.test/v1/delivery/intents"
+    assert captured["json"]["target_identity"] == {"profile": "reviewer", "instance_id": "reviewer@unknown"}
+    assert captured["json"]["idempotency_key"].startswith("wake:ch569:reviewer:")
+    assert captured["json"]["source_ref"].startswith("wake://reviewer?body=")
+    assert captured["json"]["ttl_seconds"] == 300
+    assert captured["json"]["channel_id"] == 569
 
 
 def test_direct_agent_message_handler_accepts_registry_args_dict(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1596,13 +1593,9 @@ def test_direct_agent_message_handler_accepts_registry_args_dict(monkeypatch: py
     parsed = json.loads(result)
 
     assert parsed["status"] == "ok"
-    assert captured["url"] == "http://channels.test/api/direct-agent-events"
-    assert captured["json"] == {
-        "channelId": 569,
-        "memberIdentity": "reviewer",
-        "senderIdentity": "profile-runner",
-        "body": "please reply",
-    }
+    assert captured["url"] == "http://channels.test/v1/delivery/intents"
+    assert captured["json"]["target_identity"] == {"profile": "reviewer", "instance_id": "reviewer@unknown"}
+    assert captured["json"]["channel_id"] == 569
 
 
 def test_direct_agent_message_handler_forwards_explicit_worker_selectors(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1662,20 +1655,23 @@ def test_direct_agent_message_handler_forwards_explicit_worker_selectors(monkeyp
     parsed = json.loads(result)
 
     assert parsed["status"] == "ok"
-    assert captured["url"] == "http://channels.test/api/direct-agent-events"
-    assert captured["json"] == {
-        "channelId": 604,
-        "memberIdentity": "spawned-reviewer",
-        "senderIdentity": "pi-crew-runner",
-        "body": "review task 2528",
-        "targetTaskId": 2528,
-        "assignmentId": "1375",
-        "workerRunId": "piw-review-1375",
-        "workerRole": "reviewer",
-        "profileIdentity": "spawned-reviewer",
-        "poolMemberId": "pool-reviewer-03",
-        "agentInstanceId": "hermes:den-k8:spawned-reviewer:pool-reviewer-03:live",
+    assert captured["url"] == "http://channels.test/v1/delivery/intents"
+    json_payload = captured["json"]
+    assert json_payload["target_identity"] == {
+        "profile": "spawned-reviewer",
+        "instance_id": "hermes:den-k8:spawned-reviewer:pool-reviewer-03:live",
     }
+    assert json_payload["idempotency_key"].startswith("wake:ch604:spawned-reviewer:piw-review-1375")
+    assert json_payload["source_ref"].startswith("wake://spawned-reviewer?body=")
+    assert json_payload["ttl_seconds"] == 300
+    assert json_payload["channel_id"] == 604
+    assert json_payload["target_task_id"] == 2528
+    assert json_payload["assignment_id"] == "1375"
+    assert json_payload["worker_run_id"] == "piw-review-1375"
+    assert json_payload["worker_role"] == "reviewer"
+    assert json_payload["profile_identity"] == "spawned-reviewer"
+    assert json_payload["pool_member_id"] == "pool-reviewer-03"
+    assert json_payload["agent_instance_id"] == "hermes:den-k8:spawned-reviewer:pool-reviewer-03:live"
 
 
 def test_direct_agent_message_tool_schema_exposes_worker_selector_fields() -> None:

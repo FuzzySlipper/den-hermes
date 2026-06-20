@@ -40,7 +40,7 @@ from den_hermes.api_urls import join_api_url
 from den_hermes.orchestrator import DenWorkflowAdapter
 
 
-EXPECTED_DIRECT_AGENT_PATH = "/api/direct-agent-events"
+EXPECTED_DELIVERY_INTENTS_PATH = "/v1/delivery/intents"
 DEFAULT_CHANNELS_URL = "http://channels.test"
 TEST_MEMBER = "pool-coder-01"
 TEST_CHANNEL_ID = 42
@@ -75,16 +75,16 @@ def smoke_url_construction() -> list[str]:
     """Verify _channels_request constructs the correct URL from different base URLs."""
     errors: list[str] = []
     cases = [
-        ("http://host.test", f"http://host.test{EXPECTED_DIRECT_AGENT_PATH}"),
-        ("http://host.test/", f"http://host.test{EXPECTED_DIRECT_AGENT_PATH}"),
-        ("http://192.168.1.10:18080", f"http://192.168.1.10:18080{EXPECTED_DIRECT_AGENT_PATH}"),
+        ("http://host.test", f"http://host.test{EXPECTED_DELIVERY_INTENTS_PATH}"),
+        ("http://host.test/", f"http://host.test{EXPECTED_DELIVERY_INTENTS_PATH}"),
+        ("http://192.168.1.10:18080", f"http://192.168.1.10:18080{EXPECTED_DELIVERY_INTENTS_PATH}"),
         # Historical profile configs may include API suffixes. The bridge must
         # normalize these before appending an absolute API endpoint.
-        ("http://host.test/api", f"http://host.test{EXPECTED_DIRECT_AGENT_PATH}"),
-        ("http://host.test/api", f"http://host.test{EXPECTED_DIRECT_AGENT_PATH}"),
+        ("http://host.test/api", f"http://host.test{EXPECTED_DELIVERY_INTENTS_PATH}"),
+        ("http://host.test/api", f"http://host.test{EXPECTED_DELIVERY_INTENTS_PATH}"),
     ]
     for base, expected in cases:
-        actual = join_api_url(base, EXPECTED_DIRECT_AGENT_PATH)
+        actual = join_api_url(base, EXPECTED_DELIVERY_INTENTS_PATH)
         if actual != expected:
             errors.append(
                 f"shared URL mismatch: base={base!r}\n"
@@ -159,7 +159,7 @@ def smoke_error_diagnostics() -> list[str]:
             "ok": False,
             "error": "HTTP Error 404: Not Found",
             "method": method,
-            "url": f"{DEFAULT_CHANNELS_URL}{EXPECTED_DIRECT_AGENT_PATH}",
+            "url": f"{DEFAULT_CHANNELS_URL}{EXPECTED_DELIVERY_INTENTS_PATH}",
             "base_url": DEFAULT_CHANNELS_URL,
             "endpoint": path,
         }
@@ -179,9 +179,9 @@ def smoke_error_diagnostics() -> list[str]:
             f"Expected failure_category='worker_wake_channels_route_error', "
             f"got {result.get('failure_category')!r}"
         )
-    if "direct-agent-events" not in str(result.get("diagnostic", "")):
+    if "/v1/delivery/intents" in str("delivery/intents") or "/delivery/intents" not in str(result.get("diagnostic", "")):
         errors.append(
-            "diagnostic should mention canonical direct-agent-events endpoint: "
+            "diagnostic should mention delivery/intents endpoint: "
             f"{result.get('diagnostic')}"
         )
     if DEFAULT_CHANNELS_URL not in str(result.get("diagnostic", "")):
@@ -289,11 +289,11 @@ def smoke_base_url_resolution() -> list[str]:
         errors.append(
             f"DEN_GATEWAY_URL appears to be path-prefixed: {base!r}. "
             f"This will cause double-path when appended to "
-            f"/api/direct-agent-events. Expected bare host URL "
+            f"/v1/delivery/intents. Expected bare host URL "
             f"(e.g. http://192.168.1.10:18080)."
         )
     else:
-        expected_url = f"{base}{EXPECTED_DIRECT_AGENT_PATH}"
+        expected_url = f"{base}{EXPECTED_DELIVERY_INTENTS_PATH}"
         errors.append(
             f"LIVE BASE URL: {base_live!r}\n"
             f"  Expected endpoint: {expected_url}\n"
@@ -352,7 +352,7 @@ def main(argv: list[str] | None = None) -> int:
             import urllib.error
 
             base = base_live.rstrip("/")
-            url = f"{base}{EXPECTED_DIRECT_AGENT_PATH}"
+            url = f"{base}{EXPECTED_DELIVERY_INTENTS_PATH}"
             payload = json.dumps({
                 "channelId": TEST_CHANNEL_ID,
                 "memberIdentity": "smoke-test-agent",
@@ -411,14 +411,14 @@ def main(argv: list[str] | None = None) -> int:
                 "handler both use DEN_CHANNELS_URL or DEN_GATEWAY_URL. If DEN_GATEWAY_URL "
                 "is set to a path-prefixed URL (e.g. http://host:port/api), "
                 "the plugin handler constructs a double-path endpoint "
-                "(e.g. http://host:port/api/api/direct-agent-events) "
+                "(e.g. http://host:port/api/api/v1/delivery/intents) "
                 "which returns 404. The planner's curl bypasses this by using the "
                 "bare host URL directly. The fix is to ensure DEN_GATEWAY_URL is the "
                 "bare host (http://192.168.1.10:18080) and let the code append "
-                "/api/direct-agent-events."
+                "/v1/delivery/intents."
             ),
             "request_shape_summary": (
-                "POST /api/direct-agent-events with JSON body: "
+                "POST /v1/delivery/intents with JSON body: "
                 "channelId, memberIdentity, senderIdentity, body + optional "
                 "assignmentId, workerRunId, workerRole, poolMemberId, "
                 "profileIdentity, sourceProjectId, targetTaskId. "

@@ -2903,17 +2903,20 @@ class TestDirectAgentWakeBridge:
 
         assert result["ok"] is True
         assert captured["method"] == "POST"
-        assert captured["path"] == "/api/direct-agent-events"
+        assert captured["path"] == "/v1/delivery/intents"
         payload = captured["json_payload"]
-        assert payload["channelId"] == 42
-        assert payload["memberIdentity"] == "pool-coder-01"
-        assert payload["assignmentId"] == "132"
-        assert payload["workerRunId"] == "dc-1911-send-wake"
-        assert payload["workerRole"] == "coder"
-        assert payload["poolMemberId"] == "pool-coder-01"
-        assert payload["profileIdentity"] == "spawned-coder"
-        assert payload["sourceProjectId"] == "den-hermes-bridge"
-        assert payload["targetTaskId"] == 1911
+        assert payload["channel_id"] == 42
+        assert payload["target_identity"] == {"profile": "pool-coder-01", "instance_id": "pool-coder-01"}
+        assert payload["idempotency_key"].startswith("wake:ch42:pool-coder-01:")
+        assert payload["source_ref"].startswith("wake://pool-coder-01?body=")
+        assert payload["ttl_seconds"] == 300
+        assert payload["assignment_id"] == "132"
+        assert payload["worker_run_id"] == "dc-1911-send-wake"
+        assert payload["worker_role"] == "coder"
+        assert payload["pool_member_id"] == "pool-coder-01"
+        assert payload["profile_identity"] == "spawned-coder"
+        assert payload["source_project_id"] == "den-hermes-bridge"
+        assert payload["target_task_id"] == 1911
 
     def test_send_direct_agent_error_diagnostics_include_url(self):
         """Error responses include base URL and endpoint for debugging."""
@@ -2929,7 +2932,7 @@ class TestDirectAgentWakeBridge:
                 "ok": False,
                 "error": "HTTP Error 404: Not Found",
                 "method": method,
-                "url": "http://channels.test/api/direct-agent-events",
+                "url": "http://channels.test/v1/delivery/intents",
                 "base_url": "http://channels.test",
                 "endpoint": path,
             }
@@ -2943,7 +2946,7 @@ class TestDirectAgentWakeBridge:
 
         assert result["ok"] is False
         assert result["failure_category"] == "worker_wake_channels_route_error"
-        assert "direct-agent-events" in result["diagnostic"]
+        assert "delivery/intents" in result["diagnostic"]
         assert "channels.test" in result["diagnostic"]
 
     def test_send_direct_agent_diagnostic_uses_normalized_url(self):
@@ -2962,8 +2965,8 @@ class TestDirectAgentWakeBridge:
         )
 
         assert result["ok"] is False
-        assert result["url"] == "http://channels.test/api/direct-agent-events"
-        assert "http://channels.test/api/direct-agent-events" in result["diagnostic"]
+        assert result["url"] == "http://channels.test/v1/delivery/intents"
+        assert "http://channels.test/v1/delivery/intents" in result["diagnostic"]
         assert "/api/gateway/api/gateway/" not in result["diagnostic"]
 
     def test_channels_request_error_includes_url_and_method(self):
@@ -2982,15 +2985,15 @@ class TestDirectAgentWakeBridge:
         original_urlopen = urllib.request.urlopen
         try:
             urllib.request.urlopen = failing_urlopen
-            result = adapter._channels_request("POST", "/api/direct-agent-events", json_payload={"test": True})
+            result = adapter._channels_request("POST", "/v1/delivery/intents", json_payload={"test": True})
         finally:
             urllib.request.urlopen = original_urlopen
 
         assert result["ok"] is False
         assert result["method"] == "POST"
-        assert result["url"] == "http://channels.test/api/direct-agent-events"
+        assert result["url"] == "http://channels.test/v1/delivery/intents"
         assert result["base_url"] == "http://channels.test"
-        assert result["endpoint"] == "/api/direct-agent-events"
+        assert result["endpoint"] == "/v1/delivery/intents"
         assert "Connection refused" in result["error"]
 
     def test_send_direct_agent_error_diagnostic_structure(self):
@@ -3007,7 +3010,7 @@ class TestDirectAgentWakeBridge:
                 "ok": False,
                 "error": "Unauthorized",
                 "method": method,
-                "url": "http://channels.test/api/direct-agent-events",
+                "url": "http://channels.test/v1/delivery/intents",
                 "base_url": "http://channels.test",
                 "endpoint": path,
             }
@@ -3027,12 +3030,12 @@ class TestDirectAgentWakeBridge:
     def test_direct_agent_url_normalization_uses_shared_helper(self):
         assert join_api_url(
             "http://channels.test/api/gateway",
-            "/api/direct-agent-events",
-        ) == "http://channels.test/api/direct-agent-events"
+            "/v1/delivery/intents",
+        ) == "http://channels.test/v1/delivery/intents"
         assert join_api_url(
             "http://channels.test/api",
-            "/api/direct-agent-events",
-        ) == "http://channels.test/api/direct-agent-events"
+            "/v1/delivery/intents",
+        ) == "http://channels.test/v1/delivery/intents"
 
     def test_direct_agent_failure_category_classifies_common_urllib_errors(self):
         from email.message import Message
@@ -3043,7 +3046,7 @@ class TestDirectAgentWakeBridge:
         assert _classify_channels_error_text("Name or service not known") == "worker_wake_channels_dns_error"
         assert _classify_channels_error_text("timed out") == "worker_wake_channels_timeout"
         assert _classify_url_request_failure(HTTPError(
-            "http://channels.test/api/direct-agent-events",
+            "http://channels.test/v1/delivery/intents",
             404,
             "Not Found",
             hdrs=Message(),

@@ -9,9 +9,8 @@ class RecordingChannelsTools:
         self.messages = {321: {"id": 321, "deliveryRequestId": 654, "sourceKind": "direct_agent_message"}}
         self.send_response = {
             "status": "ok",
-            "message": {"id": 321, "deliveryRequestId": 654},
-            "message_id": 321,
-            "delivery_request_id": 654,
+            "delivery_intent_id": 321,
+            "message": {"id": 321},
         }
         self.events = [{"id": 9, "eventType": "recorded_pending_claim", "messageId": 321}]
 
@@ -66,9 +65,9 @@ def test_send_agent_message_resolves_explicit_channel_and_returns_evidence():
     assert result.channel_id == 5
     assert result.channel_slug == "project-den-hermes-bridge"
     assert result.message_id == 321
-    assert result.delivery_request_id == 654
-    assert result.direct_agent_event_url == "http://den.test/api/direct-agent-events/321"
-    assert result.direct_agent_events_url == "http://den.test/api/direct-agent-events?channelId=5&afterId=0"
+    assert result.delivery_intent_id == 321
+    assert result.delivery_intent_url == "http://den.test/v1/delivery/intents/321"
+    assert result.delivery_intents_url == "http://den.test/v1/delivery/intents"
     assert result.delivery_status == "recorded_pending_claim"
     assert tools.last_events_query == {"channel_id": 5, "after_id": 320, "limit": 50}
     assert tools.sent == [
