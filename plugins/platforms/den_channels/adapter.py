@@ -1165,6 +1165,13 @@ class DenChannelsAdapter(BasePlatformAdapter):
         self._sleep = sleep or asyncio.sleep
         token = str(extra.get("token") or os.getenv("DEN_GATEWAY_TOKEN") or "").strip() or None
         channels_token = str(extra.get("channels_token") or os.getenv("DEN_CHANNELS_TOKEN") or token or "").strip() or None
+        observation_token = str(
+            extra.get("observation_token")
+            or os.getenv("DEN_OBSERVATION_TOKEN")
+            or channels_token
+            or token
+            or ""
+        ).strip() or None
         _remember_direct_agent_config(
             gateway_url=self.gateway_url,
             delivery_url=self.delivery_url,
@@ -1180,7 +1187,7 @@ class DenChannelsAdapter(BasePlatformAdapter):
         self.channels_client = channels_client or DenChannelsClient(self.channels_url, token=channels_token)
         self.observation_client = DenObservationClient(
             self.observation_url,
-            token=(channels_token or token or None),
+            token=observation_token,
         )
         self._claim_task: asyncio.Task | None = None
         self._event_task: asyncio.Task | None = None

@@ -42,6 +42,15 @@ optional_env:
       to the conversation API base (DEN_CHANNELS_URL) for backward compatibility.
     prompt: "Den observation URL"
     password: false
+  - name: DEN_OBSERVATION_TOKEN
+    description: >
+      Bearer token for the observation/activity API. When set, overrides
+      DEN_CHANNELS_TOKEN for observation writes. Required when observation
+      is served through the Gateway with a separate write-auth token
+      (DEN_GATEWAY_OBSERVATION_WRITE_TOKEN). Falls back to DEN_CHANNELS_TOKEN
+      when not set.
+    prompt: "Den observation token"
+    password: true
   - name: DEN_CONVERSATION_URL
     description: >
       Gateway/conversation successor URL for channel-message writes. When
