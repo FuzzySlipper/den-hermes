@@ -82,7 +82,7 @@ class SpawnedHermesProfileWakeTransport:
         self.source = source
 
     def wake_profile(self, *, binding: Mapping[str, Any], envelope: Mapping[str, Any]) -> Mapping[str, Any]:
-        from den_hermes.runtime_registry import DEFAULT_RUNTIME_REGISTRY_PATH, resolve_role_runtime
+        from den_hermes.runtime_registry import DEFAULT_RUNTIME_REGISTRY_PATH, _legacy_resolve_role_runtime
 
         role = _required_str(binding, "role")
         binding_profile = _binding_profile(binding)
@@ -90,7 +90,7 @@ class SpawnedHermesProfileWakeTransport:
             raise RuntimeError(f"binding {_binding_instance_id(binding)} has no Hermes profile")
         run_id = str(self.run_id_factory())
         try:
-            runtime = resolve_role_runtime(
+            runtime = _legacy_resolve_role_runtime(
                 role,
                 registry_path=self.runtime_registry_path or DEFAULT_RUNTIME_REGISTRY_PATH,
                 run_id=run_id,

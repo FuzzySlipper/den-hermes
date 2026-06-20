@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from den_hermes.runtime_registry import RuntimeRegistryError, resolve_role_runtime
+from den_hermes.runtime_registry import RuntimeRegistryError, _legacy_resolve_role_runtime
 
 
 @dataclass(frozen=True)
@@ -640,7 +640,7 @@ def _resolve_workflow_worker_config(
 
     runtime_fields = {"profile", "provider", "model", "toolsets", "timeout_seconds", "runtime_id"}
     overrides = {key: config[key] for key in runtime_fields if key in config}
-    runtime = resolve_role_runtime(
+    runtime = _legacy_resolve_role_runtime(
         role,
         registry_path=registry_path,
         run_id=run_id,

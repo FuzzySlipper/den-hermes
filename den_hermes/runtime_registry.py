@@ -15,7 +15,23 @@ CANONICAL_ROLES = frozenset({"coder", "reviewer", "validator", "drift_checker", 
 SECRETISH_PATTERN = re.compile(r"(?i)(sk-[a-z0-9_-]{8,}|api[_-]?key|auth[_-]?token|secret|bearer\s+)")
 DEFAULT_PREFLIGHT_PROMPT = "Reply with exactly: PROFILE_OK"
 DEFAULT_PREFLIGHT_EXPECTED = "PROFILE_OK"
-DEFAULT_RUNTIME_REGISTRY_PATH = Path("/home/agents/runtime/spawned-hermes-runtimes.yaml")
+DEFAULT_RUNTIME_REGISTRY_PATH = Path("/home/agents/runtime/retired/20260608-spawned-hermes-runtimes-yaml/spawned-hermes-runtimes.yaml")
+
+
+# ── 2026-06-19: RETIRED / LEGACY ──────────────────────────────────
+#
+# The YAML runtime registry at spawned-hermes-runtimes.yaml has been
+# retired.  The live worker-pool runtime authority is:
+#
+#   Den Core pool members/assignments/leases
+#   + Channels direct-agent delivery
+#   + concrete Hermes profile/service config
+#   + Pi Crew runtime back-end
+#
+# resolve_role_runtime() now fails closed with a clear message.
+# The old implementation is preserved in _legacy_resolve_role_runtime()
+# so existing tests can still import and validate the shape.
+# ──────────────────────────────────────────────────────────────────
 
 
 class RuntimeRegistryError(ValueError):
@@ -113,6 +129,44 @@ class ResolvedRuntime:
 
 
 def resolve_role_runtime(
+    role: str,
+    *,
+    registry_path: str | Path | None = None,
+    run_id: str | None = None,
+    overrides: Mapping[str, Any] | None = None,
+    allow_runtime_override: bool = False,
+    override_reason: str | None = None,
+    requested_by: str | None = None,
+) -> ResolvedRuntime:
+    """Resolve a Den worker role to a spawned-Hermes runtime configuration.
+
+    RETIRED (2026-06-19): The spawned-Hermes YAML runtime registry is
+    no longer the live worker-pool runtime authority.  This function
+    now fails closed with a clear migration message.
+
+    Live worker-pool runtime authority:
+      - Den Core pool members / assignments / leases
+      - Channels direct-agent delivery / adapter bindings / wake
+      - Concrete Hermes profile / service config
+      - Pi Crew runtime back-end
+
+    If you need the old YAML-based resolution (e.g. for tests or legacy
+    scripts), call ``_legacy_resolve_role_runtime`` directly with an
+    explicit ``registry_path`` argument pointing at the retired YAML.
+    """
+    raise RuntimeRegistryError(
+        "The spawned-Hermes YAML runtime registry is RETIRED (2026-06-19). "
+        "Live worker-pool runtime authority comes from Den Core pool "
+        "members/assignments/leases and Channels direct-agent delivery, "
+        "not the old YAML file. "
+        "Call _legacy_resolve_role_runtime() with an explicit registry_path "
+        "if you need the old YAML resolution for test fixtures or "
+        "historical reference. "
+        f"Requested role: {role}, registry_path: {registry_path or DEFAULT_RUNTIME_REGISTRY_PATH}"
+    )
+
+
+def _legacy_resolve_role_runtime(
     role: str,
     *,
     registry_path: str | Path | None = None,

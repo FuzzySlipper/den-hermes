@@ -5,9 +5,19 @@ import subprocess
 from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
 
-from den_hermes.runtime_registry import CANONICAL_ROLES, SECRETISH_PATTERN, RuntimeRegistryError, resolve_role_runtime
+from den_hermes.runtime_registry import CANONICAL_ROLES, SECRETISH_PATTERN, RuntimeRegistryError, _legacy_resolve_role_runtime
 
 DEFAULT_ROLE_ORDER = ["coder", "reviewer", "validator", "drift_checker", "packet_auditor", "project_orchestrator"]
+
+
+def _warn_retired() -> None:
+    import logging
+    logging.getLogger(__name__).warning(
+        "validate_runtime_registry / dump_runtime_registry are RETIRED (2026-06-19). "
+        "The spawned-Hermes YAML runtime registry is no longer the live "
+        "worker-pool runtime authority. Use Den Core pool members/assignments "
+        "and Channels direct-agent delivery instead."
+    )
 
 
 def _redact(text: Any) -> str:
@@ -15,7 +25,8 @@ def _redact(text: Any) -> str:
 
 
 def validate_runtime_registry(registry_path: str | Path | None = None) -> dict[str, Any]:
-    runtimes = [resolve_role_runtime(role, registry_path=registry_path) for role in DEFAULT_ROLE_ORDER]
+    _warn_retired()
+    runtimes = [_legacy_resolve_role_runtime(role, registry_path=registry_path) for role in DEFAULT_ROLE_ORDER]
     return {
         "ok": True,
         "registry_id": runtimes[0].registry_id,
@@ -26,7 +37,8 @@ def validate_runtime_registry(registry_path: str | Path | None = None) -> dict[s
 
 
 def format_runtime_matrix(registry_path: str | Path | None = None, roles: Iterable[str] | None = None) -> str:
-    runtimes = [resolve_role_runtime(role, registry_path=registry_path) for role in (roles or DEFAULT_ROLE_ORDER)]
+    _warn_retired()
+    runtimes = [_legacy_resolve_role_runtime(role, registry_path=registry_path) for role in (roles or DEFAULT_ROLE_ORDER)]
     if not runtimes:
         raise RuntimeRegistryError("No roles selected for runtime matrix")
 
@@ -53,7 +65,7 @@ def preflight_runtime_roles(
     run_command = runner or _subprocess_runner
     results: list[dict[str, Any]] = []
     for role in roles or DEFAULT_ROLE_ORDER:
-        runtime = resolve_role_runtime(role, registry_path=registry_path)
+        runtime = _legacy_resolve_role_runtime(role, registry_path=registry_path)
         command = runtime.preflight_command()
         timeout_seconds = int(runtime.preflight.get("timeout_seconds", 300))
         completed = run_command(command, timeout_seconds)

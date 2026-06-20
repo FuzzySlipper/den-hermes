@@ -12,7 +12,7 @@ from typing import Any, Mapping
 from urllib.parse import quote
 
 from den_hermes.api_urls import join_api_url
-from den_hermes.runtime_registry import DEFAULT_RUNTIME_REGISTRY_PATH, RuntimeRegistryError, resolve_role_runtime
+from den_hermes.runtime_registry import DEFAULT_RUNTIME_REGISTRY_PATH, RuntimeRegistryError, _legacy_resolve_role_runtime as resolve_role_runtime
 from den_hermes.worker_launcher import run_hermes_worker, _verify_git_branch_head
 from den_hermes.pool_drift import check_pool_runtime_drift
 from den_hermes.work_complete_notifier import (

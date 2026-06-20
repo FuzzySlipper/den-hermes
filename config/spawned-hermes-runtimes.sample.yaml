@@ -1,7 +1,14 @@
-# Sample central spawned-Hermes runtime registry.
-# Copy to /home/agents/runtime/spawned-hermes-runtimes.yaml
-# or point DEN_HERMES_RUNTIME_REGISTRY at an operator-owned copy.
-# Do not put API keys, auth tokens, .env contents, auth.json contents, or full environment dumps here.
+# RETIRED (2026-06-19): The spawned-Hermes YAML runtime registry has been
+# retired as the live worker-pool runtime authority.
+#
+# This sample file is preserved for historical reference and test fixtures.
+# Do NOT copy it to /home/agents/runtime/ — that path is no longer active.
+#
+# Live worker-pool runtime authority:
+#   - Den Core pool members / assignments / leases
+#   - Channels direct-agent delivery / adapter bindings / wake
+#   - Concrete Hermes profile / service config
+#   - Pi Crew runtime back-end
 
 schema_version: 1
 registry_id: den-hermes-runner-defaults

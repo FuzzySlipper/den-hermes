@@ -3,7 +3,7 @@ import subprocess
 
 import pytest
 
-from den_hermes.runtime_registry import RuntimeRegistryError, resolve_role_runtime
+from den_hermes.runtime_registry import RuntimeRegistryError, _legacy_resolve_role_runtime as resolve_role_runtime
 from den_hermes.orchestrator import (
     DenWorkflowAdapter,
     handle_review_outcome,
