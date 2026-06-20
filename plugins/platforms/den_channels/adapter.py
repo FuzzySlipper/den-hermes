@@ -643,6 +643,76 @@ def _remember_direct_agent_config(
     _DIRECT_AGENT_CONFIG_DEFAULTS.update({key: value for key, value in updates.items() if value})
 
 
+class DenObservationClient:
+    """Thin async HTTP client for posting agent_activity.v1 events to Observation.
+
+    Posts ``agent_activity.v1`` payloads to ``POST /v1/observation/activity-events``
+    (or the compatible ``/v1/observation/lifecycle-events`` alias).  Gracefully
+    degrades on network/connectivity errors — logged at debug, never raises.
+    """
+
+    def __init__(
+        self,
+        base_url: str,
+        *,
+        token: str | None = None,
+        timeout: float = 15.0,
+    ) -> None:
+        self._base_url = base_url.rstrip("/")
+        self._token = token
+        self._timeout = timeout
+
+    @property
+    def is_configured(self) -> bool:
+        return bool(self._base_url)
+
+    async def post_activity_event(
+        self,
+        source_domain: str,
+        event_type: str,
+        agent_identity: dict[str, Any],
+        payload: dict[str, Any],
+    ) -> None:
+        """Post an agent_activity.v1 event to observation.
+
+        Logs and silently degrades on transport errors.  Never raises.
+        """
+        if not self.is_configured:
+            return
+        import httpx
+
+        headers: dict[str, str] = {}
+        if self._token:
+            headers["Authorization"] = f"Bearer {self._token}"
+        body = {
+            "source_domain": source_domain,
+            "event_type": event_type,
+            "agent_identity": agent_identity,
+            "payload": payload,
+        }
+        try:
+            async with httpx.AsyncClient(timeout=self._timeout) as client:
+                resp = await client.post(
+                    f"{self._base_url}/v1/observation/activity-events",
+                    json=body,
+                    headers=headers,
+                )
+                resp.raise_for_status()
+                logger.debug(
+                    "[DenObservation] posted %s for %s (%s)",
+                    event_type,
+                    agent_identity.get("profile", "?"),
+                    resp.status_code,
+                )
+        except Exception:
+            logger.debug(
+                "[DenObservation] failed to post %s for %s",
+                event_type,
+                agent_identity.get("profile", "?"),
+                exc_info=True,
+            )
+
+
 class DenGatewayClient:
     """Small async HTTP client for Den Gateway delivery APIs."""
 
@@ -1108,6 +1178,10 @@ class DenChannelsAdapter(BasePlatformAdapter):
         )
         self.gateway_client = gateway_client or (DenGatewayClient(self.gateway_url, token=token) if self.gateway_url else None)
         self.channels_client = channels_client or DenChannelsClient(self.channels_url, token=channels_token)
+        self.observation_client = DenObservationClient(
+            self.observation_url,
+            token=(channels_token or token or None),
+        )
         self._claim_task: asyncio.Task | None = None
         self._event_task: asyncio.Task | None = None
         self._sync_cursors_to_server = _coerce_bool(
@@ -1177,10 +1251,21 @@ class DenChannelsAdapter(BasePlatformAdapter):
             except Exception:
                 logger.debug("[DenChannels] subscription init failed on connect", exc_info=True)
 
+        await self._emit_observation_activity(
+            "adapter_connected",
+            summary=f"Hermes {self.profile} connected to Den Channels.",
+            surface="channel",
+        )
         return True
 
     async def disconnect(self) -> None:
         self._running = False
+        await self._emit_observation_activity(
+            "adapter_disconnected",
+            severity="warning",
+            summary=f"Hermes {self.profile} disconnected from Den Channels.",
+            reason_code="graceful_shutdown",
+        )
         if self._claim_task and not self._claim_task.done():
             self._claim_task.cancel()
             try:
@@ -1483,6 +1568,20 @@ class DenChannelsAdapter(BasePlatformAdapter):
                 context.channel_id,
                 context.session_key,
             )
+            await self._emit_observation_activity(
+                "work_started",
+                summary=f"Hermes {self.profile} processing delivery {context.delivery_request_id}.",
+                visibility="agent",
+                surface="worker",
+                session_key=context.session_key,
+                work_ref={
+                    "project_id": context.project_id,
+                    "task_id": _coerce_int(
+                        _first(context.raw_delivery or {}, "task_id", "taskId")
+                    ),
+                    "channel_id": context.channel_id,
+                },
+            )
 
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
         task = asyncio.current_task()
@@ -1497,14 +1596,99 @@ class DenChannelsAdapter(BasePlatformAdapter):
                 # instead of leaving it claimed forever.
                 if context is not None:
                     await self._mark_failed(context, "processing_no_response", event.raw_message)
+                    await self._emit_observation_activity(
+                        "work_failed",
+                        severity="error",
+                        summary=f"Hermes {self.profile} processing {context.delivery_request_id}: no response.",
+                        reason_code="processing_no_response",
+                        visibility="agent",
+                        surface="worker",
+                        session_key=context.session_key,
+                        work_ref={
+                            "project_id": context.project_id,
+                            "channel_id": context.channel_id,
+                        } if context else None,
+                    )
                     self._clear_context(context)
                 return
             context = self._build_context(event) or context or self._context_for_event(event)
             if context is not None:
                 await self._mark_failed(context, f"processing_{getattr(outcome, 'value', outcome)}", event.raw_message)
+                await self._emit_observation_activity(
+                    "work_failed",
+                    severity="error",
+                    summary=f"Hermes {self.profile} processing {context.delivery_request_id}: {getattr(outcome, 'value', outcome)}.",
+                    reason_code=f"processing_{getattr(outcome, 'value', outcome)}",
+                    visibility="agent",
+                    surface="worker",
+                    work_ref={
+                        "project_id": context.project_id,
+                        "channel_id": context.channel_id,
+                    },
+                )
                 self._clear_context(context)
         finally:
             self._clear_activity_environment(context)
+
+    def _build_observation_identity(self) -> dict[str, Any]:
+        """Build the agent_identity dict for observation events."""
+        identity: dict[str, Any] = {
+            "profile": self.profile or self.agent_identity,
+        }
+        if self.agent_instance_id:
+            identity["instance_id"] = self.agent_instance_id
+        elif self.adapter_instance_id:
+            identity["instance_id"] = self.adapter_instance_id
+        return identity
+
+    async def _emit_observation_activity(
+        self,
+        event_type: str,
+        *,
+        source_domain: str = "runtime",
+        summary: str = "",
+        severity: str = "info",
+        visibility: str = "agent",
+        surface: str = "worker",
+        session_key: str | None = None,
+        work_ref: dict[str, Any] | None = None,
+        result_ref: dict[str, Any] | None = None,
+        reason_code: str | None = None,
+        tool_name: str | None = None,
+    ) -> None:
+        """Post an agent_activity.v1 event to observation.
+
+        Async so callers (connect, disconnect, processing lifecycle) can await it.
+        All observation write failures are logged at debug and silently degraded.
+        """
+        if not self.observation_client.is_configured:
+            return
+        payload: dict[str, Any] = {
+            "kind": "agent_activity.v1",
+            "schema_version": 1,
+            "summary": (summary or "")[:240],
+            "severity": severity,
+            "visibility": visibility,
+            "adapter": "hermes",
+            "surface": surface,
+        }
+        if session_key:
+            payload["session_key"] = session_key
+        if work_ref:
+            payload["work_ref"] = work_ref
+        if result_ref:
+            payload["result_ref"] = result_ref
+        if reason_code:
+            payload["reason_code"] = reason_code
+        if tool_name:
+            payload["tool_name"] = tool_name
+
+        await self.observation_client.post_activity_event(
+            source_domain=source_domain,
+            event_type=event_type,
+            agent_identity=self._build_observation_identity(),
+            payload=payload,
+        )
 
     def _set_activity_environment(self, context: _DeliveryContext) -> None:
         payload = {
