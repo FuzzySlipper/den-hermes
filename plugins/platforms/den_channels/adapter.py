@@ -844,6 +844,46 @@ class DenGatewayClient:
         return await self._request("POST", f"/api/deliveries/{delivery_request_id}/fail", payload)
 
 
+class DenRuntimeClient:
+    """Small async HTTP client for Den Runtime successor instance APIs."""
+
+    def __init__(self, base_url: str, *, token: str | None = None, timeout: float = 15.0):
+        self.base_url = (base_url or "").rstrip("/")
+        self.token = token
+        self.timeout = timeout
+
+    @property
+    def is_configured(self) -> bool:
+        return bool(self.base_url)
+
+    async def _request(self, method: str, path: str, payload: dict[str, Any] | None = None) -> Any:
+        import httpx
+
+        headers = {"Content-Type": "application/json"}
+        if self.token:
+            headers["Authorization"] = f"Bearer {self.token}"
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            response = await client.request(method, f"{self.base_url}{path}", json=payload, headers=headers)
+            response.raise_for_status()
+            if not response.content:
+                return {}
+            return response.json()
+
+    async def register_instance(self, payload: dict[str, Any]) -> dict[str, Any]:
+        result = await self._request("POST", "/v1/runtime/instances", payload)
+        return result if isinstance(result, dict) else {}
+
+    async def heartbeat(self, instance_id: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        from urllib.parse import quote
+
+        result = await self._request(
+            "POST",
+            f"/v1/runtime/instances/{quote(instance_id, safe='')}/heartbeat",
+            payload or {"state": "active"},
+        )
+        return result if isinstance(result, dict) else {}
+
+
 class DenDeliveryClient:
     """Small async HTTP client for Den Delivery successor intent APIs."""
 
@@ -913,10 +953,25 @@ class DenDeliveryClient:
             body_values = parse_qs(parsed.query).get("body") or []
             body = body_values[0] if body_values else ""
         channel_message_id = _coerce_int(intent.get("channel_message_id"))
+        source_path = urlsplit(source_ref).path if source_ref else ""
+        source_parts = [part for part in source_path.split("/") if part]
+        source_channel_id: int | None = None
+        source_message_id: int | None = None
+        if "channels" in source_parts and "messages" in source_parts:
+            channel_index = source_parts.index("channels")
+            message_index = source_parts.index("messages")
+            if channel_index + 1 < len(source_parts) and message_index + 1 < len(source_parts):
+                source_channel_id = _coerce_int(source_parts[channel_index + 1])
+                source_message_id = _coerce_int(source_parts[message_index + 1])
+        if channel_message_id is None and source_message_id is not None:
+            channel_message_id = source_message_id
         metadata: dict[str, Any] = {
             "delivery_successor_intent": True,
             "claim_token": claim_token,
+            "source_ref": source_ref,
         }
+        if source_channel_id is not None:
+            metadata["channel_id"] = source_channel_id
         if channel_message_id is not None:
             metadata["channel_message_id"] = channel_message_id
         return {
@@ -1144,37 +1199,70 @@ class _DirectAgentEventPoller:
 
 
 class DenConversationClient:
-    """Small async HTTP client for Conversation successor channel-message writes."""
+    """Small async HTTP client for Conversation successor channel-message APIs."""
 
-    def __init__(self, base_url: str, *, token: str | None = None, timeout: float = 15.0):
+    def __init__(
+        self,
+        base_url: str,
+        *,
+        token: str | None = None,
+        read_token: str | None = None,
+        timeout: float = 15.0,
+    ):
         self.base_url = (base_url or "").rstrip("/")
         self.token = token
+        self.read_token = read_token or token
         self.timeout = timeout
 
-    async def post_channel_message(self, channel_id: str | int, payload: dict[str, Any], *, dedupe_key: str | None = None) -> dict[str, Any]:
-        if not self.base_url:
-            raise RuntimeError("DEN_CONVERSATION_URL is required for channel-message replies")
-        if not self.token:
-            raise RuntimeError("DEN_CONVERSATION_TOKEN is required for channel-message replies")
-        import httpx
-
+    def _headers(self, token: str | None, *, dedupe_key: str | None = None) -> dict[str, str]:
+        if not token:
+            raise RuntimeError("DEN_CONVERSATION_TOKEN is required for Conversation successor access")
         headers = {
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {self.token}",
+            "Authorization": f"Bearer {token}",
             "X-Den-Migrated-Functions": "true",
         }
         if dedupe_key:
             headers["Idempotency-Key"] = dedupe_key
+        return headers
+
+    async def post_channel_message(self, channel_id: str | int, payload: dict[str, Any], *, dedupe_key: str | None = None) -> dict[str, Any]:
+        if not self.base_url:
+            raise RuntimeError("DEN_CONVERSATION_URL is required for channel-message replies")
+        import httpx
+
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             response = await client.post(
                 f"{self.base_url}/v1/conversation/channels/{channel_id}/messages",
                 json=payload,
-                headers=headers,
+                headers=self._headers(self.token, dedupe_key=dedupe_key),
             )
             response.raise_for_status()
             if not response.content:
                 return {}
             return response.json()
+
+    async def get_channel_message(self, channel_id: str | int, message_id: str | int) -> dict[str, Any]:
+        if not self.base_url:
+            raise RuntimeError("DEN_CONVERSATION_URL is required for channel-message readback")
+        import httpx
+
+        message_int = _coerce_int(message_id)
+        after_id = max(0, (message_int or 1) - 1)
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            response = await client.get(
+                f"{self.base_url}/v1/conversation/channels/{channel_id}/messages?after_id={after_id}&limit=10",
+                headers=self._headers(self.read_token),
+            )
+            response.raise_for_status()
+            if not response.content:
+                return {}
+            payload = response.json()
+            items = payload if isinstance(payload, list) else (payload.get("messages") or payload.get("items") or []) if isinstance(payload, dict) else []
+            for item in items:
+                if isinstance(item, dict) and _coerce_int(_first(item, "id", "message_id", "channel_message_id")) == message_int:
+                    return item
+            raise RuntimeError(f"Conversation message {message_id} was not returned by readback")
 
 
 class DenChannelsClient:
@@ -1332,6 +1420,7 @@ class DenChannelsAdapter(BasePlatformAdapter):
         gateway_client: Any | None = None,
         channels_client: Any | None = None,
         conversation_client: Any | None = None,
+        runtime_client: Any | None = None,
         sleep: Any | None = None,
     ) -> None:
         super().__init__(config, Platform(_PLATFORM_NAME))
@@ -1360,6 +1449,14 @@ class DenChannelsAdapter(BasePlatformAdapter):
                 self.channels_url,
             )
         self.delivery_url = configured_delivery_url or self.gateway_url or derived_delivery_url
+        configured_runtime_url = str(
+            extra.get("runtime_url")
+            or extra.get("RUNTIME_URL")
+            or os.getenv("DEN_RUNTIME_URL")
+            or os.getenv("DEN_GATEWAY_RUNTIME_URL")
+            or ""
+        ).rstrip("/")
+        self.runtime_url = configured_runtime_url or self.gateway_url or self.delivery_url
         self.observation_url = str(
             extra.get("observation_url")
             or extra.get("OBSERVATION_URL")
@@ -1404,6 +1501,13 @@ class DenChannelsAdapter(BasePlatformAdapter):
         self.claim_interval_seconds = float(extra.get("claim_interval_seconds") or 2.0)
         self.claim_limit = max(1, _coerce_int(extra.get("claim_limit")) or 1)
         self.lease_seconds = max(1, _coerce_int(extra.get("lease_seconds")) or 300)
+        self.runtime_heartbeat_interval_seconds = float(
+            extra.get("runtime_heartbeat_interval_seconds")
+            or os.getenv("DEN_RUNTIME_HEARTBEAT_INTERVAL_SECONDS")
+            or 30.0
+        )
+        self.runtime_required_for_delivery = _coerce_bool(extra.get("runtime_required_for_delivery"), True)
+        self._runtime_registered = False
         self.start_claim_loop = _coerce_bool(extra.get("start_claim_loop"), bool(self.gateway_url or self.delivery_url))
         self.poll_interval_seconds = float(extra.get("poll_interval_seconds") or 2.0)
         self.poll_limit = max(1, _coerce_int(extra.get("poll_limit")) or 10)
@@ -1437,6 +1541,20 @@ class DenChannelsAdapter(BasePlatformAdapter):
             or os.getenv("DEN_CONVERSATION_TOKEN")
             or ""
         ).strip() or None
+        conversation_read_token = str(
+            extra.get("conversation_read_token")
+            or os.getenv("DEN_CONVERSATION_READ_TOKEN")
+            or conversation_token
+            or ""
+        ).strip() or None
+        runtime_token = str(
+            extra.get("runtime_token")
+            or os.getenv("DEN_RUNTIME_TOKEN")
+            or os.getenv("DEN_GATEWAY_RUNTIME_TOKEN")
+            or token
+            or channels_token
+            or ""
+        ).strip() or None
         _remember_direct_agent_config(
             gateway_url=self.gateway_url,
             delivery_url=self.delivery_url,
@@ -1450,9 +1568,14 @@ class DenChannelsAdapter(BasePlatformAdapter):
         )
         self.gateway_client = gateway_client or (DenGatewayClient(self.gateway_url, token=token) if self.gateway_url else None)
         self.delivery_client = DenDeliveryClient(self.delivery_url, token=channels_token or token) if self.delivery_url else None
+        self.runtime_client = runtime_client or (DenRuntimeClient(self.runtime_url, token=runtime_token) if self.runtime_url else None)
         self.channels_client = channels_client or DenChannelsClient(self.channels_url, token=channels_token)
         self.conversation_client = conversation_client or (
-            DenConversationClient(self.conversation_url, token=conversation_token)
+            DenConversationClient(
+                self.conversation_url,
+                token=conversation_token,
+                read_token=conversation_read_token,
+            )
             if self.conversation_enabled
             else None
         )
@@ -1461,6 +1584,7 @@ class DenChannelsAdapter(BasePlatformAdapter):
             token=observation_token,
         )
         self._claim_task: asyncio.Task | None = None
+        self._runtime_task: asyncio.Task | None = None
         self._event_task: asyncio.Task | None = None
         self._sync_cursors_to_server = _coerce_bool(
             extra.get("sync_cursors_to_server"), True
@@ -1507,8 +1631,27 @@ class DenChannelsAdapter(BasePlatformAdapter):
             return False
         if self.gateway_client is not None:
             await self.gateway_client.upsert_adapter_binding(self._binding_payload())
+        self._runtime_registered = await self._register_runtime_instance()
         self._running = True
-        if self.start_claim_loop and (self.gateway_client is not None or self.delivery_client is not None):
+        if self._runtime_registered and self.runtime_client is not None and self.runtime_heartbeat_interval_seconds > 0:
+            try:
+                self._runtime_task = asyncio.create_task(self._runtime_heartbeat_loop())
+            except RuntimeError:
+                # Unit tests may construct without a running loop; registration still proves config.
+                self._runtime_task = None
+        delivery_claim_allowed = (
+            self.start_claim_loop
+            and (self.gateway_client is not None or self.delivery_client is not None)
+            and (self._runtime_registered or not self.runtime_required_for_delivery)
+        )
+        if self.start_claim_loop and not delivery_claim_allowed:
+            logger.warning(
+                "[DenChannels] delivery claim loop disabled until Runtime registration succeeds "
+                "for instance_id=%s runtime_url=%s",
+                self._runtime_instance_id(),
+                self.runtime_url,
+            )
+        if delivery_claim_allowed:
             try:
                 self._claim_task = asyncio.create_task(self._claim_loop())
             except RuntimeError:
@@ -1551,6 +1694,13 @@ class DenChannelsAdapter(BasePlatformAdapter):
             except asyncio.CancelledError:
                 pass
         self._claim_task = None
+        if self._runtime_task and not self._runtime_task.done():
+            self._runtime_task.cancel()
+            try:
+                await self._runtime_task
+            except asyncio.CancelledError:
+                pass
+        self._runtime_task = None
         if self._event_task and not self._event_task.done():
             self._event_task.cancel()
             try:
@@ -1736,8 +1886,12 @@ class DenChannelsAdapter(BasePlatformAdapter):
         readback_message_id = source_id if source_id and source_kind in {"channel_message", "channelMessage", "message", ""} else None
         if readback_message_id is None and source_kind == "delivery_intent":
             readback_message_id = str(_first(metadata, "channel_message_id", "channelMessageId", default="") or "") or None
+        readback_channel_id = _coerce_int(_first(metadata, "channel_id", "channelId"))
         if readback_message_id:
-            message = await self.channels_client.get_message_readback(readback_message_id)
+            if source_kind == "delivery_intent" and self.conversation_client is not None and readback_channel_id is not None:
+                message = await self.conversation_client.get_channel_message(readback_channel_id, readback_message_id)
+            else:
+                message = await self.channels_client.get_message_readback(readback_message_id)
             if not isinstance(message, dict):
                 message = {}
 
@@ -1937,6 +2091,65 @@ class DenChannelsAdapter(BasePlatformAdapter):
         finally:
             self._clear_activity_environment(context)
 
+    def _runtime_instance_id(self) -> str:
+        return str(self.agent_instance_id or self.adapter_instance_id or "").strip()
+
+    def _runtime_registration_payload(self) -> dict[str, Any]:
+        pid = os.getpid()
+        return {
+            "instance_id": self._runtime_instance_id(),
+            "profile_identity": self.profile or self.agent_identity,
+            "host": socket.gethostname(),
+            "pid": pid,
+        }
+
+    async def _register_runtime_instance(self) -> bool:
+        """Register this Hermes gateway with the Runtime successor.
+
+        Delivery successor claims are runtime-liveness gated. Observation activity
+        alone is display telemetry; do not start the Delivery claim loop unless
+        Runtime can see this exact adapter instance id.
+        """
+        if self.runtime_client is None or not getattr(self.runtime_client, "is_configured", True):
+            if self.delivery_client is not None or self.gateway_client is not None:
+                logger.warning(
+                    "[DenChannels] Runtime registration skipped for %s: runtime_url is not configured; "
+                    "Delivery successor claims will stay disabled",
+                    self._runtime_instance_id(),
+                )
+            return False
+        try:
+            await self.runtime_client.register_instance(self._runtime_registration_payload())
+            logger.info("[DenChannels] registered Runtime instance %s", self._runtime_instance_id())
+            return True
+        except Exception as exc:
+            logger.warning(
+                "[DenChannels] Runtime registration failed for %s via %s; Delivery successor claims disabled: %s",
+                self._runtime_instance_id(),
+                self.runtime_url,
+                _redact(str(exc)),
+            )
+            return False
+
+    async def _runtime_heartbeat_loop(self) -> None:
+        runtime_client = self.runtime_client
+        if runtime_client is None:
+            return
+        while self._running:
+            try:
+                await runtime_client.heartbeat(self._runtime_instance_id(), {"state": "active"})
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self._runtime_registered = False
+                logger.warning(
+                    "[DenChannels] Runtime heartbeat failed for %s; future Delivery claims disabled until reconnect",
+                    self._runtime_instance_id(),
+                    exc_info=True,
+                )
+                return
+            await self._maybe_sleep(self.runtime_heartbeat_interval_seconds)
+
     def _build_observation_identity(self) -> dict[str, Any]:
         """Build the agent_identity dict for observation events."""
         identity: dict[str, Any] = {
@@ -2121,6 +2334,9 @@ class DenChannelsAdapter(BasePlatformAdapter):
             return
         while self._running:
             try:
+                if self.runtime_required_for_delivery and not self._runtime_registered:
+                    await self._maybe_sleep(self.claim_interval_seconds)
+                    continue
                 claims = await client.claim_deliveries(self._claim_payload())
                 for delivery in claims:
                     try:

@@ -39,6 +39,25 @@ optional_env:
       delivery complete/fail, adapter binding heartbeat, and direct-agent events.
     prompt: "Den delivery API URL"
     password: false
+  - name: DEN_RUNTIME_URL
+    description: >
+      Runtime successor API base used to register and heartbeat this Hermes
+      adapter instance before claiming Delivery-successor intents. Usually this
+      should be the sanctioned Gateway route that forwards /v1/runtime/* with
+      server-side upstream auth, not the Runtime service loopback port directly.
+      If omitted, the adapter tries DEN_GATEWAY_RUNTIME_URL, then DEN_GATEWAY_URL,
+      then DEN_DELIVERY_URL. Delivery claims stay disabled until registration
+      succeeds.
+    prompt: "Den Runtime API URL"
+    password: false
+  - name: DEN_RUNTIME_TOKEN
+    description: >
+      Bearer token for the Runtime successor caller route. If omitted, the
+      adapter tries DEN_GATEWAY_RUNTIME_TOKEN and then existing gateway/channels
+      tokens. Missing or rejected Runtime auth disables Delivery claims rather
+      than bypassing liveness.
+    prompt: "Den Runtime token"
+    password: true
   - name: DEN_OBSERVATION_URL
     description: >
       Den observation/activity API base. Used for: tool-activity event emission
@@ -72,6 +91,14 @@ optional_env:
       Used with DEN_CONVERSATION_URL. Do not share this token — it has
       conversation write authority.
     prompt: "Den conversation token"
+    password: true
+  - name: DEN_CONVERSATION_READ_TOKEN
+    description: >
+      Bearer token for Gateway conversation successor readback. Used to read
+      Den Web-created conversation messages for Delivery-successor wake bodies.
+      If omitted, DEN_CONVERSATION_TOKEN is used; active Gateway configs may
+      require a separate read token.
+    prompt: "Den conversation read token"
     password: true
   - name: DEN_CONVERSATION_ENABLED
     description: >

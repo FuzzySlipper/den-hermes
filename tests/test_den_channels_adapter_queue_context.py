@@ -23,6 +23,7 @@ sys.modules[_SPEC.name] = _adapter_module
 _SPEC.loader.exec_module(_adapter_module)
 DenChannelsAdapter = _adapter_module.DenChannelsAdapter
 DenDeliveryClient = _adapter_module.DenDeliveryClient
+DenRuntimeClient = _adapter_module.DenRuntimeClient
 normalize_tool_activity = _adapter_module.normalize_tool_activity
 _on_pre_tool_call = _adapter_module._on_pre_tool_call
 _on_post_tool_call = _adapter_module._on_post_tool_call
@@ -63,6 +64,28 @@ class FakeGatewayClient:
     async def mark_failed(self, delivery_request_id: int, payload: dict[str, Any]) -> dict[str, Any]:
         self.failed.append((delivery_request_id, payload))
         return {"ok": True}
+
+
+class FakeRuntimeClient:
+    is_configured = True
+
+    def __init__(self, *, fail_register: bool = False, fail_heartbeat: bool = False) -> None:
+        self.fail_register = fail_register
+        self.fail_heartbeat = fail_heartbeat
+        self.registrations: list[dict[str, Any]] = []
+        self.heartbeats: list[tuple[str, dict[str, Any] | None]] = []
+
+    async def register_instance(self, payload: dict[str, Any]) -> dict[str, Any]:
+        self.registrations.append(payload)
+        if self.fail_register:
+            raise RuntimeError("runtime unavailable")
+        return {"state": "starting", **payload}
+
+    async def heartbeat(self, instance_id: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        self.heartbeats.append((instance_id, payload))
+        if self.fail_heartbeat:
+            raise RuntimeError("heartbeat unavailable")
+        return {"instance_id": instance_id, "state": "active"}
 
 
 class FakeChannelsClient:
@@ -196,6 +219,11 @@ class FakeConversationClient:
         self.channels.posts.append((channel_id, legacy_shape))
         self.channels._next_post_id += 1
         return {"id": self.channels._next_post_id}
+
+    async def get_channel_message(self, channel_id: str | int, message_id: str | int) -> dict[str, Any]:
+        message = dict(self.channels.messages[int(message_id)])
+        message.setdefault("channel_id", int(channel_id))
+        return message
 
 
 def _adapter(gateway: FakeGatewayClient, channels: FakeChannelsClient) -> DenChannelsAdapter:
@@ -684,6 +712,84 @@ def test_gateway_proxy_channels_url_enables_successor_delivery_claims() -> None:
     assert adapter.start_claim_loop is True
     assert adapter.gateway_client is None
     assert adapter.delivery_client is not None
+    assert adapter.runtime_url == "http://192.168.1.10:8079"
+    assert adapter.runtime_client is not None
+
+
+@pytest.mark.asyncio
+async def test_connect_registers_runtime_before_delivery_claims() -> None:
+    runtime = FakeRuntimeClient()
+    gateway = FakeGatewayClient()
+    adapter = DenChannelsAdapter(
+        PlatformConfig(
+            enabled=True,
+            token="***",
+            extra={
+                "channels_url": "http://192.168.1.10:8079",
+                "runtime_url": "http://192.168.1.10:8079",
+                "project_id": "goblinbench",
+                "agent_identity": "goblin-overseer",
+                "role": "overseer",
+                "profile": "goblin-overseer",
+                "adapter_instance_id": "den-k8plus:goblin-overseer:overseer:gateway",
+                "start_claim_loop": True,
+                "start_poll_loop": False,
+                "runtime_heartbeat_interval_seconds": 999,
+                "token": "gateway-token",
+            },
+        ),
+        gateway_client=gateway,
+        channels_client=FakeChannelsClient(),
+        runtime_client=runtime,
+    )
+
+    assert await adapter.connect() is True
+    await asyncio.sleep(0)
+    await adapter.disconnect()
+
+    assert runtime.registrations == [{
+        "instance_id": "den-k8plus:goblin-overseer:overseer:gateway",
+        "profile_identity": "goblin-overseer",
+        "host": runtime.registrations[0]["host"],
+        "pid": os.getpid(),
+    }]
+    assert runtime.heartbeats[0] == (
+        "den-k8plus:goblin-overseer:overseer:gateway",
+        {"state": "active"},
+    )
+    assert adapter._runtime_registered is True
+
+
+@pytest.mark.asyncio
+async def test_runtime_registration_failure_disables_delivery_claim_loop_fail_closed() -> None:
+    runtime = FakeRuntimeClient(fail_register=True)
+    adapter = DenChannelsAdapter(
+        PlatformConfig(
+            enabled=True,
+            token="***",
+            extra={
+                "channels_url": "http://192.168.1.10:8079",
+                "runtime_url": "http://192.168.1.10:8079",
+                "project_id": "goblinbench",
+                "agent_identity": "goblin-overseer",
+                "role": "overseer",
+                "profile": "goblin-overseer",
+                "adapter_instance_id": "den-k8plus:goblin-overseer:overseer:gateway",
+                "start_claim_loop": True,
+                "start_poll_loop": False,
+                "token": "gateway-token",
+            },
+        ),
+        channels_client=FakeChannelsClient(),
+        runtime_client=runtime,
+    )
+
+    assert await adapter.connect() is True
+    await asyncio.sleep(0)
+    await adapter.disconnect()
+
+    assert adapter._runtime_registered is False
+    assert adapter._claim_task is None
 
 
 def test_legacy_channels_url_does_not_enable_delivery_claims() -> None:
@@ -729,6 +835,51 @@ def test_delivery_successor_intent_maps_to_delivery_event() -> None:
     metadata = json.loads(delivery["metadata_json"])
     assert metadata["claim_token"] == "claim-token"
     assert metadata["channel_message_id"] == 222
+
+
+def test_delivery_successor_intent_parses_conversation_source_ref_metadata() -> None:
+    client = DenDeliveryClient("http://delivery.test", token="token")
+
+    delivery = client._intent_to_delivery(
+        {
+            "id": 39,
+            "source_ref": "/api/v1/conversation/channels/32/messages/29275",
+            "channel_message_id": 29275,
+        },
+        "claim-token",
+    )
+
+    metadata = json.loads(delivery["metadata_json"])
+    assert metadata["channel_id"] == 32
+    assert metadata["channel_message_id"] == 29275
+    assert metadata["source_ref"] == "/api/v1/conversation/channels/32/messages/29275"
+
+
+@pytest.mark.asyncio
+async def test_delivery_intent_uses_conversation_successor_readback() -> None:
+    gateway = FakeGatewayClient()
+    channels = FakeChannelsClient()
+    channels.messages[29275] = {
+        "id": 29275,
+        "channel_id": 32,
+        "sender_identity": "patch-smoke",
+        "body": "goblin wake ok?",
+    }
+    adapter = _adapter(gateway, channels)
+    delivery = DenDeliveryClient("http://delivery.test", token="token")._intent_to_delivery(
+        {
+            "id": 39,
+            "source_ref": "/api/v1/conversation/channels/32/messages/29275",
+            "channel_message_id": 29275,
+        },
+        "claim-token",
+    )
+
+    event = await adapter.delivery_to_event(delivery)
+
+    assert event.text == "goblin wake ok?"
+    assert event.raw_message["channel_id"] == 32
+    assert event.raw_message["channel_message"]["id"] == 29275
 
 
 @pytest.mark.asyncio
