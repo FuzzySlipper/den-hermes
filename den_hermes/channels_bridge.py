@@ -348,11 +348,10 @@ class JsonFileWakeStore(InMemoryWakeStore):
 class ConversationConfig:
     """Configuration for the Gateway/conversation successor message path.
 
-    When ``enabled`` is True, channel_message replies are posted through
-    the Gateway conversation successor instead of the legacy
-    ``gateway_client.post_channel_message`` path.  The legacy path
-    remains available for rollback when ``enabled`` is False or when
-    the successor write fails.
+    Channel-message replies are posted through the Gateway conversation
+    successor instead of the legacy ``gateway_client.post_channel_message``
+    path. The legacy write path is intentionally not used as a fallback: if
+    the successor is disabled, missing, or fails, reply posting fails closed.
     """
 
     enabled: bool = False
@@ -460,29 +459,34 @@ class DenChannelsResponseBridge:
         )
 
     def _post_channel_message(self, channel_id: str, body: str, metadata: Mapping[str, Any], dedupe_key: str) -> Any:
-        """Post a channel message, preferring the conversation successor path when configured."""
-        if self._conversation_client is not None:
-            try:
-                return self._conversation_client.post_channel_message(
-                    channel_id=channel_id,
-                    body=body,
-                    metadata=metadata,
-                    dedupe_key=dedupe_key,
-                )
-            except RuntimeError:
-                import logging
-                logging.getLogger(__name__).warning(
-                    "Conversation successor write failed, falling back to legacy gateway_client",
-                    exc_info=True,
-                )
-        if self.gateway_client is None:
-            raise RuntimeError("channel_message response target requires gateway_client (no conversation successor)")
-        return self.gateway_client.post_channel_message(
-            channel_id=channel_id,
-            body=body,
-            metadata=metadata,
-            dedupe_key=dedupe_key,
-        )
+        """Post a channel message through the conversation successor only.
+
+        Legacy den-channels channel-message writes are intentionally not a
+        fallback. If the successor is unavailable, fail closed so #3026 can
+        safely tombstone ``POST /api/channels/{id}/messages``.
+        """
+        if self._conversation_client is None:
+            raise RuntimeError(
+                "channel_message response target requires configured conversation successor "
+                "(DEN_CONVERSATION_ENABLED=true, DEN_CONVERSATION_URL, DEN_CONVERSATION_TOKEN); "
+                "legacy den-channels channel-message fallback is retired"
+            )
+        try:
+            return self._conversation_client.post_channel_message(
+                channel_id=channel_id,
+                body=body,
+                metadata=metadata,
+                dedupe_key=dedupe_key,
+            )
+        except RuntimeError as exc:
+            import logging
+            logging.getLogger(__name__).error(
+                "Conversation successor write failed; legacy den-channels channel-message fallback is retired",
+                exc_info=True,
+            )
+            raise RuntimeError(
+                f"conversation successor channel_message write failed closed: {exc}"
+            ) from exc
 
     def post_reply(self, delivery: Mapping[str, Any], *, body: str, run_id: str | None) -> ResponseResult:
         delivery_request_id = _required_int(delivery, "delivery_request_id")
@@ -546,12 +550,22 @@ class DenChannelsResponseBridge:
                 urgency=_optional_str(response_target.get("urgency")) or "normal",
             )
         elif target_kind == "channel_message":
-            response = self._post_channel_message(
-                channel_id=_required_str(response_target, "channel_id"),
-                body=body,
-                metadata=metadata,
-                dedupe_key=f"reply:{dedupe_key}:{target_kind}",
-            )
+            try:
+                response = self._post_channel_message(
+                    channel_id=_required_str(response_target, "channel_id"),
+                    body=body,
+                    metadata=metadata,
+                    dedupe_key=f"reply:{dedupe_key}:{target_kind}",
+                )
+            except RuntimeError as exc:
+                return ResponseResult(
+                    status="failed",
+                    delivery_request_id=delivery_request_id,
+                    dedupe_key=dedupe_key,
+                    correlation_id=correlation_id,
+                    target_kind=target_kind,
+                    diagnostic=str(exc),
+                )
         else:
             raise ValueError(f"Unsupported response target kind: {target_kind}")
         result = ResponseResult(

@@ -85,6 +85,27 @@ class FakeChannelsClient:
         return {"id": self._next_post_id}
 
 
+class FakeConversationClient:
+    def __init__(self, channels: FakeChannelsClient) -> None:
+        self.channels = channels
+
+    async def post_channel_message(
+        self,
+        channel_id: str | int,
+        payload: dict[str, Any],
+        *,
+        dedupe_key: str | None = None,
+    ) -> dict[str, Any]:
+        self.channels.posts.append((channel_id, {
+            "sourceId": payload.get("source_id"),
+            "sourceProjectId": payload.get("source_project_id"),
+            "dedupeKey": payload.get("dedupe_key"),
+            "metadataJson": payload.get("metadata"),
+        }))
+        self.channels._next_post_id += 1
+        return {"id": self.channels._next_post_id}
+
+
 def _durable_adapter(
     gateway: FakeGatewayClient,
     channels: FakeChannelsClient,
@@ -111,6 +132,7 @@ def _durable_adapter(
         ),
         gateway_client=gateway,
         channels_client=channels,
+        conversation_client=FakeConversationClient(channels),
     )
 
 
@@ -143,6 +165,7 @@ def _pool_adapter(
         ),
         gateway_client=gateway,
         channels_client=channels,
+        conversation_client=FakeConversationClient(channels),
     )
 
 

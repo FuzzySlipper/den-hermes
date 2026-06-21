@@ -567,7 +567,13 @@ def test_lifecycle_events_go_to_agent_stream_with_debug_visibility_for_noisy_eve
 def test_response_bridge_supports_agent_stream_user_notification_and_channel_targets():
     tools = RecordingDenTools([])
     gateway = RecordingGatewayClient()
-    bridge = DenChannelsResponseBridge(den_tools=tools, gateway_client=gateway, store=InMemoryWakeStore())
+    conv_client = RecordingConversationClient()
+    bridge = DenChannelsResponseBridge(
+        den_tools=tools,
+        gateway_client=gateway,
+        store=InMemoryWakeStore(),
+        conversation_client=conv_client,
+    )
 
     stream_result = bridge.post_reply(
         delivery(response_target={"kind": "agent_stream", "event_type": "answer"}),
@@ -590,7 +596,8 @@ def test_response_bridge_supports_agent_stream_user_notification_and_channel_tar
     assert channel_result.status == "posted"
     assert tools.agent_stream_messages[-1]["event_type"] == "answer"
     assert tools.user_notifications[0]["urgency"] == "high"
-    assert gateway.channel_messages[0]["channel_id"] == "telegram:-100:55"
+    assert conv_client.channel_messages[0]["channel_id"] == "telegram:-100:55"
+    assert gateway.channel_messages == []
 
 
 def test_end_to_end_wake_then_visible_reply_smoke():
@@ -958,7 +965,7 @@ class TestConversationSuccessor:
         except RuntimeError as exc:
             assert "write_token is not configured" in str(exc)
 
-    def test_legacy_path_used_when_conversation_disabled(self):
+    def test_legacy_path_is_not_used_when_conversation_disabled(self):
         tools = RecordingDenTools([])
         gateway = RecordingGatewayClient()
         bridge = DenChannelsResponseBridge(
@@ -972,9 +979,10 @@ class TestConversationSuccessor:
             body="legacy reply",
             run_id="legacy-run",
         )
-        assert result.status == "posted"
-        assert len(gateway.channel_messages) == 1
-        assert gateway.channel_messages[0]["channel_id"] == "test:1"
+        assert result.status == "failed"
+        assert "conversation successor" in (result.diagnostic or "")
+        assert "fallback is retired" in (result.diagnostic or "")
+        assert len(gateway.channel_messages) == 0
 
     def test_conversation_path_used_when_enabled(self):
         tools = RecordingDenTools([])
@@ -1000,7 +1008,7 @@ class TestConversationSuccessor:
         # Legacy path was NOT used
         assert len(gateway.channel_messages) == 0
 
-    def test_conversation_failure_falls_back_to_legacy(self):
+    def test_conversation_failure_fails_closed_without_legacy_fallback(self):
         tools = RecordingDenTools([])
         gateway = RecordingGatewayClient()
         conv_client = RecordingConversationClient()
@@ -1016,10 +1024,11 @@ class TestConversationSuccessor:
             body="fallback reply",
             run_id="fb-run",
         )
-        assert result.status == "posted"
-        # Legacy path was used as fallback
-        assert len(gateway.channel_messages) == 1
-        assert gateway.channel_messages[0]["channel_id"] == "fallback:7"
+        assert result.status == "failed"
+        assert "failed closed" in (result.diagnostic or "")
+        assert "simulated conversation successor failure" in (result.diagnostic or "")
+        # Legacy path must not be used as fallback.
+        assert len(gateway.channel_messages) == 0
 
     def test_conversation_payload_shape_valid(self):
         """Verify the payload dict has the expected snake_case fields."""
@@ -1062,6 +1071,7 @@ class TestConversationSuccessor:
         try:
             bridge._post_channel_message(channel_id="1", body="x", metadata={}, dedupe_key="k")
         except RuntimeError as exc:
-            assert "requires gateway_client" in str(exc)
+            assert "configured conversation successor" in str(exc)
+            assert "fallback is retired" in str(exc)
             raised = True
         assert raised, "expected RuntimeError when neither path is available"

@@ -159,6 +159,44 @@ class FakeChannelsClient:
         return list(self.subscription_cursors.get(subscription_id, []))
 
 
+class FakeConversationClient:
+    def __init__(self, channels: FakeChannelsClient, *, fail: bool = False) -> None:
+        self.channels = channels
+        self.fail = fail
+        self.posts: list[tuple[str | int, dict[str, Any], str | None]] = []
+
+    async def post_channel_message(
+        self,
+        channel_id: str | int,
+        payload: dict[str, Any],
+        *,
+        dedupe_key: str | None = None,
+    ) -> dict[str, Any]:
+        if self.fail:
+            raise RuntimeError("simulated conversation successor failure")
+        self.posts.append((channel_id, payload, dedupe_key))
+        # Keep existing assertions readable by mirroring the old camelCase shape
+        # in the fake channel post ledger. Production uses the snake_case payload.
+        legacy_shape = {
+            "senderType": payload.get("sender_type"),
+            "senderIdentity": payload.get("sender_identity"),
+            "body": payload.get("body"),
+            "messageKind": payload.get("message_kind"),
+            "sourceKind": payload.get("source_kind"),
+            "sourceId": payload.get("source_id"),
+            "sourceProjectId": payload.get("source_project_id"),
+            "dedupeKey": payload.get("dedupe_key"),
+            "metadataJson": payload.get("metadata"),
+        }
+        if "reply_to_message_id" in payload:
+            legacy_shape["replyToMessageId"] = payload["reply_to_message_id"]
+        if "thread_root_message_id" in payload:
+            legacy_shape["threadRootMessageId"] = payload["thread_root_message_id"]
+        self.channels.posts.append((channel_id, legacy_shape))
+        self.channels._next_post_id += 1
+        return {"id": self.channels._next_post_id}
+
+
 def _adapter(gateway: FakeGatewayClient, channels: FakeChannelsClient) -> DenChannelsAdapter:
     return DenChannelsAdapter(
         PlatformConfig(
@@ -178,6 +216,7 @@ def _adapter(gateway: FakeGatewayClient, channels: FakeChannelsClient) -> DenCha
         ),
         gateway_client=gateway,
         channels_client=channels,
+        conversation_client=FakeConversationClient(channels),
     )
 
 
@@ -198,6 +237,7 @@ def _channels_only_adapter(channels: FakeChannelsClient) -> DenChannelsAdapter:
             },
         ),
         channels_client=channels,
+        conversation_client=FakeConversationClient(channels),
     )
 
 
@@ -725,6 +765,49 @@ async def test_assistant_content_before_tool_calls_is_interim_until_final_notify
     final_metadata = json.loads(final_payload["metadataJson"])
     assert final_metadata["delivery_stage"] == "final"
     assert final_metadata["terminal_delivery"] is True
+
+
+@pytest.mark.asyncio
+async def test_adapter_channel_reply_fails_closed_when_conversation_successor_fails() -> None:
+    gateway = FakeGatewayClient()
+    channels = FakeChannelsClient()
+    channels.messages = {
+        106: {"id": 106, "channelId": 42, "senderIdentity": "patch", "body": "please reply"},
+    }
+    adapter = DenChannelsAdapter(
+        PlatformConfig(
+            enabled=True,
+            token="***",
+            extra={
+                "gateway_url": "http://192.168.1.10:18080",
+                "channels_url": "http://192.168.1.10:18080",
+                "project_id": "den-hermes-bridge",
+                "agent_identity": "den-mcp-runner",
+                "role": "runner",
+                "profile": "den-mcp-runner",
+                "adapter_instance_id": "test-host:den-mcp-runner:runner:gateway",
+                "start_claim_loop": False,
+                "token": "test-token",
+            },
+        ),
+        gateway_client=gateway,
+        channels_client=channels,
+        conversation_client=FakeConversationClient(channels, fail=True),
+    )
+    event = await adapter.delivery_to_event(_delivery(606, 106, attempt_id=806))
+
+    result = await adapter.send(
+        event.source.chat_id,
+        "this should fail closed",
+        metadata={"delivery_request_id": 606, "notify": True},
+    )
+
+    assert result.success is False
+    assert "simulated conversation successor failure" in (result.error or "")
+    assert channels.posts == []
+    assert gateway.completed == []
+    assert gateway.failed
+    assert gateway.failed[-1][0] == 606
 
 
 @pytest.mark.asyncio
@@ -1848,6 +1931,7 @@ def _adapter_with_pool_member(
         ),
         gateway_client=gateway,
         channels_client=channels,
+        conversation_client=FakeConversationClient(channels),
     )
 
 

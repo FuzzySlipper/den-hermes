@@ -57,8 +57,9 @@ optional_env:
       set and DEN_CONVERSATION_ENABLED=true, channel_message replies are
       posted through the Gateway conversation successor (POST /v1/conversation/
       channels/{id}/messages) instead of the legacy channels API. Requires
-      DEN_CONVERSATION_TOKEN for Gateway auth. Falls back to legacy path on
-      failure.
+      DEN_CONVERSATION_TOKEN for Gateway auth. There is no legacy write
+      fallback; missing or failing successor config makes reply posting fail
+      closed so den-channels legacy channel-message writes can be tombstoned.
     prompt: "Den conversation successor URL"
     password: false
   - name: DEN_CONVERSATION_TOKEN
@@ -71,7 +72,9 @@ optional_env:
   - name: DEN_CONVERSATION_ENABLED
     description: >
       Set to "true" to enable the conversation successor write path for
-      channel-message replies. Defaults to "false" for backward compatibility.
+      channel-message replies. Active Den Channels Hermes profiles must set
+      this to "true"; "false" is readback/poll-only and reply posting fails
+      closed rather than using legacy channel-message writes.
     prompt: "Enable conversation successor? (true/false)"
     password: false
   - name: DEN_GATEWAY_TOKEN

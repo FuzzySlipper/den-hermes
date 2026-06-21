@@ -956,8 +956,47 @@ class _DirectAgentEventPoller:
         self._save_cursors()
 
 
+class DenConversationClient:
+    """Small async HTTP client for Conversation successor channel-message writes."""
+
+    def __init__(self, base_url: str, *, token: str | None = None, timeout: float = 15.0):
+        self.base_url = (base_url or "").rstrip("/")
+        self.token = token
+        self.timeout = timeout
+
+    async def post_channel_message(self, channel_id: str | int, payload: dict[str, Any], *, dedupe_key: str | None = None) -> dict[str, Any]:
+        if not self.base_url:
+            raise RuntimeError("DEN_CONVERSATION_URL is required for channel-message replies")
+        if not self.token:
+            raise RuntimeError("DEN_CONVERSATION_TOKEN is required for channel-message replies")
+        import httpx
+
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.token}",
+            "X-Den-Migrated-Functions": "true",
+        }
+        if dedupe_key:
+            headers["Idempotency-Key"] = dedupe_key
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            response = await client.post(
+                f"{self.base_url}/v1/conversation/channels/{channel_id}/messages",
+                json=payload,
+                headers=headers,
+            )
+            response.raise_for_status()
+            if not response.content:
+                return {}
+            return response.json()
+
+
 class DenChannelsClient:
-    """Small async HTTP client for Den Channels message APIs."""
+    """Small async HTTP client for Den Channels readback/subscription APIs.
+
+    Channel-message writes are intentionally excluded from production use; final
+    replies must go through ``DenConversationClient`` so den-channels legacy
+    ``POST /api/channels/{id}/messages`` can be tombstoned.
+    """
 
     def __init__(self, base_url: str, *, token: str | None = None, timeout: float = 15.0):
         self.base_url = (base_url or "").rstrip("/")
@@ -1015,7 +1054,16 @@ class DenChannelsClient:
         return await self._request("GET", f"/api/gateway/messages/{message_id}")
 
     async def post_channel_message(self, channel_id: str | int, payload: dict[str, Any]) -> dict[str, Any]:
-        return await self._request("POST", f"/api/channels/{channel_id}/messages", payload)
+        """Legacy write helper retained for tests/readback shims only.
+
+        Production reply posting must use ``DenConversationClient``. This method
+        remains so old test doubles and explicit legacy smoke code fail loudly
+        rather than silently recreating ``POST /api/channels/{id}/messages``.
+        """
+        raise RuntimeError(
+            "legacy den-channels channel-message write is retired; use Conversation successor "
+            "POST /v1/conversation/channels/{channel_id}/messages"
+        )
 
     async def add_reaction(self, message_id: str | int, payload: dict[str, Any]) -> dict[str, Any]:
         return await self._request("POST", f"/api/channel-messages/{message_id}/reactions", payload)
@@ -1096,6 +1144,7 @@ class DenChannelsAdapter(BasePlatformAdapter):
         *,
         gateway_client: Any | None = None,
         channels_client: Any | None = None,
+        conversation_client: Any | None = None,
         sleep: Any | None = None,
     ) -> None:
         super().__init__(config, Platform(_PLATFORM_NAME))
@@ -1122,6 +1171,20 @@ class DenChannelsAdapter(BasePlatformAdapter):
             or self.channels_url
             or ""
         ).rstrip("/")
+        self.conversation_url = str(
+            extra.get("conversation_url")
+            or extra.get("CONVERSATION_URL")
+            or os.getenv("DEN_CONVERSATION_URL")
+            or ""
+        ).rstrip("/")
+        self.conversation_enabled = _coerce_bool(
+            extra.get("conversation_enabled")
+            if "conversation_enabled" in extra
+            else extra.get("CONVERSATION_ENABLED")
+            if "CONVERSATION_ENABLED" in extra
+            else os.getenv("DEN_CONVERSATION_ENABLED"),
+            False,
+        )
         self.project_id = str(extra.get("project_id") or os.getenv("DEN_CHANNELS_PROJECT_ID") or "").strip()
         self.agent_identity = str(extra.get("agent_identity") or os.getenv("HERMES_AGENT_IDENTITY") or os.getenv("HERMES_PROFILE") or "hermes").strip()
         self.role = str(extra.get("role") or os.getenv("HERMES_AGENT_ROLE") or "agent").strip()
@@ -1173,6 +1236,11 @@ class DenChannelsAdapter(BasePlatformAdapter):
             or token
             or ""
         ).strip() or None
+        conversation_token = str(
+            extra.get("conversation_token")
+            or os.getenv("DEN_CONVERSATION_TOKEN")
+            or ""
+        ).strip() or None
         _remember_direct_agent_config(
             gateway_url=self.gateway_url,
             delivery_url=self.delivery_url,
@@ -1186,6 +1254,11 @@ class DenChannelsAdapter(BasePlatformAdapter):
         )
         self.gateway_client = gateway_client or (DenGatewayClient(self.gateway_url, token=token) if self.gateway_url else None)
         self.channels_client = channels_client or DenChannelsClient(self.channels_url, token=channels_token)
+        self.conversation_client = conversation_client or (
+            DenConversationClient(self.conversation_url, token=conversation_token)
+            if self.conversation_enabled
+            else None
+        )
         self.observation_client = DenObservationClient(
             self.observation_url,
             token=observation_token,
@@ -1379,8 +1452,33 @@ class DenChannelsAdapter(BasePlatformAdapter):
         if context.thread_root_message_id is not None:
             payload["threadRootMessageId"] = context.thread_root_message_id
 
+        conversation_payload: dict[str, Any] = {
+            "sender_type": payload["senderType"],
+            "sender_identity": payload["senderIdentity"],
+            "body": payload["body"],
+            "message_kind": payload["messageKind"],
+            "source_kind": payload["sourceKind"],
+            "source_id": payload["sourceId"],
+            "source_project_id": payload["sourceProjectId"],
+            "dedupe_key": payload["dedupeKey"],
+            "metadata": payload["metadataJson"],
+        }
+        if reply_anchor is not None:
+            conversation_payload["reply_to_message_id"] = reply_anchor
+        if context.thread_root_message_id is not None:
+            conversation_payload["thread_root_message_id"] = context.thread_root_message_id
+
         try:
-            posted = await self.channels_client.post_channel_message(context.channel_id, payload)
+            if self.conversation_client is None:
+                raise RuntimeError(
+                    "Conversation successor is not configured for channel-message replies; "
+                    "legacy den-channels channel-message fallback is retired"
+                )
+            posted = await self.conversation_client.post_channel_message(
+                context.channel_id,
+                conversation_payload,
+                dedupe_key=payload["dedupeKey"],
+            )
             message_id = _first(posted if isinstance(posted, dict) else {}, "id", "messageId", "channel_message_id")
             message_int = _coerce_int(message_id)
             if not is_terminal_reply:

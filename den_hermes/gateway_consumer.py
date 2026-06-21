@@ -248,10 +248,10 @@ def _delivery_to_envelope(delivery: Mapping[str, Any], binding: Mapping[str, Any
             "metadata": metadata,
         },
         "reply": {
-            "kind": "den_channels_channel_message",
-            "base_url": "http://192.168.1.10:18080",
+            "kind": "conversation_successor_channel_message",
+            "base_url": os.environ.get("DEN_CONVERSATION_URL") or os.environ.get("DEN_GATEWAY_URL") or "http://192.168.1.10:8079",
             "channel_id": metadata.get("channel_id"),
-            "endpoint_template": "/api/channels/{channel_id}/messages",
+            "endpoint_template": "/v1/conversation/channels/{channel_id}/messages",
             "sender_type": "agent",
             "sender_identity": binding.get("agent_identity"),
             "message_kind": "agent_text",
@@ -260,8 +260,9 @@ def _delivery_to_envelope(delivery: Mapping[str, Any], binding: Mapping[str, Any
         },
         "instructions": [
             "Refresh Den state before acting.",
-            "Use the delivery source pointers and then reply in the originating Den Channels channel.",
-            "For a Den Channels reply, POST JSON to {base_url}{endpoint_template} using the reply object values: senderType, senderIdentity, body, messageKind, sourceKind, sourceId, sourceProjectId, metadataJson, dedupeKey.",
+            "Use the delivery source pointers and then reply in the originating Den conversation channel.",
+            "For a Den conversation reply, POST JSON to {base_url}{endpoint_template} using snake_case fields: sender_type, sender_identity, body, message_kind, source_kind, source_id, source_project_id, metadata, dedupe_key. Use DEN_CONVERSATION_TOKEN for Gateway auth.",
+            "Do not fall back to legacy den-channels POST /api/channels/{channel_id}/messages.",
             "Do not expose secrets or raw settings in the response.",
         ],
     }
