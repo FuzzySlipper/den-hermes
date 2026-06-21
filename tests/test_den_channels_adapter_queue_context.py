@@ -22,6 +22,7 @@ _adapter_module = importlib.util.module_from_spec(_SPEC)
 sys.modules[_SPEC.name] = _adapter_module
 _SPEC.loader.exec_module(_adapter_module)
 DenChannelsAdapter = _adapter_module.DenChannelsAdapter
+DenDeliveryClient = _adapter_module.DenDeliveryClient
 normalize_tool_activity = _adapter_module.normalize_tool_activity
 _on_pre_tool_call = _adapter_module._on_pre_tool_call
 _on_post_tool_call = _adapter_module._on_post_tool_call
@@ -657,6 +658,77 @@ async def test_channels_only_connect_does_not_require_gateway_binding() -> None:
 
     assert await adapter.connect() is True
     assert adapter.gateway_client is None
+
+
+def test_gateway_proxy_channels_url_enables_successor_delivery_claims() -> None:
+    adapter = DenChannelsAdapter(
+        PlatformConfig(
+            enabled=True,
+            token="***",
+            extra={
+                "channels_url": "http://192.168.1.10:8079",
+                "project_id": "",
+                "agent_identity": "den-mcp-runner",
+                "role": "runner",
+                "profile": "den-mcp-runner",
+                "adapter_instance_id": "test-host:den-mcp-runner:runner:gateway",
+                "start_poll_loop": False,
+                "token": "gateway-token",
+            },
+        ),
+        channels_client=FakeChannelsClient(),
+    )
+
+    assert adapter.gateway_url == ""
+    assert adapter.delivery_url == "http://192.168.1.10:8079"
+    assert adapter.start_claim_loop is True
+    assert adapter.gateway_client is None
+    assert adapter.delivery_client is not None
+
+
+def test_legacy_channels_url_does_not_enable_delivery_claims() -> None:
+    adapter = DenChannelsAdapter(
+        PlatformConfig(
+            enabled=True,
+            token="***",
+            extra={
+                "channels_url": "http://192.168.1.10:18081",
+                "project_id": "",
+                "agent_identity": "den-mcp-runner",
+                "role": "runner",
+                "profile": "den-mcp-runner",
+                "adapter_instance_id": "test-host:den-mcp-runner:runner:gateway",
+                "start_poll_loop": False,
+                "token": "channels-token",
+            },
+        ),
+        channels_client=FakeChannelsClient(),
+    )
+
+    assert adapter.gateway_url == ""
+    assert adapter.delivery_url == ""
+    assert adapter.start_claim_loop is False
+    assert adapter.gateway_client is None
+
+
+def test_delivery_successor_intent_maps_to_delivery_event() -> None:
+    client = DenDeliveryClient("http://delivery.test", token="token")
+
+    delivery = client._intent_to_delivery(
+        {
+            "id": 34,
+            "source_ref": "wake://goblin-overseer?body=hello%20goblin",
+            "channel_message_id": 222,
+        },
+        "claim-token",
+    )
+
+    assert delivery["delivery_request_id"] == 34
+    assert delivery["source_kind"] == "delivery_intent"
+    assert delivery["body"] == "hello goblin"
+    metadata = json.loads(delivery["metadata_json"])
+    assert metadata["claim_token"] == "claim-token"
+    assert metadata["channel_message_id"] == 222
 
 
 @pytest.mark.asyncio

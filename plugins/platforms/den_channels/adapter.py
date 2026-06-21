@@ -26,7 +26,7 @@ import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Optional
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 try:
     from den_hermes.api_urls import join_api_url
@@ -502,6 +502,22 @@ def _is_private_url(url: str) -> bool:
         return False
 
 
+def _looks_like_gateway_url(url: str) -> bool:
+    """Return True when a configured base URL is a Den Gateway/proxy base.
+
+    Historical fleet profiles used DEN_CHANNELS_URL for the Gateway proxy base
+    because the Gateway used to own/direct most Channels compatibility routes.
+    After direct-agent writes moved to Delivery, those profiles still need a
+    Gateway client so they can claim successor delivery intents.  Do not infer a
+    Gateway client from the legacy den-channels service port itself.
+    """
+    parsed = urlsplit(url or "")
+    if parsed.port in {8079, 18080}:
+        return True
+    host = (parsed.hostname or "").strip().lower()
+    return host in {"den-gateway", "gateway"}
+
+
 @dataclass
 class _DeliveryContext:
     delivery_request_id: int
@@ -826,6 +842,113 @@ class DenGatewayClient:
 
     async def mark_failed(self, delivery_request_id: int, payload: dict[str, Any]) -> Any:
         return await self._request("POST", f"/api/deliveries/{delivery_request_id}/fail", payload)
+
+
+class DenDeliveryClient:
+    """Small async HTTP client for Den Delivery successor intent APIs."""
+
+    def __init__(self, base_url: str, *, token: str | None = None, timeout: float = 15.0):
+        self.base_url = (base_url or "").rstrip("/")
+        self.token = token
+        self.timeout = timeout
+        self._claim_tokens_by_intent: dict[int, str] = {}
+
+    async def _request(self, method: str, path: str, payload: dict[str, Any] | None = None) -> Any:
+        import httpx
+
+        headers = {"Content-Type": "application/json"}
+        if self.token:
+            headers["Authorization"] = f"Bearer {self.token}"
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            response = await client.request(method, f"{self.base_url}{path}", json=payload, headers=headers)
+            response.raise_for_status()
+            if not response.content:
+                return {}
+            return response.json()
+
+    async def claim_deliveries(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
+        if not self.base_url:
+            return []
+        agent_identity = str(payload.get("agent_identity") or "").strip()
+        adapter_instance_id = str(payload.get("adapter_instance_id") or "").strip()
+        claim_limit = max(1, _coerce_int(payload.get("limit")) or 1)
+        result = await self._request("GET", "/v1/delivery/intents?state=pending")
+        intents = result if isinstance(result, list) else []
+        claimed: list[dict[str, Any]] = []
+        for intent in intents:
+            if len(claimed) >= claim_limit or not isinstance(intent, dict):
+                break
+            target = intent.get("target_identity") if isinstance(intent.get("target_identity"), dict) else {}
+            target = target if isinstance(target, dict) else {}
+            target_profile = str(target.get("profile") or "").strip()
+            target_instance = str(target.get("instance_id") or "").strip()
+            if target_profile != agent_identity and target_instance not in {adapter_instance_id, agent_identity}:
+                continue
+            intent_id = _coerce_int(intent.get("id"))
+            if intent_id is None:
+                continue
+            claim_token = f"hermes:{adapter_instance_id}:{intent_id}:{int(time.time())}"
+            claim_payload = {
+                "claim_token": claim_token,
+                "claimed_by": {
+                    "profile": target_profile or agent_identity,
+                    "instance_id": target_instance or adapter_instance_id or f"{agent_identity}@hermes",
+                },
+            }
+            try:
+                claimed_intent = await self._request("POST", f"/v1/delivery/intents/{intent_id}/claim", claim_payload)
+            except Exception:
+                logger.debug("[DenDelivery] failed to claim intent %s", intent_id, exc_info=True)
+                continue
+            self._claim_tokens_by_intent[intent_id] = claim_token
+            claimed.append(self._intent_to_delivery(claimed_intent if isinstance(claimed_intent, dict) else intent, claim_token))
+        return claimed
+
+    def _intent_to_delivery(self, intent: dict[str, Any], claim_token: str) -> dict[str, Any]:
+        intent_id = _coerce_int(intent.get("id")) or 0
+        source_ref = str(intent.get("source_ref") or "")
+        body = ""
+        if source_ref.startswith("wake://"):
+            parsed = urlsplit(source_ref)
+            body_values = parse_qs(parsed.query).get("body") or []
+            body = body_values[0] if body_values else ""
+        channel_message_id = _coerce_int(intent.get("channel_message_id"))
+        metadata: dict[str, Any] = {
+            "delivery_successor_intent": True,
+            "claim_token": claim_token,
+        }
+        if channel_message_id is not None:
+            metadata["channel_message_id"] = channel_message_id
+        return {
+            "delivery_request_id": intent_id,
+            "attempt_id": intent_id,
+            "project_id": "",
+            "source_kind": "delivery_intent",
+            "source_id": str(intent_id),
+            "body": body or source_ref or f"Delivery intent {intent_id}",
+            "context_summary": f"Delivery successor intent {intent_id} claimed by Hermes.",
+            "metadata_json": json.dumps(metadata),
+        }
+
+    async def mark_delivered(self, delivery_request_id: int, payload: dict[str, Any]) -> Any:
+        return await self._report_event(delivery_request_id, "running", payload)
+
+    async def mark_completed(self, delivery_request_id: int, payload: dict[str, Any]) -> Any:
+        return await self._report_event(delivery_request_id, "completed", payload)
+
+    async def mark_failed(self, delivery_request_id: int, payload: dict[str, Any]) -> Any:
+        return await self._report_event(delivery_request_id, "failed", payload)
+
+    async def _report_event(self, delivery_request_id: int, event_type: str, payload: dict[str, Any]) -> Any:
+        claim_token = self._claim_tokens_by_intent.get(delivery_request_id)
+        if not claim_token:
+            logger.debug("[DenDelivery] no claim token for intent %s; skipping %s", delivery_request_id, event_type)
+            return {"skipped": "missing_claim_token"}
+        return await self._request(
+            "POST",
+            f"/v1/delivery/intents/{delivery_request_id}/events",
+            {"event_type": event_type, "claim_token": claim_token, "payload": payload},
+        )
 
 
 class _DirectAgentEventPoller:
@@ -1219,15 +1342,24 @@ class DenChannelsAdapter(BasePlatformAdapter):
             # global group default is per-user isolation for public chat apps.
             config.extra["group_sessions_per_user"] = False
             config.extra.setdefault("thread_sessions_per_user", False)
-        self.gateway_url = str(extra.get("gateway_url") or os.getenv("DEN_GATEWAY_URL") or "").rstrip("/")
+        configured_gateway_url = str(extra.get("gateway_url") or os.getenv("DEN_GATEWAY_URL") or "").rstrip("/")
         self.channels_url = str(extra.get("channels_url") or os.getenv("DEN_CHANNELS_URL") or "").rstrip("/")
-        self.delivery_url = str(
+        configured_delivery_url = str(
             extra.get("delivery_url")
             or extra.get("DELIVERY_URL")
             or os.getenv("DEN_DELIVERY_URL")
-            or self.gateway_url
             or ""
         ).rstrip("/")
+        derived_delivery_url = ""
+        self.gateway_url = configured_gateway_url
+        if not configured_gateway_url and not configured_delivery_url and _looks_like_gateway_url(self.channels_url):
+            derived_delivery_url = self.channels_url
+            logger.warning(
+                "[DenChannels] deriving delivery_url from channels_url=%s for successor delivery intent polling; "
+                "set DEN_DELIVERY_URL explicitly to silence this compatibility path",
+                self.channels_url,
+            )
+        self.delivery_url = configured_delivery_url or self.gateway_url or derived_delivery_url
         self.observation_url = str(
             extra.get("observation_url")
             or extra.get("OBSERVATION_URL")
@@ -1272,7 +1404,7 @@ class DenChannelsAdapter(BasePlatformAdapter):
         self.claim_interval_seconds = float(extra.get("claim_interval_seconds") or 2.0)
         self.claim_limit = max(1, _coerce_int(extra.get("claim_limit")) or 1)
         self.lease_seconds = max(1, _coerce_int(extra.get("lease_seconds")) or 300)
-        self.start_claim_loop = _coerce_bool(extra.get("start_claim_loop"), bool(self.gateway_url))
+        self.start_claim_loop = _coerce_bool(extra.get("start_claim_loop"), bool(self.gateway_url or self.delivery_url))
         self.poll_interval_seconds = float(extra.get("poll_interval_seconds") or 2.0)
         self.poll_limit = max(1, _coerce_int(extra.get("poll_limit")) or 10)
         self.start_poll_loop = _coerce_bool(extra.get("start_poll_loop"), True)
@@ -1317,6 +1449,7 @@ class DenChannelsAdapter(BasePlatformAdapter):
             token or channels_token or _is_private_url(self.gateway_url) or _is_private_url(self.channels_url)
         )
         self.gateway_client = gateway_client or (DenGatewayClient(self.gateway_url, token=token) if self.gateway_url else None)
+        self.delivery_client = DenDeliveryClient(self.delivery_url, token=channels_token or token) if self.delivery_url else None
         self.channels_client = channels_client or DenChannelsClient(self.channels_url, token=channels_token)
         self.conversation_client = conversation_client or (
             DenConversationClient(self.conversation_url, token=conversation_token)
@@ -1375,7 +1508,7 @@ class DenChannelsAdapter(BasePlatformAdapter):
         if self.gateway_client is not None:
             await self.gateway_client.upsert_adapter_binding(self._binding_payload())
         self._running = True
-        if self.start_claim_loop and self.gateway_client is not None:
+        if self.start_claim_loop and (self.gateway_client is not None or self.delivery_client is not None):
             try:
                 self._claim_task = asyncio.create_task(self._claim_loop())
             except RuntimeError:
@@ -1564,14 +1697,15 @@ class DenChannelsAdapter(BasePlatformAdapter):
                     default=str,
                 ),
             }
-            if self.gateway_client is None:
+            lifecycle_client = self.gateway_client or self.delivery_client
+            if lifecycle_client is None:
                 # Channels-owned direct-agent polling does not have a legacy
                 # Gateway delivery lifecycle endpoint to complete. The visible
                 # gateway_delivery reply itself is the terminal Channels evidence.
                 self._terminal_delivery_ids.add(context.delivery_request_id)
             else:
                 try:
-                    await self.gateway_client.mark_completed(context.delivery_request_id, completed_payload)
+                    await lifecycle_client.mark_completed(context.delivery_request_id, completed_payload)
                     self._terminal_delivery_ids.add(context.delivery_request_id)
                 except Exception:
                     logger.warning(
@@ -1599,8 +1733,11 @@ class DenChannelsAdapter(BasePlatformAdapter):
         source_kind = str(_first(delivery, "source_kind", "sourceKind", default="") or "")
         metadata = _json_obj(_first(delivery, "metadata_json", "metadataJson", "metadata", default={}))
         message: dict[str, Any] = {}
-        if source_id and source_kind in {"channel_message", "channelMessage", "message", ""}:
-            message = await self.channels_client.get_message_readback(source_id)
+        readback_message_id = source_id if source_id and source_kind in {"channel_message", "channelMessage", "message", ""} else None
+        if readback_message_id is None and source_kind == "delivery_intent":
+            readback_message_id = str(_first(metadata, "channel_message_id", "channelMessageId", default="") or "") or None
+        if readback_message_id:
+            message = await self.channels_client.get_message_readback(readback_message_id)
             if not isinstance(message, dict):
                 message = {}
 
@@ -1979,9 +2116,12 @@ class DenChannelsAdapter(BasePlatformAdapter):
         return payload
 
     async def _claim_loop(self) -> None:
+        client = self.gateway_client or self.delivery_client
+        if client is None:
+            return
         while self._running:
             try:
-                claims = await self.gateway_client.claim_deliveries(self._claim_payload())
+                claims = await client.claim_deliveries(self._claim_payload())
                 for delivery in claims:
                     try:
                         event = await self.delivery_to_event(delivery)
@@ -2433,15 +2573,16 @@ class DenChannelsAdapter(BasePlatformAdapter):
                 default=str,
             )[:4000],
         }
-        if self.gateway_client is None:
+        lifecycle_client = self.gateway_client or self.delivery_client
+        if lifecycle_client is None:
             logger.debug(
-                "[DenChannels] no Gateway delivery client configured; skipping delivery %s failed marker",
+                "[DenChannels] no delivery lifecycle client configured; skipping delivery %s failed marker",
                 context.delivery_request_id,
             )
             self._terminal_delivery_ids.add(context.delivery_request_id)
             return
         try:
-            await self.gateway_client.mark_failed(context.delivery_request_id, payload)
+            await lifecycle_client.mark_failed(context.delivery_request_id, payload)
             self._terminal_delivery_ids.add(context.delivery_request_id)
         except Exception:
             logger.debug("[DenChannels] failed to mark delivery %s failed", context.delivery_request_id, exc_info=True)

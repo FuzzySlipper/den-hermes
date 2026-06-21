@@ -24,6 +24,10 @@ optional_env:
       Gateway/delivery API base for executable actuation. Used for: delivery
       claim/complete/fail, adapter binding heartbeat, and direct-agent event
       management. Separate from the conversation/channel API base (DEN_CHANNELS_URL).
+      If omitted, the adapter has a temporary compatibility path that derives this
+      from DEN_CHANNELS_URL only when that URL clearly points at the Gateway/proxy
+      base (for example port 8079/18080), so old fleet profiles can still claim
+      Delivery-successor wakes after direct-agent writes move out of Channels.
       Must have a bearer token configured via DEN_CHANNELS_TOKEN or DEN_GATEWAY_TOKEN.
     prompt: "Den Gateway/delivery URL"
     password: false
@@ -38,8 +42,8 @@ optional_env:
   - name: DEN_OBSERVATION_URL
     description: >
       Den observation/activity API base. Used for: tool-activity event emission
-      (breadcrumbs), agent status/progress projection. If not set, falls back
-      to the conversation API base (DEN_CHANNELS_URL) for backward compatibility.
+      (breadcrumbs), agent status/progress projection. If not set, observation
+      telemetry is skipped/fail-soft; it must not fall back to Den Channels.
     prompt: "Den observation URL"
     password: false
   - name: DEN_OBSERVATION_TOKEN
