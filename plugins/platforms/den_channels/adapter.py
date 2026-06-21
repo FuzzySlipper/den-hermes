@@ -6,9 +6,10 @@ claims delivery requests from Den Channels, turns them into normal runner
 final assistant replies back to Den Channels as ``human_text`` or
 ``gateway_delivery`` messages.
 
-Breadcrumb / tool-activity emission posts to ``POST /api/channel-activity-events``
-on the configured Channels base URL (``channels_url`` / ``channelsUrl``),
-with ``gateway_url`` / ``gatewayUrl`` as a compatibility fallback.
+Breadcrumb / tool-activity emission posts successor ``agent_activity.v1``
+events to ``POST /v1/observation/activity-events`` on the configured
+Observation base URL. Legacy den-channels ``/api/channel-activity-events``
+writes are intentionally not used.
 """
 
 from __future__ import annotations
@@ -301,61 +302,124 @@ def _json_dict_from_payload(value: Any) -> dict[str, Any]:
 
 
 def _emit_activity_event(context: dict[str, Any], payload: dict[str, Any]) -> None:
-    """Post a tool-activity event to Den Channels.
+    """Post a tool-activity event to the Observation successor.
 
-    Prefers ``observationUrl`` / ``observation_url`` / ``DEN_OBSERVATION_URL``
-    as the base URL for activity/observation events. Falls back to
-    ``channelsUrl`` / ``channels_url`` / ``DEN_CHANNELS_URL`` for backward
-    compatibility with profiles that have not yet migrated to an explicit
-    observation URL.
-    The ``gatewayUrl`` / ``gateway_url`` fallback is removed as of #2786.
+    This hook is synchronous because Hermes tool-call hooks are synchronous.
+    Observation failures remain best-effort and fail-soft, but legacy
+    den-channels ``/api/channel-activity-events`` writes are not used as a
+    fallback.
     """
     base_url = str(
-        context.get("observationUrl") or context.get("observation_url")
-        or context.get("channelsUrl") or context.get("channels_url")
+        context.get("observationUrl")
+        or context.get("observation_url")
+        or os.getenv("DEN_OBSERVATION_URL")
         or ""
     ).rstrip("/")
-    channel_id = context.get("channelId") or context.get("channel_id")
-    if not base_url or not channel_id:
+    if not base_url:
         return
-    request_payload = {
-        "channelId": str(channel_id),
-        "projectId": context.get("projectId") or context.get("project_id"),
-        "agentIdentity": context.get("agentIdentity") or context.get("agent_identity") or "hermes",
-        "deliveryRequestId": str(context.get("deliveryRequestId") or context.get("delivery_request_id") or "") or None,
-        "hermesSessionKey": context.get("hermesSessionKey") or context.get("sessionKey") or context.get("session_key"),
-        "taskId": _coerce_int(context.get("taskId") or context.get("task_id")),
-        "threadId": _coerce_int(context.get("threadId") or context.get("thread_id")),
-        "anchorMessageId": _coerce_int(context.get("anchorMessageId") or context.get("anchor_message_id")),
-        **payload,
+
+    event_type = str(payload.get("eventType") or payload.get("event_type") or "tool_call_started")
+    tool_name = str(payload.get("title") or _json_dict_from_payload(payload.get("metadataJson")).get("tool_name") or "tool")
+    status = str(payload.get("status") or "started")
+    summary = _truncate_text(str(payload.get("summary") or tool_name), 240)
+    metadata = _json_dict_from_payload(payload.get("metadataJson"))
+    for key in ("sequence", "dedupeKey", "previewJson", "displayBlockId", "parentHermesSessionKey", "parentAgentIdentity"):
+        if payload.get(key) not in {None, ""}:
+            metadata[key] = payload[key]
+    for ctx_key in (
+        "deliveryRequestId",
+        "displayBlockId",
+        "parentHermesSessionKey",
+        "parentAgentIdentity",
+        "threadId",
+        "conversationLaneId",
+    ):
+        if context.get(ctx_key) not in {None, ""}:
+            metadata[ctx_key] = context[ctx_key]
+
+    work_ref: dict[str, Any] = {}
+    project_id = context.get("projectId") or context.get("project_id")
+    if project_id:
+        work_ref["project_id"] = project_id
+    for ctx_key, ref_key in (
+        ("taskId", "task_id"),
+        ("task_id", "task_id"),
+        ("channelId", "channel_id"),
+        ("channel_id", "channel_id"),
+        ("anchorMessageId", "channel_message_id"),
+        ("anchor_message_id", "channel_message_id"),
+    ):
+        value = _coerce_int(context.get(ctx_key))
+        if value is not None:
+            work_ref[ref_key] = value
+    assignment_id = context.get("assignmentId") or context.get("assignment_id")
+    if assignment_id:
+        work_ref["assignment_id"] = str(assignment_id)
+    worker_run_id = context.get("workerRunId") or context.get("worker_run_id")
+    worker_role = context.get("workerRole") or context.get("worker_role")
+    if worker_run_id:
+        work_ref["run_id"] = str(worker_run_id)
+        metadata["workerRunId"] = str(worker_run_id)
+    if worker_role:
+        metadata["workerRole"] = str(worker_role)
+
+    observation_payload: dict[str, Any] = {
+        "kind": "agent_activity.v1",
+        "schema_version": 1,
+        "summary": summary,
+        "severity": "error" if event_type == "tool_call_failed" or status == "failed" else "info",
+        "visibility": "channel",
+        "adapter": "hermes",
+        "surface": "channel",
+        "tool_name": _truncate_text(tool_name, 120),
     }
-    forwarded = {
-        "displayBlockId": context.get("displayBlockId") or context.get("display_block_id"),
-        "parentHermesSessionKey": context.get("parentHermesSessionKey") or context.get("parent_hermes_session_key"),
-        "parentAgentIdentity": context.get("parentAgentIdentity") or context.get("parent_agent_identity"),
-        "workerRunId": context.get("workerRunId") or context.get("worker_run_id"),
-        "workerRole": context.get("workerRole") or context.get("worker_role"),
-    }
-    request_payload.update({key: value for key, value in forwarded.items() if value not in {None, ""}})
-    metadata = _json_dict_from_payload(request_payload.get("metadataJson"))
-    if forwarded["workerRunId"] not in {None, ""}:
-        metadata["workerRunId"] = forwarded["workerRunId"]
-    if forwarded["workerRole"] not in {None, ""}:
-        metadata["workerRole"] = forwarded["workerRole"]
+    session_key = context.get("hermesSessionKey") or context.get("sessionKey") or context.get("session_key")
+    if session_key:
+        observation_payload["session_key"] = str(session_key)
+    if work_ref:
+        observation_payload["work_ref"] = work_ref
     if metadata:
-        request_payload["metadataJson"] = _safe_json_preview(metadata)
+        # Observation's current DTO validates known fields and ignores extras;
+        # retain breadcrumb-specific details for downstream projections without
+        # depending on the old den-channels camelCase write contract.
+        observation_payload["metadata"] = metadata
+    if event_type == "tool_call_completed":
+        observation_payload["result_ref"] = {"artifact_path": f"hermes-tool:{_truncate_text(tool_name, 80)}"}
+    if event_type == "tool_call_failed":
+        observation_payload["reason_code"] = str(metadata.get("reason_code") or "tool_call_failed")
+
+    agent_profile = context.get("profileIdentity") or context.get("profile") or context.get("agentIdentity") or context.get("agent_identity")
+    agent_instance = context.get("agentInstanceId") or context.get("agent_instance_id") or context.get("adapterInstanceId") or context.get("adapter_instance_id")
+    request_payload: dict[str, Any] = {
+        "source_domain": "runtime",
+        "event_type": event_type,
+        "payload": observation_payload,
+    }
+    if agent_profile and agent_instance:
+        request_payload["agent_identity"] = {
+            "profile": str(agent_profile),
+            "instance_id": str(agent_instance),
+        }
+    elif agent_instance:
+        request_payload["runtime_instance_id"] = str(agent_instance)
+
     headers = {"Content-Type": "application/json"}
-    token = str(context.get("token") or "").strip()
+    token = str(
+        context.get("observationToken")
+        or context.get("observation_token")
+        or os.getenv("DEN_OBSERVATION_TOKEN")
+        or ""
+    ).strip()
     if token:
         headers["Authorization"] = f"Bearer {token}"
     try:
         import httpx
 
         with httpx.Client(timeout=2.0) as client:
-            response = client.post(f"{base_url}/api/channel-activity-events", json=request_payload, headers=headers)
+            response = client.post(f"{base_url}/v1/observation/activity-events", json=request_payload, headers=headers)
             response.raise_for_status()
     except Exception:
-        logger.debug("[DenChannels] activity event emission failed", exc_info=True)
+        logger.debug("[DenChannels] observation activity event emission failed", exc_info=True)
 
 
 def _on_pre_tool_call(**kwargs: Any) -> None:
@@ -1168,7 +1232,6 @@ class DenChannelsAdapter(BasePlatformAdapter):
             extra.get("observation_url")
             or extra.get("OBSERVATION_URL")
             or os.getenv("DEN_OBSERVATION_URL")
-            or self.channels_url
             or ""
         ).rstrip("/")
         self.conversation_url = str(
@@ -1236,6 +1299,7 @@ class DenChannelsAdapter(BasePlatformAdapter):
             or token
             or ""
         ).strip() or None
+        self.observation_token = observation_token
         conversation_token = str(
             extra.get("conversation_token")
             or os.getenv("DEN_CONVERSATION_TOKEN")
@@ -1802,7 +1866,8 @@ class DenChannelsAdapter(BasePlatformAdapter):
             "deliveryUrl": self.delivery_url,
             "observationUrl": self.observation_url,
             "channelsUrl": self.channels_url,
-            "token": self.gateway_client.token if isinstance(self.gateway_client, DenGatewayClient) else None,
+            "observationToken": self.observation_token,
+            "adapterInstanceId": self.adapter_instance_id,
             "channelId": context.channel_id,
             "projectId": context.project_id,
             "agentIdentity": self.agent_identity,

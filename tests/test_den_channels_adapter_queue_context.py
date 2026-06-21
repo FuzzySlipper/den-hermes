@@ -923,6 +923,130 @@ async def test_activity_environment_is_bound_to_delivery_context(monkeypatch: py
     assert _adapter_module._activity_context() == {}
 
 
+@pytest.mark.asyncio
+async def test_adapter_activity_hook_skips_when_only_channels_url_configured(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Adapter-level breadcrumb context must not derive Observation from channels_url."""
+    monkeypatch.delenv("DEN_OBSERVATION_URL", raising=False)
+    monkeypatch.delenv("DEN_OBSERVATION_TOKEN", raising=False)
+    posted: list[tuple[str, dict[str, Any]]] = []
+
+    class FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+    class FakeClient:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        def __enter__(self) -> "FakeClient":
+            return self
+
+        def __exit__(self, *args: Any) -> None:
+            return None
+
+        def post(self, url: str, *, json: dict[str, Any], headers: dict[str, str]) -> FakeResponse:
+            posted.append((url, json))
+            return FakeResponse()
+
+    class FakeHttpx:
+        Client = FakeClient
+
+    monkeypatch.setitem(sys.modules, "httpx", FakeHttpx)
+
+    channels = FakeChannelsClient()
+    channels.messages = {
+        130: {"id": 130, "channelId": 42, "senderIdentity": "runner", "body": "work"},
+    }
+    adapter = _channels_only_adapter(channels)
+    event = await adapter.delivery_to_event(_delivery(901, 130, attempt_id=1101))
+    context = adapter._build_context(event)
+    assert context is not None
+    adapter._set_activity_environment(context)
+    try:
+        activity_context = _adapter_module._activity_context()
+        assert activity_context["channelsUrl"] == "http://192.168.1.10:18081"
+        assert activity_context["observationUrl"] == ""
+        _on_pre_tool_call(tool_name="terminal", args={"command": "date"})
+    finally:
+        adapter._clear_activity_environment(context)
+
+    assert posted == []
+
+
+@pytest.mark.asyncio
+async def test_generic_adapter_activity_hook_uses_adapter_instance_for_agent_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Generic non-pool breadcrumbs should still carry stable Observation agent identity."""
+    monkeypatch.delenv("DEN_HERMES_AGENT_INSTANCE_ID", raising=False)
+    posted: list[dict[str, Any]] = []
+
+    class FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+    class FakeClient:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        def __enter__(self) -> "FakeClient":
+            return self
+
+        def __exit__(self, *args: Any) -> None:
+            return None
+
+        def post(self, url: str, *, json: dict[str, Any], headers: dict[str, str]) -> FakeResponse:
+            posted.append(json)
+            return FakeResponse()
+
+    class FakeHttpx:
+        Client = FakeClient
+
+    monkeypatch.setitem(sys.modules, "httpx", FakeHttpx)
+
+    gateway = FakeGatewayClient()
+    channels = FakeChannelsClient()
+    channels.messages = {
+        131: {"id": 131, "channelId": 42, "senderIdentity": "runner", "body": "work"},
+    }
+    adapter = DenChannelsAdapter(
+        PlatformConfig(
+            enabled=True,
+            token="test-token",
+            extra={
+                "gateway_url": "http://192.168.1.10:18080",
+                "channels_url": "http://192.168.1.10:18081",
+                "observation_url": "http://obs.test",
+                "project_id": "den-hermes-bridge",
+                "agent_identity": "den-mcp-runner",
+                "role": "runner",
+                "profile": "den-mcp-runner",
+                "adapter_instance_id": "test-host:den-mcp-runner:runner:gateway",
+                "start_claim_loop": False,
+            },
+        ),
+        gateway_client=gateway,
+        channels_client=channels,
+        conversation_client=FakeConversationClient(channels),
+    )
+    event = await adapter.delivery_to_event(_delivery(902, 131, attempt_id=1102))
+    context = adapter._build_context(event)
+    assert context is not None
+    adapter._set_activity_environment(context)
+    try:
+        activity_context = _adapter_module._activity_context()
+        assert "agentInstanceId" not in activity_context
+        assert activity_context["adapterInstanceId"] == "test-host:den-mcp-runner:runner:gateway"
+        _on_pre_tool_call(tool_name="terminal", args={"command": "date"})
+    finally:
+        adapter._clear_activity_environment(context)
+
+    assert posted[0]["agent_identity"] == {
+        "profile": "den-mcp-runner",
+        "instance_id": "test-host:den-mcp-runner:runner:gateway",
+    }
+
+
 def test_activity_emitter_preserves_hermes_session_key(monkeypatch: pytest.MonkeyPatch) -> None:
     posted: list[dict[str, Any]] = []
 
@@ -951,7 +1075,7 @@ def test_activity_emitter_preserves_hermes_session_key(monkeypatch: pytest.Monke
 
     _adapter_module._emit_activity_event(
         {
-            "channelsUrl": "http://gateway.test",
+            "observationUrl": "http://obs.test",
             "channelId": 42,
             "projectId": "den-hermes-bridge",
             "agentIdentity": "den-mcp-runner",
@@ -961,7 +1085,7 @@ def test_activity_emitter_preserves_hermes_session_key(monkeypatch: pytest.Monke
         normalize_tool_activity("terminal", {"command": "date"}),
     )
 
-    assert posted[0]["hermesSessionKey"] == "project:den-hermes-bridge:channel:42"
+    assert posted[0]["payload"]["session_key"] == "project:den-hermes-bridge:channel:42"
 
 
 def test_activity_emitter_forwards_spawned_worker_context(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -992,7 +1116,7 @@ def test_activity_emitter_forwards_spawned_worker_context(monkeypatch: pytest.Mo
 
     _adapter_module._emit_activity_event(
         {
-            "channelsUrl": "http://gateway.test",
+            "observationUrl": "http://obs.test",
             "channelId": 42,
             "projectId": "den-hermes-bridge",
             "taskId": 1565,
@@ -1010,19 +1134,19 @@ def test_activity_emitter_forwards_spawned_worker_context(monkeypatch: pytest.Mo
     )
 
     event = posted[0]
-    assert event["displayBlockId"] == "block-701"
-    assert event["parentHermesSessionKey"] == "parent-session"
-    assert event["parentAgentIdentity"] == "den-mcp-runner"
-    assert event["workerRunId"] == "coder-run-1"
-    assert event["workerRole"] == "coder"
-    metadata = json.loads(event["metadataJson"])
+    activity = event["payload"]
+    assert activity["work_ref"]["run_id"] == "coder-run-1"
+    metadata = activity["metadata"]
+    assert metadata["displayBlockId"] == "block-701"
+    assert metadata["parentHermesSessionKey"] == "parent-session"
+    assert metadata["parentAgentIdentity"] == "den-mcp-runner"
     assert metadata["workerRunId"] == "coder-run-1"
     assert metadata["workerRole"] == "coder"
 
 
-def test_activity_emitter_accepts_channels_url_only(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Activity emission works with only channels_url (no gatewayUrl)."""
-    posted: list[dict[str, Any]] = []
+def test_activity_emitter_uses_observation_successor(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Activity emission writes successor Observation events, not legacy Channels events."""
+    posted: list[tuple[str, dict[str, Any]]] = []
 
     class FakeResponse:
         def raise_for_status(self) -> None:
@@ -1049,10 +1173,11 @@ def test_activity_emitter_accepts_channels_url_only(monkeypatch: pytest.MonkeyPa
 
     _adapter_module._emit_activity_event(
         {
-            "channels_url": "http://channels.test",
+            "observation_url": "http://obs.test",
             "channelId": 42,
             "projectId": "den-hermes-bridge",
             "agentIdentity": "den-mcp-runner",
+            "agentInstanceId": "hermes:test:runner",
             "deliveryRequestId": 702,
         },
         normalize_tool_activity("terminal", {"command": "date"}),
@@ -1060,14 +1185,18 @@ def test_activity_emitter_accepts_channels_url_only(monkeypatch: pytest.MonkeyPa
 
     assert len(posted) == 1
     url, body = posted[0]
-    assert url == "http://channels.test/api/channel-activity-events"
-    assert body["channelId"] == "42"
-    assert body["agentIdentity"] == "den-mcp-runner"
+    assert url == "http://obs.test/v1/observation/activity-events"
+    assert body["source_domain"] == "runtime"
+    assert body["event_type"] == "tool_call_started"
+    assert body["agent_identity"] == {"profile": "den-mcp-runner", "instance_id": "hermes:test:runner"}
+    assert body["payload"]["kind"] == "agent_activity.v1"
+    assert body["payload"]["tool_name"] == "terminal"
+    assert body["payload"]["work_ref"]["channel_id"] == 42
 
 
 def test_activity_emitter_prefers_observation_over_channels(monkeypatch: pytest.MonkeyPatch) -> None:
-    """When both observationUrl and channelsUrl are set, observationUrl is preferred."""
-    posted: list[dict[str, Any]] = []
+    """When both observationUrl and channelsUrl are set, only observationUrl is used."""
+    posted: list[tuple[str, dict[str, Any]]] = []
 
     class FakeResponse:
         def raise_for_status(self) -> None:
@@ -1105,13 +1234,13 @@ def test_activity_emitter_prefers_observation_over_channels(monkeypatch: pytest.
 
     assert len(posted) == 1
     url, _body = posted[0]
-    assert url == "http://obs.test/api/channel-activity-events"
+    assert url == "http://obs.test/v1/observation/activity-events"
     assert "channels.test" not in url
 
 
-def test_activity_emitter_falls_back_to_channels_url(monkeypatch: pytest.MonkeyPatch) -> None:
-    """When only channelsUrl is set (no observationUrl), channelsUrl is used as fallback."""
-    posted: list[dict[str, Any]] = []
+def test_activity_emitter_does_not_fallback_to_channels_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    """When only channelsUrl is set, legacy activity emission is skipped."""
+    posted: list[tuple[str, dict[str, Any]]] = []
 
     class FakeResponse:
         def raise_for_status(self) -> None:
@@ -1146,9 +1275,7 @@ def test_activity_emitter_falls_back_to_channels_url(monkeypatch: pytest.MonkeyP
         normalize_tool_activity("terminal", {"command": "date"}),
     )
 
-    assert len(posted) == 1
-    url, _body = posted[0]
-    assert url == "http://channels.test/api/channel-activity-events"
+    assert posted == []
 
 
 def test_canonical_spawned_worker_activity_payload_shape_1567(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1185,12 +1312,13 @@ def test_canonical_spawned_worker_activity_payload_shape_1567(monkeypatch: pytes
 
     _adapter_module._emit_activity_event(
         {
-            "channelsUrl": "http://gateway.test",
+            "observationUrl": "http://obs.test",
             "channelId": 42,
             "projectId": "den-hermes-bridge",
             "taskId": 1567,
             "threadId": 9001,
             "agentIdentity": "den-coder-profile",
+            "agentInstanceId": "hermes:test:coder",
             "deliveryRequestId": 701,
             "displayBlockId": "parent-1567",
             "parentHermesSessionKey": "parent-session-1567",
@@ -1202,19 +1330,20 @@ def test_canonical_spawned_worker_activity_payload_shape_1567(monkeypatch: pytes
     )
 
     event = posted[0]
-    expected_shape = {
-        "agentIdentity": "den-coder-profile",
-        "deliveryRequestId": "701",
-        "displayBlockId": "parent-1567",
-        "parentHermesSessionKey": "parent-session-1567",
-        "parentAgentIdentity": "den-mcp-runner",
-        "workerRunId": "coder-1567",
-        "workerRole": "coder",
-    }
-    for key, expected in expected_shape.items():
-        assert event[key] == expected
-    assert "displayDeliveryRequestId" not in event
-    metadata = json.loads(event["metadataJson"])
+    assert event["source_domain"] == "runtime"
+    assert event["event_type"] == "tool_call_started"
+    assert event["agent_identity"] == {"profile": "den-coder-profile", "instance_id": "hermes:test:coder"}
+    activity = event["payload"]
+    assert activity["kind"] == "agent_activity.v1"
+    assert activity["schema_version"] == 1
+    assert activity["work_ref"]["project_id"] == "den-hermes-bridge"
+    assert activity["work_ref"]["task_id"] == 1567
+    assert activity["work_ref"]["channel_id"] == 42
+    assert activity["work_ref"]["run_id"] == "coder-1567"
+    metadata = activity["metadata"]
+    assert metadata["displayBlockId"] == "parent-1567"
+    assert metadata["parentHermesSessionKey"] == "parent-session-1567"
+    assert metadata["parentAgentIdentity"] == "den-mcp-runner"
     assert metadata["workerRunId"] == "coder-1567"
     assert metadata["workerRole"] == "coder"
 
@@ -2077,7 +2206,8 @@ async def test_activity_environment_omits_pool_member_id_when_not_configured(mon
 
     assert "poolMemberId" not in context
     assert "agentInstanceId" not in context
-    # profileIdentity should still be set
+    # Generic profiles still expose adapterInstanceId as stable Observation attribution.
+    assert context["adapterInstanceId"] == "test-host:den-mcp-runner:runner:gateway"
     assert context["profileIdentity"] == "den-mcp-runner"
 
     await adapter.on_processing_complete(event, _adapter_module.ProcessingOutcome.FAILURE)
