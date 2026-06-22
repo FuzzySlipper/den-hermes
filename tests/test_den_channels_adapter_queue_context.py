@@ -24,6 +24,7 @@ _SPEC.loader.exec_module(_adapter_module)
 DenChannelsAdapter = _adapter_module.DenChannelsAdapter
 DenDeliveryClient = _adapter_module.DenDeliveryClient
 DenRuntimeClient = _adapter_module.DenRuntimeClient
+_DeliveryContext = _adapter_module._DeliveryContext
 normalize_tool_activity = _adapter_module.normalize_tool_activity
 _on_pre_tool_call = _adapter_module._on_pre_tool_call
 _on_post_tool_call = _adapter_module._on_post_tool_call
@@ -63,6 +64,29 @@ class FakeGatewayClient:
 
     async def mark_failed(self, delivery_request_id: int, payload: dict[str, Any]) -> dict[str, Any]:
         self.failed.append((delivery_request_id, payload))
+        return {"ok": True}
+
+
+
+class FakeDeliveryExecutionClient:
+    def __init__(self) -> None:
+        self.claims: list[dict[str, Any]] = []
+        self.completed: list[tuple[int, dict[str, Any]]] = []
+        self.failed: list[tuple[int, dict[str, Any]]] = []
+
+    async def claim_deliveries(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
+        self.claims.append(payload)
+        return []
+
+    async def mark_completed(self, delivery_request_id: int, payload: dict[str, Any]) -> dict[str, Any]:
+        self.completed.append((delivery_request_id, payload))
+        return {"ok": True}
+
+    async def mark_failed(self, delivery_request_id: int, payload: dict[str, Any]) -> dict[str, Any]:
+        self.failed.append((delivery_request_id, payload))
+        return {"ok": True}
+
+    async def mark_delivered(self, delivery_request_id: int, payload: dict[str, Any]) -> dict[str, Any]:
         return {"ok": True}
 
 
@@ -910,6 +934,73 @@ async def test_start_poll_loop_fails_closed_instead_of_spinning_retired_poller()
     assert await adapter.connect() is False
     assert adapter._event_task is None
     assert adapter.has_fatal_error is True
+
+
+
+
+@pytest.mark.asyncio
+async def test_adapter_prefers_delivery_successor_over_gateway_for_claim_and_lifecycle() -> None:
+    gateway = FakeGatewayClient()
+    channels = FakeChannelsClient()
+    channels.messages = {1009: {"id": 1009, "channelId": 42, "senderIdentity": "patch", "body": "please do work"}}
+    delivery = FakeDeliveryExecutionClient()
+    adapter = DenChannelsAdapter(
+        PlatformConfig(
+            enabled=True,
+            token="***",
+            extra={
+                "gateway_url": "http://127.0.0.1:8079",
+                "delivery_url": "http://127.0.0.1:8083",
+                "conversation_url": "http://127.0.0.1:8084",
+                "project_id": "den-hermes-bridge",
+                "agent_identity": "spawned-coder",
+                "adapter_instance_id": "spawned-coder@den-k8",
+                "start_claim_loop": False,
+                "start_poll_loop": False,
+                "token": "gateway-token",
+            },
+        ),
+        gateway_client=gateway,
+        channels_client=channels,
+        conversation_client=FakeConversationClient(channels),
+    )
+    adapter.delivery_client = delivery
+
+    assert adapter._delivery_execution_client() is delivery
+    await adapter._delivery_execution_client().claim_deliveries(adapter._claim_payload())
+    assert delivery.claims
+    assert gateway.completed == []
+
+    event = await adapter.delivery_to_event(_delivery(909, 1009, attempt_id=1909))
+    result = await adapter.send(
+        event.source.chat_id,
+        "final answer",
+        metadata={"delivery_request_id": 909, "notify": True},
+    )
+
+    assert result.success is True
+    assert [item[0] for item in delivery.completed] == [909]
+    assert gateway.completed == []
+
+    await adapter._mark_failed(
+        _DeliveryContext(
+            delivery_request_id=910,
+            attempt_id=1910,
+            project_id="den-hermes-bridge",
+            channel_id=1,
+            trigger_message_id=None,
+            thread_root_message_id=None,
+            session_key="s",
+            session_id="s",
+            original_source_kind="delivery_intent",
+            original_source_id="910",
+            raw_delivery={},
+        ),
+        "test_failure",
+        "boom",
+    )
+    assert [item[0] for item in delivery.failed] == [910]
+    assert gateway.failed == []
 
 
 def test_delivery_successor_intent_parses_conversation_source_ref_metadata() -> None:

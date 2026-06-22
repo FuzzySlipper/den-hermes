@@ -1445,6 +1445,7 @@ class DenChannelsAdapter(BasePlatformAdapter):
                 "set DEN_DELIVERY_URL explicitly to silence this compatibility path",
                 self.channels_url,
             )
+        self._delivery_successor_explicit = bool(configured_delivery_url or derived_delivery_url)
         self.delivery_url = configured_delivery_url or self.gateway_url or derived_delivery_url
         configured_runtime_url = str(
             extra.get("runtime_url")
@@ -1857,7 +1858,7 @@ class DenChannelsAdapter(BasePlatformAdapter):
                     default=str,
                 ),
             }
-            lifecycle_client = self.gateway_client or self.delivery_client
+            lifecycle_client = self._delivery_execution_client()
             if lifecycle_client is None:
                 # Channels-owned direct-agent polling does not have a legacy
                 # Gateway delivery lifecycle endpoint to complete. The visible
@@ -2320,6 +2321,19 @@ class DenChannelsAdapter(BasePlatformAdapter):
             binding["agent_instance_id"] = self.agent_instance_id
         return binding
 
+    def _delivery_execution_client(self) -> Any | None:
+        """Return the client used for executable Delivery claim/lifecycle calls.
+
+        When a Delivery successor URL is explicitly configured, it wins over the
+        Gateway binding client so normal execution cannot fall back to retired
+        ``/api/deliveries/*`` routes. Gateway-only legacy test/profile setups
+        continue to use the injected Gateway client unless/until they configure
+        the successor Delivery surface explicitly.
+        """
+        if self.delivery_client is not None and self._delivery_successor_explicit:
+            return self.delivery_client
+        return self.gateway_client or self.delivery_client
+
     def _claim_payload(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "adapter_kind": "hermes_profile",
@@ -2339,7 +2353,7 @@ class DenChannelsAdapter(BasePlatformAdapter):
         return payload
 
     async def _claim_loop(self) -> None:
-        client = self.gateway_client or self.delivery_client
+        client = self._delivery_execution_client()
         if client is None:
             return
         while self._running:
@@ -2803,7 +2817,7 @@ class DenChannelsAdapter(BasePlatformAdapter):
                 default=str,
             )[:4000],
         }
-        lifecycle_client = self.gateway_client or self.delivery_client
+        lifecycle_client = self._delivery_execution_client()
         if lifecycle_client is None:
             logger.debug(
                 "[DenChannels] no delivery lifecycle client configured; skipping delivery %s failed marker",
