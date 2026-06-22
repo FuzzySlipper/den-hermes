@@ -39,7 +39,8 @@ def get_memberships(base_url: str, *, project_id: str | None, channel_id: int | 
 
 
 def active_member(memberships: dict[str, Any], member_identity: str) -> dict[str, Any] | None:
-    for member in memberships.get("members") or []:
+    rows = memberships.get("memberships") or memberships.get("items") or memberships.get("members") or []
+    for member in rows:
         if (
             (member.get("memberIdentity") or member.get("member_identity")) == member_identity
             and (member.get("memberType") or member.get("member_type")) == "agent"
@@ -85,7 +86,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.send:
         payload = {
             "target_identity": {"profile": args.member_identity, "instance_id": args.member_identity},
-            "idempotency_key": f"smoke:{channel_id}:{args.member_identity}",
+            "idempotency_key": f"wake:ch{channel_id}:{args.member_identity}:smoke",
             "source_ref": f"wake://{args.member_identity}?body={urllib.parse.quote(args.body)}",
             "channel_id": channel_id,
             "ttl_seconds": 300,

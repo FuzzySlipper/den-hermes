@@ -907,41 +907,43 @@ class DenDeliveryClient:
             return response.json()
 
     async def claim_deliveries(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
+        """Atomically claim the next Delivery intent for this runtime identity.
+
+        Task #3178 made ``POST /v1/delivery/intents/claim-next`` the only
+        blessed worker-polling path. Do not list pending intents and then claim
+        by ID: list-then-claim races and can cross concrete runtime instances.
+        """
         if not self.base_url:
             return []
         agent_identity = str(payload.get("agent_identity") or "").strip()
-        adapter_instance_id = str(payload.get("adapter_instance_id") or "").strip()
+        claimed_instance_id = str(
+            payload.get("agent_instance_id")
+            or payload.get("pool_member_id")
+            or payload.get("adapter_instance_id")
+            or ""
+        ).strip()
+        if not agent_identity or not claimed_instance_id:
+            logger.warning("[DenDelivery] claim-next skipped; missing agent_identity or concrete instance id")
+            return []
         claim_limit = max(1, _coerce_int(payload.get("limit")) or 1)
-        result = await self._request("GET", "/v1/delivery/intents?state=pending")
-        intents = result if isinstance(result, list) else []
         claimed: list[dict[str, Any]] = []
-        for intent in intents:
-            if len(claimed) >= claim_limit or not isinstance(intent, dict):
-                break
-            target = intent.get("target_identity") if isinstance(intent.get("target_identity"), dict) else {}
-            target = target if isinstance(target, dict) else {}
-            target_profile = str(target.get("profile") or "").strip()
-            target_instance = str(target.get("instance_id") or "").strip()
-            if target_profile != agent_identity and target_instance not in {adapter_instance_id, agent_identity}:
-                continue
-            intent_id = _coerce_int(intent.get("id"))
-            if intent_id is None:
-                continue
-            claim_token = f"hermes:{adapter_instance_id}:{intent_id}:{int(time.time())}"
+        for _ in range(claim_limit):
+            claim_token = f"hermes:{claimed_instance_id}:{int(time.time() * 1000)}"
             claim_payload = {
                 "claim_token": claim_token,
                 "claimed_by": {
-                    "profile": target_profile or agent_identity,
-                    "instance_id": target_instance or adapter_instance_id or f"{agent_identity}@hermes",
+                    "profile": agent_identity,
+                    "instance_id": claimed_instance_id,
                 },
+                "limit": 1,
             }
-            try:
-                claimed_intent = await self._request("POST", f"/v1/delivery/intents/{intent_id}/claim", claim_payload)
-            except Exception:
-                logger.debug("[DenDelivery] failed to claim intent %s", intent_id, exc_info=True)
-                continue
-            self._claim_tokens_by_intent[intent_id] = claim_token
-            claimed.append(self._intent_to_delivery(claimed_intent if isinstance(claimed_intent, dict) else intent, claim_token))
+            result = await self._request("POST", "/v1/delivery/intents/claim-next", claim_payload)
+            if not isinstance(result, dict) or not result:
+                break
+            intent_id = _coerce_int(result.get("id"))
+            if intent_id is not None:
+                self._claim_tokens_by_intent[intent_id] = claim_token
+            claimed.append(self._intent_to_delivery(result, claim_token))
         return claimed
 
     def _intent_to_delivery(self, intent: dict[str, Any], claim_token: str) -> dict[str, Any]:
@@ -1550,19 +1552,38 @@ class DenChannelsAdapter(BasePlatformAdapter):
             or channels_token
             or ""
         ).strip() or None
+        delivery_token = str(
+            extra.get("delivery_token")
+            or os.getenv("DEN_DELIVERY_TOKEN")
+            or os.getenv("DEN_GATEWAY_DELIVERY_TOKEN")
+            or token
+            or channels_token
+            or ""
+        ).strip() or None
         _remember_direct_agent_config(
             gateway_url=self.gateway_url,
             delivery_url=self.delivery_url,
             observation_url=self.observation_url,
             channels_url=self.channels_url,
-            token=channels_token or token,
+            token=delivery_token or channels_token or token,
             agent_identity=self.agent_identity,
         )
         self._has_trusted_transport = bool(
-            token or channels_token or _is_private_url(self.gateway_url) or _is_private_url(self.channels_url)
+            token
+            or channels_token
+            or delivery_token
+            or runtime_token
+            or conversation_token
+            or observation_token
+            or _is_private_url(self.gateway_url)
+            or _is_private_url(self.delivery_url)
+            or _is_private_url(self.runtime_url)
+            or _is_private_url(self.conversation_url)
+            or _is_private_url(self.observation_url)
+            or _is_private_url(self.channels_url)
         )
         self.gateway_client = gateway_client or (DenGatewayClient(self.gateway_url, token=token) if self.gateway_url else None)
-        self.delivery_client = DenDeliveryClient(self.delivery_url, token=channels_token or token) if self.delivery_url else None
+        self.delivery_client = DenDeliveryClient(self.delivery_url, token=delivery_token) if self.delivery_url else None
         self.runtime_client = runtime_client or (DenRuntimeClient(self.runtime_url, token=runtime_token) if self.runtime_url else None)
         self.channels_client = channels_client or DenChannelsClient(self.conversation_url, token=conversation_token or conversation_read_token)
         self.conversation_client = conversation_client or (
@@ -1620,7 +1641,7 @@ class DenChannelsAdapter(BasePlatformAdapter):
         if not self._has_trusted_transport:
             self._set_fatal_error(
                 "den_channels_auth",
-                "Den Channels adapter requires DEN_GATEWAY_TOKEN/token or a private/loopback DEN_GATEWAY_URL",
+                "Den Channels adapter requires a successor token or a private/loopback successor URL",
                 retryable=False,
             )
             return False
@@ -1652,20 +1673,14 @@ class DenChannelsAdapter(BasePlatformAdapter):
             except RuntimeError:
                 # Unit tests may construct without a running loop; connect still proves config/binding.
                 self._claim_task = None
-        if self.start_poll_loop and self.conversation_url:
-            try:
-                self._event_task = asyncio.create_task(self._event_poll_loop())
-            except RuntimeError:
-                self._event_task = None
-
-        # Initialize subscriptions and cursors from the server (task #2554).
-        # This runs on connect so newly added channels are discovered immediately
-        # without waiting for the first poll loop cycle.
-        if self.start_poll_loop and self.conversation_url and self.agent_identity:
-            try:
-                await self._discover_and_sync_subscriptions()
-            except Exception:
-                logger.debug("[DenChannels] subscription init failed on connect", exc_info=True)
+        if self.start_poll_loop:
+            self._set_fatal_error(
+                "den_channels_legacy_poll_loop_retired",
+                "Legacy direct-agent event polling is retired; use Delivery claim-next instead.",
+                retryable=False,
+            )
+            self._running = False
+            return False
 
         await self._emit_observation_activity(
             "adapter_connected",
@@ -2817,10 +2832,20 @@ def validate_config(config: PlatformConfig) -> bool:
     channels_url = extra.get("channels_url") or os.getenv("DEN_CHANNELS_URL")
     agent_identity = extra.get("agent_identity") or os.getenv("HERMES_AGENT_IDENTITY") or os.getenv("HERMES_PROFILE")
     token = str(extra.get("token") or os.getenv("DEN_GATEWAY_TOKEN") or "").strip()
+    delivery_url = extra.get("delivery_url") or os.getenv("DEN_DELIVERY_URL")
+    runtime_url = extra.get("runtime_url") or os.getenv("DEN_RUNTIME_URL")
+    conversation_url = extra.get("conversation_url") or os.getenv("DEN_CONVERSATION_URL")
+    observation_url = extra.get("observation_url") or os.getenv("DEN_OBSERVATION_URL")
+    successor_url = delivery_url or runtime_url or conversation_url or observation_url or gateway_url
     return bool(
-        channels_url
-        and agent_identity
-        and (token or _is_private_url(str(gateway_url or "")) or _is_private_url(str(channels_url)))
+        agent_identity
+        and successor_url
+        and (
+            token
+            or _is_private_url(str(successor_url or ""))
+            or _is_private_url(str(gateway_url or ""))
+            or _is_private_url(str(channels_url or ""))
+        )
     )
 
 
@@ -3099,7 +3124,8 @@ async def _handle_direct_agent_message(args: dict[str, Any] | None = None, **kwa
     endpoint = join_api_url(base_url, endpoint_path)
     headers = {"Content-Type": "application/json"}
     token = str(
-        os.getenv("DEN_GATEWAY_TOKEN")
+        os.getenv("DEN_DELIVERY_TOKEN")
+        or os.getenv("DEN_GATEWAY_TOKEN")
         or os.getenv("DEN_CHANNELS_TOKEN")
         or _DIRECT_AGENT_CONFIG_DEFAULTS.get("token")
         or ""
@@ -3153,7 +3179,7 @@ def register(ctx: Any) -> None:
         adapter_factory=lambda cfg: DenChannelsAdapter(cfg),
         check_fn=check_requirements,
         validate_config=validate_config,
-        required_env=["DEN_GATEWAY_URL", "DEN_CHANNELS_URL"],
+        required_env=[],
         allowed_users_env="DEN_CHANNELS_ALLOWED_USERS",
         allow_all_env="DEN_CHANNELS_ALLOW_ALL_USERS",
         install_hint="No extra packages needed beyond Hermes runtime dependencies",
@@ -3176,7 +3202,7 @@ def register(ctx: Any) -> None:
         description=(
             "Send a direct agent message through Den Channels Gateway to a specific "
             "agent member. Requires member_identity as the target — broadcast is not "
-            "supported. Uses DEN_CHANNELS_URL / DEN_GATEWAY_URL from environment or "
+            "supported. Uses DEN_DELIVERY_URL / DEN_GATEWAY_URL from environment or "
             "plugin config."
         ),
         emoji="📨",

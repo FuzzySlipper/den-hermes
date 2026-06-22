@@ -364,6 +364,10 @@ class DenWorkflowAdapter:
     target_project_id: str | None = None
     channels_url: str | None = None
     channels_token: str | None = None
+    conversation_url: str | None = None
+    conversation_token: str | None = None
+    delivery_url: str | None = None
+    delivery_token: str | None = None
 
     @property
     def work_project_id(self) -> str:
@@ -688,6 +692,13 @@ class DenWorkflowAdapter:
     # Channel membership methods (worker-pool home / target-work residency)
     # ------------------------------------------------------------------
 
+    def _successor_base_for_path(self, path: str) -> tuple[str | None, str | None, str]:
+        if path.startswith("/v1/conversation"):
+            return self.conversation_url or self.channels_url, self.conversation_token or self.channels_token, "conversation_url"
+        if path.startswith("/v1/delivery"):
+            return self.delivery_url or self.channels_url, self.delivery_token or self.channels_token, "delivery_url"
+        return self.channels_url, self.channels_token, "channels_url"
+
     def _channels_request(
         self,
         method: str,
@@ -696,26 +707,28 @@ class DenWorkflowAdapter:
         params: dict[str, str] | None = None,
         json_payload: Any = None,
     ) -> Mapping[str, Any]:
-        """Make a synchronous HTTP request to the Channels API.
+        """Make a synchronous HTTP request to the correct successor service.
 
-        Uses stdlib HTTP to avoid adding a runtime dependency to the Bridge.
-        Returns the parsed JSON response or a safe fallback on errors.
+        The historical method name is retained for call-site compatibility, but
+        paths are no longer all sent to one ``channels_url`` bucket. Conversation
+        and Delivery successors may be deployed as distinct services.
         """
-        if not self.channels_url:
-            return {"ok": False, "error": "no channels_url configured"}
+        base_url, token, base_name = self._successor_base_for_path(path)
+        if not base_url:
+            return {"ok": False, "error": f"no {base_name} configured", "endpoint": path}
         from urllib.parse import urlencode
         from urllib.request import Request, urlopen
 
-        url = join_api_url(self.channels_url, path)
+        url = join_api_url(base_url, path)
         if params:
             url = f"{url}?{urlencode(params)}"
         headers = {"Content-Type": "application/json", "Accept": "application/json"}
-        if self.channels_token:
-            headers["Authorization"] = f"Bearer {self.channels_token}"
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
         body = json.dumps(json_payload).encode("utf-8") if json_payload is not None else None
         try:
             request = Request(url, data=body, headers=headers, method=method)
-            with urlopen(request, timeout=10) as response:  # noqa: S310 - URL is operator-configured LAN Core/Channels API.
+            with urlopen(request, timeout=10) as response:  # noqa: S310 - URL is operator-configured LAN successor API.
                 content = response.read()
             if not content:
                 return {"ok": True}
@@ -726,14 +739,15 @@ class DenWorkflowAdapter:
         except Exception as exc:
             error_text = str(exc)[:500]
             failure_category = _classify_url_request_failure(exc)
-            logger.warning("Channels API %s %s failed: %s", method, path, exc)
+            logger.warning("Den successor API %s %s failed: %s", method, path, exc)
             return {
                 "ok": False,
                 "error": error_text,
                 "failure_category": failure_category,
                 "method": method,
                 "url": url,
-                "base_url": self.channels_url,
+                "base_url": base_url,
+                "base_name": base_name,
                 "endpoint": path,
             }
 
@@ -2538,15 +2552,17 @@ def build_mcp_adapter(
         project_id=project_id,
         requested_by=requested_by,
         target_project_id=target_project_id or os.environ.get("DEN_TARGET_PROJECT_ID") or None,
-        channels_url=(
-            os.environ.get("DEN_CONVERSATION_URL")
-            or os.environ.get("DEN_DELIVERY_URL")
-            or os.environ.get("DEN_GATEWAY_URL")
+        channels_url=os.environ.get("DEN_GATEWAY_URL") or None,
+        channels_token=os.environ.get("DEN_GATEWAY_TOKEN") or None,
+        conversation_url=(os.environ.get("DEN_CONVERSATION_URL") or os.environ.get("DEN_GATEWAY_URL") or None),
+        conversation_token=(
+            os.environ.get("DEN_CONVERSATION_TOKEN")
+            or os.environ.get("DEN_GATEWAY_TOKEN")
             or None
         ),
-        channels_token=(
-            os.environ.get("DEN_CONVERSATION_TOKEN")
-            or os.environ.get("DEN_DELIVERY_TOKEN")
+        delivery_url=(os.environ.get("DEN_DELIVERY_URL") or os.environ.get("DEN_GATEWAY_URL") or None),
+        delivery_token=(
+            os.environ.get("DEN_DELIVERY_TOKEN")
             or os.environ.get("DEN_GATEWAY_TOKEN")
             or None
         ),

@@ -244,3 +244,29 @@ def test_send_agent_message_without_target_project_preserves_existing_behavior()
     assert result.project_id == "den-hermes-bridge"
     sent = tools.sent[0]
     assert "source_project_id" not in sent
+
+
+def test_smoke_active_member_accepts_successor_memberships_shape():
+    import importlib.util
+    from pathlib import Path
+
+    script = Path(__file__).resolve().parents[1] / "scripts" / "smoke_agent_message_green_path.py"
+    spec = importlib.util.spec_from_file_location("smoke_agent_message_green_path_under_test", script)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    membership = module.active_member(
+        {
+            "memberships": [
+                {
+                    "member_identity": "spawned-coder",
+                    "member_type": "agent",
+                    "membership_status": "active",
+                }
+            ]
+        },
+        "spawned-coder",
+    )
+
+    assert membership is not None

@@ -3068,3 +3068,31 @@ def _make_minimal_tools():
             return {"completion_state": "missing_packet"}
 
     return MinimalTools()
+
+
+def test_build_mcp_adapter_keeps_conversation_and_delivery_bases_split(monkeypatch):
+    from den_hermes.orchestrator import build_mcp_adapter
+
+    monkeypatch.setenv("DEN_HERMES_MCP_URL", "http://mcp.test/mcp")
+    monkeypatch.setenv("DEN_CONVERSATION_URL", "http://conversation.test")
+    monkeypatch.setenv("DEN_DELIVERY_URL", "http://delivery.test")
+    monkeypatch.setenv("DEN_GATEWAY_URL", "http://gateway.test")
+    monkeypatch.setenv("DEN_CONVERSATION_TOKEN", "conversation-token")
+    monkeypatch.setenv("DEN_DELIVERY_TOKEN", "delivery-token")
+    monkeypatch.setenv("DEN_GATEWAY_TOKEN", "gateway-token")
+
+    adapter = build_mcp_adapter(project_id="den-hermes-bridge", requested_by="planner")
+
+    assert adapter.conversation_url == "http://conversation.test"
+    assert adapter.delivery_url == "http://delivery.test"
+    assert adapter.channels_url == "http://gateway.test"
+    assert adapter._successor_base_for_path("/v1/conversation/channels/1/memberships") == (
+        "http://conversation.test",
+        "conversation-token",
+        "conversation_url",
+    )
+    assert adapter._successor_base_for_path("/v1/delivery/intents") == (
+        "http://delivery.test",
+        "delivery-token",
+        "delivery_url",
+    )

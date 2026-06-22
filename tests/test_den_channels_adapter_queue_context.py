@@ -837,6 +837,81 @@ def test_delivery_successor_intent_maps_to_delivery_event() -> None:
     assert metadata["channel_message_id"] == 222
 
 
+
+
+class RecordingDeliveryClient(DenDeliveryClient):
+    def __init__(self) -> None:
+        super().__init__("http://delivery.test", token="token")
+        self.requests: list[tuple[str, str, dict[str, Any] | None]] = []
+
+    async def _request(self, method: str, path: str, payload: dict[str, Any] | None = None) -> Any:
+        self.requests.append((method, path, payload))
+        if path == "/v1/delivery/intents/claim-next":
+            return {
+                "id": 77,
+                "source_ref": "wake://spawned-coder?body=hello",
+                "target_identity": dict(payload.get("claimed_by") or {}) if payload else {},
+            }
+        raise AssertionError(f"unexpected request {method} {path}")
+
+
+@pytest.mark.asyncio
+async def test_delivery_client_uses_claim_next_with_concrete_runtime_identity() -> None:
+    client = RecordingDeliveryClient()
+
+    claims = await client.claim_deliveries({
+        "agent_identity": "spawned-coder",
+        "adapter_instance_id": "profile-wide-instance",
+        "agent_instance_id": "spawned-coder@den-k8",
+        "limit": 1,
+    })
+
+    assert len(claims) == 1
+    method, path, payload = client.requests[0]
+    assert (method, path) == ("POST", "/v1/delivery/intents/claim-next")
+    assert payload is not None
+    assert payload["claimed_by"] == {"profile": "spawned-coder", "instance_id": "spawned-coder@den-k8"}
+    assert payload["limit"] == 1
+    assert "/v1/delivery/intents?state=pending" not in [request[1] for request in client.requests]
+
+
+def test_validate_config_accepts_successor_only_without_den_channels_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("DEN_CHANNELS_URL", raising=False)
+    monkeypatch.setenv("DEN_DELIVERY_URL", "http://127.0.0.1:8083")
+    monkeypatch.setenv("DEN_RUNTIME_URL", "http://127.0.0.1:8081")
+    monkeypatch.setenv("DEN_CONVERSATION_URL", "http://127.0.0.1:8084")
+    monkeypatch.setenv("DEN_OBSERVATION_URL", "http://127.0.0.1:8082")
+    monkeypatch.setenv("HERMES_AGENT_IDENTITY", "spawned-coder")
+
+    assert _adapter_module.validate_config(PlatformConfig(enabled=True, extra={})) is True
+
+
+@pytest.mark.asyncio
+async def test_start_poll_loop_fails_closed_instead_of_spinning_retired_poller() -> None:
+    adapter = DenChannelsAdapter(
+        PlatformConfig(
+            enabled=True,
+            token="***",
+            extra={
+                "delivery_url": "http://127.0.0.1:8083",
+                "conversation_url": "http://127.0.0.1:8084",
+                "runtime_url": "http://127.0.0.1:8081",
+                "project_id": "den-hermes-bridge",
+                "agent_identity": "spawned-coder",
+                "adapter_instance_id": "spawned-coder@den-k8",
+                "start_claim_loop": False,
+                "start_poll_loop": True,
+            },
+        ),
+        channels_client=FakeChannelsClient(),
+        runtime_client=FakeRuntimeClient(),
+    )
+
+    assert await adapter.connect() is False
+    assert adapter._event_task is None
+    assert adapter.has_fatal_error is True
+
+
 def test_delivery_successor_intent_parses_conversation_source_ref_metadata() -> None:
     client = DenDeliveryClient("http://delivery.test", token="token")
 
