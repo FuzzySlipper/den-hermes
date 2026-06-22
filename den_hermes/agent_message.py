@@ -2,11 +2,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any, Mapping
-from urllib.parse import urlencode
 
 AGENT_COMMONS_CHANNEL_ID = 21
 AGENT_COMMONS_SLUG = "agent-commons"
-DEFAULT_CHANNELS_BASE_URL = "http://192.168.1.10:18081"
+DEFAULT_CHANNELS_BASE_URL = "http://192.168.1.10:8079"
 
 
 @dataclass(frozen=True)
@@ -109,13 +108,7 @@ class DenChannelsAgentMessenger:
         message_payload = self._read_message(message_id)
         if delivery_request_id is None:
             delivery_request_id = _extract_delivery_request_id(message_payload)
-        events_payload = self._read_events(resolved_channel_id, after_id=_events_after_id(message_id))
-        delivery_status = _extract_delivery_status(
-            events_payload,
-            message_id=message_id,
-            delivery_request_id=delivery_request_id,
-            member_identity=member_identity,
-        )
+        delivery_status = _optional_str(_first_present(response, "delivery_status", "status"))
         return AgentMessageResult(
             status="sent",
             member_identity=member_identity,
@@ -153,25 +146,11 @@ class DenChannelsAgentMessenger:
         except Exception:  # noqa: BLE001 - evidence enrichment is best-effort after send.
             return None
 
-    def _read_events(self, channel_id: int, *, after_id: int = 0) -> Mapping[str, Any] | None:
-        if not hasattr(self.tools, "den_channels_get_events"):
-            return None
-        try:
-            return self.tools.den_channels_get_events(channel_id=channel_id, after_id=after_id, limit=50)
-        except Exception:  # noqa: BLE001 - evidence enrichment is best-effort after send.
-            return None
-
     def _delivery_intent_url(self, intent_id: int) -> str:
         return f"{self.base_url}/v1/delivery/intents/{intent_id}"
 
     def _delivery_intents_url(self) -> str:
         return f"{self.base_url}/v1/delivery/intents"
-
-    def _direct_agent_event_url(self, event_id: int | str) -> str:
-        return f"{self.base_url}/api/direct-agent-events/{event_id}"
-
-    def _direct_agent_events_url(self, channel_id: int) -> str:
-        return f"{self.base_url}/api/direct-agent-events?{urlencode({'channelId': channel_id, 'afterId': 0})}"
 
 
 def _extract_memberships(response: Any) -> Mapping[str, Any]:

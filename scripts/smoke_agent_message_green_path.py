@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Smoke/preflight Den Channels green-path direct-agent messaging.
+"""Smoke/preflight successor Delivery + Conversation direct-agent messaging.
 
-Default mode is non-mutating: resolve channel, preflight active agent membership,
-and print the evidence that would be used for a direct-agent wake. Pass --send to
-creates a Delivery intent via POST /v1/delivery/intents.
+Default mode is non-mutating: resolve Conversation successor membership,
+preflight active agent membership, and print the evidence that would be used for
+a Delivery successor intent. Pass --send to create a Delivery intent.
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ import urllib.request
 from typing import Any
 
 AGENT_COMMONS_CHANNEL_ID = 21
-DEFAULT_BASE_URL = "http://192.168.1.10:18080"
+DEFAULT_BASE_URL = "http://192.168.1.10:8079"
 
 
 def request_json(method: str, url: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -30,20 +30,20 @@ def request_json(method: str, url: str, payload: dict[str, Any] | None = None) -
 
 def get_memberships(base_url: str, *, project_id: str | None, channel_id: int | None) -> dict[str, Any]:
     if channel_id is not None:
-        query = urllib.parse.urlencode({"channelId": channel_id})
+        query = urllib.parse.urlencode({"channel_id": channel_id})
     elif project_id:
-        query = urllib.parse.urlencode({"projectId": project_id})
+        query = urllib.parse.urlencode({"project_id": project_id})
     else:
-        query = urllib.parse.urlencode({"channelId": AGENT_COMMONS_CHANNEL_ID})
-    return request_json("GET", f"{base_url}/api/channel-memberships?{query}")
+        query = urllib.parse.urlencode({"channel_id": AGENT_COMMONS_CHANNEL_ID})
+    return request_json("GET", f"{base_url}/v1/conversation/memberships?{query}")
 
 
 def active_member(memberships: dict[str, Any], member_identity: str) -> dict[str, Any] | None:
     for member in memberships.get("members") or []:
         if (
-            member.get("memberIdentity") == member_identity
-            and member.get("memberType") == "agent"
-            and member.get("membershipStatus") == "active"
+            (member.get("memberIdentity") or member.get("member_identity")) == member_identity
+            and (member.get("memberType") or member.get("member_type")) == "agent"
+            and (member.get("membershipStatus") or member.get("membership_status")) == "active"
         ):
             return member
     return None
@@ -62,18 +62,20 @@ def main(argv: list[str] | None = None) -> int:
 
     base_url = args.base_url.rstrip("/")
     memberships = get_memberships(base_url, project_id=args.project_id, channel_id=args.channel_id)
-    channel_id = memberships.get("channelId")
-    channel_slug = memberships.get("channelSlug")
+    rows = memberships.get("memberships") or memberships.get("items") or []
+    first = rows[0] if rows else {}
+    channel_id = memberships.get("channelId") or memberships.get("channel_id") or first.get("channelId") or first.get("channel_id")
+    channel_slug = memberships.get("channelSlug") or memberships.get("channel_slug") or first.get("channelSlug") or first.get("channel_slug")
     member = active_member(memberships, args.member_identity)
     result: dict[str, Any] = {
         "status": "preflight_ok" if member else "not_sent",
         "memberIdentity": args.member_identity,
         "channelId": channel_id,
         "channelSlug": channel_slug,
-        "channelKind": memberships.get("channelKind"),
-        "projectId": memberships.get("projectId"),
-        "membershipStatus": member.get("membershipStatus") if member else None,
-        "wakePolicy": member.get("wakePolicy") if member else None,
+        "channelKind": memberships.get("channelKind") or memberships.get("channel_kind") or first.get("channelKind") or first.get("channel_kind"),
+        "projectId": memberships.get("projectId") or memberships.get("project_id") or first.get("projectId") or first.get("project_id"),
+        "membershipStatus": (member.get("membershipStatus") or member.get("membership_status")) if member else None,
+        "wakePolicy": (member.get("wakePolicy") or member.get("wake_policy")) if member else None,
         "deliveryIntentsUrl": f"{base_url}/v1/delivery/intents?{urllib.parse.urlencode({'channelId': channel_id, 'afterId': 0})}",
     }
     if not member:
@@ -82,10 +84,11 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     if args.send:
         payload = {
-            "channelId": channel_id,
-            "memberIdentity": args.member_identity,
-            "body": args.body,
-            "senderIdentity": args.sender_identity,
+            "target_identity": {"profile": args.member_identity, "instance_id": args.member_identity},
+            "idempotency_key": f"smoke:{channel_id}:{args.member_identity}",
+            "source_ref": f"wake://{args.member_identity}?body={urllib.parse.quote(args.body)}",
+            "channel_id": channel_id,
+            "ttl_seconds": 300,
         }
         response = request_json("POST", f"{base_url}/v1/delivery/intents", payload)
         message_id = response.get("messageId") or (response.get("message") or {}).get("id") or response.get("id")

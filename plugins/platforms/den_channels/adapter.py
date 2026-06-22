@@ -1266,11 +1266,13 @@ class DenConversationClient:
 
 
 class DenChannelsClient:
-    """Small async HTTP client for Den Channels readback/subscription APIs.
+    """Successor-only client for conversation/runtime readback helpers.
 
-    Channel-message writes are intentionally excluded from production use; final
-    replies must go through ``DenConversationClient`` so den-channels legacy
-    ``POST /api/channels/{id}/messages`` can be tombstoned.
+    Historical versions of this class called den-channels ``/api/*``
+    compatibility routes. Task #3163 retires those production callers: active
+    methods here must target successor ``/v1/conversation`` or
+    ``/v1/runtime`` contracts and fail closed when no successor URL is
+    configured.
     """
 
     def __init__(self, base_url: str, *, token: str | None = None, timeout: float = 15.0):
@@ -1294,9 +1296,9 @@ class DenChannelsClient:
     async def get_direct_agent_events(
         self, *, channel_id: int, after_id: int = 0, limit: int = 10
     ) -> dict[str, Any]:
-        return await self._request(
-            "GET",
-            f"/api/direct-agent-events?channelId={channel_id}&afterId={after_id}&limit={limit}",
+        raise RuntimeError(
+            "direct-agent event readback is retired for production Hermes; "
+            "use Delivery successor claims instead"
         )
 
     async def get_channel_memberships(
@@ -1310,30 +1312,25 @@ class DenChannelsClient:
         from urllib.parse import urlencode
 
         query = urlencode({
-            "memberIdentity": member_identity,
-            "includeLeft": str(include_left).lower(),
-            "includeOrdinaryMemberships": str(include_ordinary_memberships).lower(),
+            "member_identity": member_identity,
+            "include_left": str(include_left).lower(),
+            "include_ordinary_memberships": str(include_ordinary_memberships).lower(),
             "limit": limit,
         })
-        return await self._request("GET", f"/api/channel-memberships?{query}")
+        return await self._request("GET", f"/v1/conversation/memberships?{query}")
 
     async def get_message_readback(self, message_id: str | int) -> dict[str, Any]:
-        """Readback only: fetch a single channel message by ID.
-
-        ``TODO(#2786)``: This calls the Gateway-shaped readback route because
-        Den Channels does not yet expose a standalone ``GET /api/messages/{id}``
-        route outside the Gateway compatibility prefix.  Once Channels has a
-        native non-gateway single-message route, this method should be switched.
-        This is a read-only compatibility call — no new actuation depends on it.
-        """
-        return await self._request("GET", f"/api/gateway/messages/{message_id}")
+        raise RuntimeError(
+            "single-message compatibility readback is retired; use "
+            "DenConversationClient.get_channel_message(channel_id, message_id)"
+        )
 
     async def post_channel_message(self, channel_id: str | int, payload: dict[str, Any]) -> dict[str, Any]:
         """Legacy write helper retained for tests/readback shims only.
 
         Production reply posting must use ``DenConversationClient``. This method
         remains so old test doubles and explicit legacy smoke code fail loudly
-        rather than silently recreating ``POST /api/channels/{id}/messages``.
+        rather than silently recreating the retired compatibility write.
         """
         raise RuntimeError(
             "legacy den-channels channel-message write is retired; use Conversation successor "
@@ -1341,7 +1338,12 @@ class DenChannelsClient:
         )
 
     async def add_reaction(self, message_id: str | int, payload: dict[str, Any]) -> dict[str, Any]:
-        return await self._request("POST", f"/api/channel-messages/{message_id}/reactions", payload)
+        successor_payload = {
+            "reactor_type": payload.get("reactorType") or payload.get("reactor_type") or "agent",
+            "reactor_identity": payload.get("reactorIdentity") or payload.get("reactor_identity") or "",
+            "reaction": payload.get("reactionKey") or payload.get("reaction") or "",
+        }
+        return await self._request("POST", f"/v1/conversation/messages/{message_id}/reactions", successor_payload)
 
     # ------------------------------------------------------------------
     # Subscription API methods (task #2554)
@@ -1358,18 +1360,11 @@ class DenChannelsClient:
         limit: int = 200,
     ) -> dict[str, Any]:
         """Discover active subscriptions for a member and/or profile."""
-        from urllib.parse import urlencode
-        params = {"memberIdentity": member_identity, "limit": str(limit)}
-        if profile_identity:
-            params["profileIdentity"] = profile_identity
-        if channel_id is not None:
-            params["channelId"] = str(channel_id)
-        if subscription_purpose:
-            params["subscriptionPurpose"] = subscription_purpose
-        if include_inactive:
-            params["includeInactive"] = "true"
-        query = urlencode(params)
-        return await self._request("GET", f"/api/channel-subscriptions?{query}")
+        raise RuntimeError(
+            "legacy channel-subscription discovery is retired; Runtime successor "
+            "subscriptions are created from configured poll channels and Delivery "
+            "claims are the production wake path"
+        )
 
     async def upsert_subscription_cursor(
         self,
@@ -1380,14 +1375,10 @@ class DenChannelsClient:
         cursor_json: str | None = None,
     ) -> dict[str, Any]:
         """Persist a subscription cursor (poll position) on the server."""
-        payload: dict[str, Any] = {
-            "subscriptionId": subscription_id,
-            "streamKind": stream_kind,
-            "lastSeenId": last_seen_id,
-        }
-        if cursor_json is not None:
-            payload["cursorJson"] = cursor_json
-        return await self._request("PUT", "/api/channel-subscription-cursors", payload)
+        return await self._request(
+            "GET",
+            f"/v1/runtime/subscriptions/{subscription_id}/stream?after={last_seen_id}",
+        )
 
     async def list_subscription_cursors(
         self,
@@ -1395,9 +1386,13 @@ class DenChannelsClient:
         subscription_id: int,
     ) -> list[dict[str, Any]]:
         """Get subscription cursors from the server for a subscription."""
-        return await self._request(
-            "GET", f"/api/channel-subscriptions/{subscription_id}/cursors"
-        )
+        response = await self._request("GET", f"/v1/runtime/subscriptions/{subscription_id}/stream")
+        if isinstance(response, dict):
+            return [{
+                "streamKind": "runtime_subscription",
+                "lastSeenId": response.get("cursor_position") or response.get("after") or 0,
+            }]
+        return []
 
 
 class DenChannelsAdapter(BasePlatformAdapter):
@@ -1511,7 +1506,7 @@ class DenChannelsAdapter(BasePlatformAdapter):
         self.start_claim_loop = _coerce_bool(extra.get("start_claim_loop"), bool(self.gateway_url or self.delivery_url))
         self.poll_interval_seconds = float(extra.get("poll_interval_seconds") or 2.0)
         self.poll_limit = max(1, _coerce_int(extra.get("poll_limit")) or 10)
-        self.start_poll_loop = _coerce_bool(extra.get("start_poll_loop"), True)
+        self.start_poll_loop = _coerce_bool(extra.get("start_poll_loop"), False)
         self.poll_channel_ids = _coerce_int_list(
             extra.get("poll_channel_ids")
             or extra.get("channel_ids")
@@ -1569,7 +1564,7 @@ class DenChannelsAdapter(BasePlatformAdapter):
         self.gateway_client = gateway_client or (DenGatewayClient(self.gateway_url, token=token) if self.gateway_url else None)
         self.delivery_client = DenDeliveryClient(self.delivery_url, token=channels_token or token) if self.delivery_url else None
         self.runtime_client = runtime_client or (DenRuntimeClient(self.runtime_url, token=runtime_token) if self.runtime_url else None)
-        self.channels_client = channels_client or DenChannelsClient(self.channels_url, token=channels_token)
+        self.channels_client = channels_client or DenChannelsClient(self.conversation_url, token=conversation_token or conversation_read_token)
         self.conversation_client = conversation_client or (
             DenConversationClient(
                 self.conversation_url,
@@ -1657,7 +1652,7 @@ class DenChannelsAdapter(BasePlatformAdapter):
             except RuntimeError:
                 # Unit tests may construct without a running loop; connect still proves config/binding.
                 self._claim_task = None
-        if self.start_poll_loop and self.channels_url:
+        if self.start_poll_loop and self.conversation_url:
             try:
                 self._event_task = asyncio.create_task(self._event_poll_loop())
             except RuntimeError:
@@ -1666,7 +1661,7 @@ class DenChannelsAdapter(BasePlatformAdapter):
         # Initialize subscriptions and cursors from the server (task #2554).
         # This runs on connect so newly added channels are discovered immediately
         # without waiting for the first poll loop cycle.
-        if self.channels_url and self.agent_identity:
+        if self.start_poll_loop and self.conversation_url and self.agent_identity:
             try:
                 await self._discover_and_sync_subscriptions()
             except Exception:
@@ -2485,7 +2480,7 @@ class DenChannelsAdapter(BasePlatformAdapter):
         import time as _time
         import httpx
 
-        if not self.channels_url or not self.agent_identity:
+        if not self.agent_identity:
             return []
         static_channels = set(self.poll_channel_ids)
         now = _time.time()
@@ -2507,15 +2502,17 @@ class DenChannelsAdapter(BasePlatformAdapter):
             from urllib.parse import urlencode
 
             scoped = {
-                "memberIdentity": self.agent_identity,
-                "includeLeft": "false",
-                "includeOrdinaryMemberships": "true",
+                "member_identity": self.agent_identity,
+                "include_left": "false",
+                "include_ordinary_memberships": "true",
                 "limit": "200",
             }
             scoped.update(query)
+            if not self.conversation_url:
+                return
             async with httpx.AsyncClient(timeout=10.0) as client:
                 response = await client.get(
-                    f"{self.channels_url}/api/channel-memberships?{urlencode(scoped)}",
+                    f"{self.conversation_url}/v1/conversation/memberships?{urlencode(scoped)}",
                     headers=headers,
                 )
                 if response.status_code != 200:
@@ -2552,8 +2549,10 @@ class DenChannelsAdapter(BasePlatformAdapter):
                     "includeOrdinaryMemberships": "true",
                     "limit": "200",
                 })
+                if not self.conversation_url:
+                    return
                 async with httpx.AsyncClient(timeout=10.0) as client:
-                    response = await client.get(f"{self.channels_url}/api/channel-memberships?{query}", headers=headers)
+                    response = await client.get(f"{self.conversation_url}/v1/conversation/memberships?{query}", headers=headers)
                     if response.status_code != 200:
                         return
                     response_body = response.json() if response.content else {}
@@ -2596,12 +2595,12 @@ class DenChannelsAdapter(BasePlatformAdapter):
 
         for cid in (672,):
             try:
-                await _check_memberships({"channelId": cid})
+                await _check_memberships({"channel_id": cid})
             except Exception:
                 logger.debug("[DenChannels] channel discovery failed for %s", cid, exc_info=True)
         if not discovered_channels and self.project_id:
             try:
-                await _check_memberships({"projectId": self.project_id})
+                await _check_memberships({"project_id": self.project_id})
             except Exception:
                 logger.debug("[DenChannels] project channel discovery failed", exc_info=True)
         self._polled_channels = set(discovered_channels) | static_channels

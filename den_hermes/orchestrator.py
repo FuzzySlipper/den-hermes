@@ -9,7 +9,6 @@ from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Any, Mapping
-from urllib.parse import quote
 
 from den_hermes.api_urls import join_api_url
 from den_hermes.runtime_registry import DEFAULT_RUNTIME_REGISTRY_PATH, RuntimeRegistryError, _legacy_resolve_role_runtime as resolve_role_runtime
@@ -741,16 +740,17 @@ class DenWorkflowAdapter:
     def ensure_worker_pool_control_membership(
         self, *, agent_identity: str,
     ) -> Mapping[str, Any]:
-        """Ensure the agent has active worker_pool_control membership in the #worker-pool channel.
+        """Record that pool-home membership is Runtime-owned after Channels retirement.
 
-        Calls PUT /api/worker-pool/control/membership (idempotent, reactivates left workers).
-        Task #1880.
+        The old den-channels worker-pool control compatibility route is no
+        longer a production dependency. Runtime registration/heartbeats and Core
+        worker-pool state are the source of truth for worker availability.
         """
-        return self._channels_request(
-            "PUT",
-            "/api/worker-pool/control/membership",
-            params={"agentIdentity": agent_identity},
-        )
+        return {
+            "ok": True,
+            "retired": "legacy_worker_pool_control_membership",
+            "agent_identity": agent_identity,
+        }
 
     def ensure_target_work_membership(
         self,
@@ -781,14 +781,14 @@ class DenWorkflowAdapter:
         }
         return self._channels_request(
             "PUT",
-            f"/api/channels/{channel_id}/memberships",
+            f"/v1/conversation/channels/{channel_id}/memberships",
             json_payload={
-                "memberType": "agent",
-                "memberIdentity": agent_identity,
-                "membershipStatus": "active",
-                "wakePolicy": "mentions_only",
-                "membershipPurpose": "target_work",
-                "settingsJson": json.dumps(
+                "member_type": "agent",
+                "member_identity": agent_identity,
+                "membership_status": "active",
+                "wake_policy": "mentions_only",
+                "membership_purpose": "target_work",
+                "settings": json.dumps(
                     {key: value for key, value in settings.items() if value not in {None, ""}},
                     sort_keys=True,
                 ),
@@ -803,10 +803,17 @@ class DenWorkflowAdapter:
         Sets membership_status to 'left' without touching worker_pool_control or agent_commons.
         Task #1880.
         """
-        encoded_agent_identity = quote(agent_identity, safe="")
         return self._channels_request(
-            "POST",
-            f"/api/channels/{channel_id}/memberships/{encoded_agent_identity}/release-target-work",
+            "PUT",
+            f"/v1/conversation/channels/{channel_id}/memberships",
+            json_payload={
+                "member_type": "agent",
+                "member_identity": agent_identity,
+                "membership_status": "left",
+                "wake_policy": "mentions_only",
+                "membership_purpose": "target_work",
+                "settings": "{}",
+            },
         )
 
     def send_direct_agent_message(
@@ -827,10 +834,9 @@ class DenWorkflowAdapter:
     ) -> Mapping[str, Any]:
         """Send a direct-agent wake via a successor Delivery intent.
 
-        Creates a delivery intent via ``POST /v1/delivery/intents``
-        instead of the legacy ``POST /api/direct-agent-events``.
+        Creates a delivery intent via ``POST /v1/delivery/intents``.
 
-        Task #3031.
+        Task #3031 / #3163.
         """
         # Build target_identity from member_identity (profile) and the most
         # specific concrete selector available for instance_id.
@@ -1508,7 +1514,7 @@ def _cleanup_channel_residency(
         )
     except Exception as exc:  # noqa: BLE001 - channel cleanup must not block release
         logger.info(
-            "Channel residency cleanup: release-target-work for %s in channel %s failed: %s",
+            "Channel residency cleanup: target-work release for %s in channel %s failed: %s",
             agent_identity,
             channel_id,
             exc,
@@ -1516,7 +1522,7 @@ def _cleanup_channel_residency(
         result = {"ok": False, "error": str(exc)[:500]}
     if not result.get("ok") and result.get("error"):
         logger.info(
-            "Channel residency cleanup: release-target-work for %s in channel %s: %s",
+            "Channel residency cleanup: target-work release for %s in channel %s: %s",
             agent_identity, channel_id, result.get("error"),
         )
     try:
@@ -2532,8 +2538,18 @@ def build_mcp_adapter(
         project_id=project_id,
         requested_by=requested_by,
         target_project_id=target_project_id or os.environ.get("DEN_TARGET_PROJECT_ID") or None,
-        channels_url=os.environ.get("DEN_CHANNELS_URL") or os.environ.get("DEN_GATEWAY_URL") or None,
-        channels_token=os.environ.get("DEN_CHANNELS_TOKEN") or os.environ.get("DEN_GATEWAY_TOKEN") or None,
+        channels_url=(
+            os.environ.get("DEN_CONVERSATION_URL")
+            or os.environ.get("DEN_DELIVERY_URL")
+            or os.environ.get("DEN_GATEWAY_URL")
+            or None
+        ),
+        channels_token=(
+            os.environ.get("DEN_CONVERSATION_TOKEN")
+            or os.environ.get("DEN_DELIVERY_TOKEN")
+            or os.environ.get("DEN_GATEWAY_TOKEN")
+            or None
+        ),
     )
 
 

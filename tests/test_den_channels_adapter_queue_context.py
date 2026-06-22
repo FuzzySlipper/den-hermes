@@ -1295,6 +1295,7 @@ def test_activity_emitter_preserves_hermes_session_key(monkeypatch: pytest.Monke
         Client = FakeClient
 
     monkeypatch.setitem(sys.modules, "httpx", FakeHttpx)
+    monkeypatch.delenv("DEN_OBSERVATION_URL", raising=False)
 
     _adapter_module._emit_activity_event(
         {
@@ -1487,6 +1488,7 @@ def test_activity_emitter_does_not_fallback_to_channels_url(monkeypatch: pytest.
         Client = FakeClient
 
     monkeypatch.setitem(sys.modules, "httpx", FakeHttpx)
+    monkeypatch.delenv("DEN_OBSERVATION_URL", raising=False)
 
     _adapter_module._emit_activity_event(
         {

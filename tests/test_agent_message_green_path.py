@@ -68,8 +68,8 @@ def test_send_agent_message_resolves_explicit_channel_and_returns_evidence():
     assert result.delivery_intent_id == 321
     assert result.delivery_intent_url == "http://den.test/v1/delivery/intents/321"
     assert result.delivery_intents_url == "http://den.test/v1/delivery/intents"
-    assert result.delivery_status == "recorded_pending_claim"
-    assert tools.last_events_query == {"channel_id": 5, "after_id": 320, "limit": 50}
+    assert result.delivery_status == "ok"
+    assert not hasattr(tools, "last_events_query")
     assert tools.sent == [
         {
             "channel_id": 5,
@@ -140,7 +140,7 @@ def test_send_agent_message_prefers_explicit_channel_over_project():
     assert result.channel_id == 7
 
 
-def test_send_agent_message_observes_agent_reply_after_direct_wake_without_delivery_id():
+def test_send_agent_message_does_not_use_legacy_direct_event_readback_without_delivery_id():
     tools = RecordingChannelsTools({
         ("channel", 5): memberships(
             members=[
@@ -181,8 +181,8 @@ def test_send_agent_message_observes_agent_reply_after_direct_wake_without_deliv
     result = messenger.send_agent_message(member_identity="spawned-coder", body="Start", channel_id=5)
 
     assert result.delivery_request_id is None
-    assert result.delivery_status == "agent_reply_posted"
-    assert tools.last_events_query == {"channel_id": 5, "after_id": 320, "limit": 50}
+    assert result.delivery_status == "ok"
+    assert not hasattr(tools, "last_events_query")
 
 
 def test_send_agent_message_carries_target_project_and_task_in_send_args():
